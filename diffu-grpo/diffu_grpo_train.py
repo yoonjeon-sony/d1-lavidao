@@ -30,6 +30,7 @@ from llava.model.language_model.llava_llada import LlavaLladaForMaskedDiffusion
 from data_utils import (
     get_code_questions,
     get_countdown_questions,
+    get_image_answer_placeholder_questions,
     get_gsm8k_questions,
     get_image_edit_placeholder_questions,
     get_math_questions,
@@ -107,7 +108,6 @@ def init_lavida_model_and_tokenizer(args: DiffuGRPOConfig, model_config: ModelCo
             f"Expected llada/lavida checkpoint path, got: {model_name_or_path}"
         )
 
-    
     vision_kwargs = dict(
         mm_vision_tower=args.vision_tower,
         mm_resampler_type=args.mm_resampler_type,
@@ -377,6 +377,13 @@ def main(grpo_config, model_config):
     elif grpo_config.dataset == "thinkmorph_edit":
         dataset = get_image_edit_placeholder_questions("train")
         reward_functions = [perceptual_score_reward_func]
+    elif grpo_config.dataset == "thinkmorph_answer":
+        dataset = get_image_answer_placeholder_questions("train")
+        reward_functions = [
+            soft_format_reward_func,
+            strict_format_reward_func,
+            correctness_reward_func,
+        ]
     elif grpo_config.dataset == "mixed_placeholder":
         dataset = get_mixed_placeholder_questions("train")
         reward_functions = [neutral_reward_func]

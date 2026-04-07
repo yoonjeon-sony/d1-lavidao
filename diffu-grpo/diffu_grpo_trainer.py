@@ -1,9 +1,10 @@
 import copy
 import os
+import random
 import sys
 import warnings
 from pathlib import Path
-from typing import Any, Callable, Optional, Union, List
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from tqdm import tqdm, trange
 import numpy as np
@@ -14,6 +15,7 @@ import wandb
 from accelerate.utils import gather, gather_object
 from datasets import Dataset, IterableDataset
 from torch import nn
+from torch.utils.data import DataLoader
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, Trainer, TrainerCallback
 from transformers.utils import is_peft_available
 from trl.extras.profiling import profiling_context, profiling_decorator
@@ -21,8 +23,14 @@ from trl.extras.profiling import profiling_context, profiling_decorator
 from trl.models import unwrap_model_for_generation
 from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.grpo_trainer import GRPOTrainer
-from trl.trainer.utils import print_prompt_completions_sample
-
+from trl.trainer.utils import print_prompt_completions_sample, selective_log_softmax
+from trl.trainer.utils import (
+    generate_model_card,
+    get_comet_experiment_url,
+    pad,
+    print_prompt_completions_sample,
+    ,
+)
 if is_peft_available():
     from peft import PeftConfig
 
@@ -35,8 +43,9 @@ LAVIDA_ROOT = REPO_ROOT / "LaVida-O"
 if str(LAVIDA_ROOT) not in sys.path:
     sys.path.insert(0, str(LAVIDA_ROOT))
 
-from llava.constants import IMAGE_TOKEN_INDEX
+from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX
 from llava.conversation import conv_templates
+from llava.train.data.datasets import LazySupervisedDataset
 
 from llava.mm_utils import pad_to_square_and_resize, process_images, tokenizer_image_token
 from llava.model.language_model.llava_llada import (
@@ -47,6 +56,7 @@ from llava.model.language_model.llada.modeling_llada import LLaDAModelLM
 from llava.model.language_model.llada.generate import (
     add_gumbel_noise,
     cosine_schedule_2,
+    generate as llada_generate,
     exp_schedule,
     get_logits as llada_get_logits,
     get_num_transfer_tokens_sch,
@@ -56,6 +66,7 @@ from llava.model.language_model.llada.generate import (
 from llava.model.utils import maybe_truncate_last_dim, pad_along_last_dim
 
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
+
 
 
 def stratified_random(n: int = 64, seed: Optional[int] = None, shuffle_blocks: bool = True) -> List[int]:
@@ -160,6 +171,63 @@ def _register_lavida_architectures() -> None:
         setattr(transformers, "LlavaLladaConfig", LlavaLladaConfig)
 
 
+class MaskDataCollator:
+    def __init__(self, tokenizer, args):
+        self.tokenizer = tokenizer
+        self.args = args
+
+    def pad_sequence(self, input_ids, batch_first, padding_value,extra_pad=-1):
+        if self.tokenizer.padding_side == "left":
+            input_ids = [torch.flip(_input_ids, [0]) for _input_ids in input_ids]
+        # breakpoint()
+        input_ids = list(input_ids)
+        max_k = max(range(len(input_ids)),key=lambda x:input_ids[x].shape[-1])
+       
+        # extra_pad = -1
+        if extra_pad > 0 :
+            extra_pad_seq = torch.tensor([padding_value]*extra_pad)
+            input_ids[max_k] = torch.cat([input_ids[max_k],extra_pad_seq])
+        input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=batch_first, padding_value=padding_value)
+        if self.tokenizer.padding_side == "left":
+            input_ids = torch.flip(input_ids, [1])
+        return input_ids
+
+    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
+        input_ids = [_input_ids[: self.tokenizer.model_max_length] for _input_ids in input_ids]
+        labels = [_labels[: self.tokenizer.model_max_length] for _labels in labels]
+        input_ids = self.pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        labels = self.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+        batch = dict(input_ids=input_ids, labels=labels.long() if labels.dtype == torch.int32 else labels, attention_mask=input_ids.ne(self.tokenizer.pad_token_id))
+
+        if "image" in instances[0]:
+            images = [instance["image"] for instance in instances]
+
+            batch["image_sizes"] = [im[1] for im_list in images for im in im_list]
+            batch["modalities"] = [im[2] for im_list in images for im in im_list]
+            images = [im[0] for im_list in images for im in im_list]
+            batch["images"] = images
+
+        if "prompt" in instances[0]:
+            batch["prompts"] = [instance["prompt"] for instance in instances]
+
+        images_gen = list([instance["image_gen"] for instance in instances if instance["image_gen"] is not None])
+        image_gen_enc = list([instance["image_gen_enc"] for instance in instances if instance["image_gen_enc"] is not None])
+        
+        if len(images_gen) > 0:
+            batch['images_gen'] = images_gen
+        else:
+            batch['images_gen']  = None
+        if len(image_gen_enc)>0:
+            batch['images_gen_enc'] = image_gen_enc
+        else:
+            batch['images_gen_enc']  = None
+        batch['image_gen_weight'] = None
+
+        batch['do_not_mask_text'] = [x['do_not_mask_text'] for x in instances]
+
+        return batch
+
 class DiffuGRPOTrainer(GRPOTrainer):
     """GRPO trainer adapted for LaVida-O text + image rollouts with unified token-level scoring."""
 
@@ -254,17 +322,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
         }
 
     @staticmethod
-    def _pad_sequence(tokenizer, seqs, padding_value: int):
-        if len(seqs) == 0:
-            return torch.empty(0, 0, dtype=torch.long)
-        if tokenizer.padding_side == "left":
-            seqs = [torch.flip(x, [0]) for x in seqs]
-        out = torch.nn.utils.rnn.pad_sequence(seqs, batch_first=True, padding_value=padding_value)
-        if tokenizer.padding_side == "left":
-            out = torch.flip(out, [1])
-        return out
-
-    @staticmethod
     def _role_to_conv_role(role: str) -> str:
         role = role.lower()
         if role in {"human", "user"}:
@@ -336,6 +393,96 @@ class DiffuGRPOTrainer(GRPOTrainer):
             return self._load_image(image_like[0])
         return image_like
 
+    def _rollout_multimodal_text_gen(
+        self,
+        model,
+        example: dict[str, Any],
+        image_processor,
+        generation_kwargs: dict[str, Any],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        prompt_text = self._build_llada_prompt(example["prompt"])
+        if example.get("image") is not None and "<image>" not in prompt_text:
+            raise ValueError(
+                "Text rollout example includes an image but the prompt does not contain '<image>': "
+                f"sample_index={idx}"
+            )
+        prompt_ids = tokenizer_image_token(
+            prompt_text,
+            self.processing_class,
+            IMAGE_TOKEN_INDEX,
+            return_tensors="pt",
+        ).to(device)
+        if self.max_prompt_length is not None:
+            prompt_ids = prompt_ids[-self.max_prompt_length :]
+        prompt_ids = prompt_ids.unsqueeze(0)
+        prompt_mask = torch.ones_like(prompt_ids, dtype=torch.long, device=device)
+        image = self._load_image(example.get("image"))
+        if image is None:
+            return None, None
+        if image_processor is None:
+            return None, None
+
+        resolution = int(self.args.image_edit_resolution)
+        processed_image = pad_to_square_and_resize(image.convert("RGB"), resolution)
+        image_tensor = process_images([processed_image], image_processor, model.config)
+        image_tensor = self._normalize_mm_image_payload(
+            image_tensor,
+            dtype=model.dtype,
+            device=device,
+        )
+        self._check_mm_payload_before_prepare_inputs(image_tensor)
+        image_sizes = [processed_image.size]
+
+        position_ids = None
+        attention_mask = prompt_mask
+        if image_tensor is not None:
+            inputs, position_ids, attention_mask, _, inputs_embeds, _ = model.prepare_inputs_labels_for_multimodal(
+                input_ids=prompt_ids,
+                position_ids=position_ids,
+                attention_mask=prompt_mask,
+                past_key_values=None,
+                labels=None,
+                images=image_tensor,
+                modalities=["image"] * prompt_ids.shape[0],
+                image_sizes=image_sizes,
+            )
+            del inputs
+        else:
+            inputs_embeds = model.get_model().embed_tokens(prompt_ids)
+
+        generated = llada_generate(
+            model.get_model(),
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            **generation_kwargs,
+        )
+
+        if isinstance(generated, tuple):
+            generated = generated[0]
+
+        prefix_lm = bool(generation_kwargs.get("prefix_lm", False))
+        norm_prompt_ids, completion_ids = self._normalize_text_rollout(generated, prompt_ids, prefix_lm)
+        decoded_text = self.processing_class.decode(
+            completion_ids.squeeze(0), skip_special_tokens=True
+        )
+        source_images = example.get("image")
+        if source_images is None:
+            source_images = []
+        elif not isinstance(source_images, list):
+            source_images = [source_images]
+
+        return completion_ids.detach(), {
+            "id": str(example.get("pid", example.get("id", ""))),
+            "image": source_images,
+            "conversations": [
+                {"from": "human", "value": example["prompt"]["content"]},
+                {"from": "gpt", "value": decoded_text},
+            ],
+        }
+        
+
     @staticmethod
     def _debug_mm_image_shapes_enabled() -> bool:
         flag = os.environ.get("DEBUG_MM_IMAGE_SHAPES", "")
@@ -351,11 +498,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
             return f"type=tensor rank={images.ndim} shape={tuple(images.shape)}"
         return f"type={type(images).__name__}"
 
-    # def _log_mm_image_shapes(self, message: str, **payload: Any) -> None:
-        # if not self._debug_mm_image_shapes_enabled():
-        #     return
-        # details = ", ".join(f"{key}={value}" for key, value in payload.items())
-        # print(f"[DEBUG_MM_IMAGE_SHAPES] {message}: {details}")
 
     def _normalize_mm_image_payload(self, image_tensor: Any, *, dtype: torch.dtype, device: torch.device) -> list[torch.Tensor]:
         if isinstance(image_tensor, list):
@@ -489,7 +631,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
         ):
             return torch.stack(batch_latents, dim=0), image_contexts
 
-        valid_indices = []
+        
         all_input_ids = []
         all_edit_images = []
         image_sizes = []
@@ -497,10 +639,10 @@ class DiffuGRPOTrainer(GRPOTrainer):
         vq_latents = []
         for batch_idx, example in enumerate(examples):
             edit_image = self._load_image(example.get("image"))
-            if edit_image is None:
-                continue
+            
+            assert edit_image is not None, f"Edit image is None for example {example}"
             instruction = self._extract_image_edit_instruction(example)
-            valid_indices.append(batch_idx)
+            
             image_sizes.append(edit_image.size)
             all_edit_images.append(edit_image)
 
@@ -529,9 +671,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 return_tensors="pt",
             ).unsqueeze(0).to(device)
             all_input_ids.append(input_ids)
-
-        if not valid_indices:
-            return torch.stack(batch_latents, dim=0), image_contexts
 
         all_input_ids = self._left_pad_2d(all_input_ids, self.processing_class.pad_token_id, torch.long)
         attention_mask = (all_input_ids != self.processing_class.pad_token_id).long()
@@ -735,7 +874,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
             else:
                 x0 = torch.where(mask_idx, x0, xt)
 
-            for batch_idx in range(len(valid_indices)):
+            for batch_idx in range(len(examples)):
                 b_mask = mask_idx[batch_idx]
                 b_n_mask = int(b_mask.sum().item())
                 if b_n_mask == 0:
@@ -766,136 +905,78 @@ class DiffuGRPOTrainer(GRPOTrainer):
             xt[transfer_index] = x0[transfer_index]
 
         xt[xt == img_mask_id] = x0[xt == img_mask_id]
-        decoded_images = None
-        if hasattr(model, "decode_image_gen"):
-            decoded_images = model.decode_image_gen(
-                xt,
-                gen_cfg["image_resolution"],
-                gen_cfg["image_resolution"],
+        decoded_images = model.decode_image_gen(
+            xt,
+            gen_cfg["image_resolution"],
+            gen_cfg["image_resolution"],
+        )
+        rollout_dir = Path("/tmp/diffu_grpo_rollouts")
+        rollout_dir.mkdir(parents=True, exist_ok=True)
+        image_contexts = []
+        for batch_idx, (example, decoded_image) in enumerate(zip(examples, decoded_images)):
+            sample_id = str(example.get("id", example.get("pid", batch_idx)))
+            safe_sample_id = sample_id.replace("/", "_").replace(os.sep, "_").replace(" ", "_")
+            decoded_image_obj = decoded_image
+            if torch.is_tensor(decoded_image):
+                from PIL import Image
+
+                image_array = decoded_image.detach().cpu()
+                if image_array.ndim == 3 and image_array.shape[0] in (1, 3):
+                    image_array = image_array.permute(1, 2, 0)
+                image_array = image_array.clamp(0, 1).mul(255).to(torch.uint8).numpy()
+                if image_array.ndim == 3 and image_array.shape[-1] == 1:
+                    image_array = image_array[..., 0]
+                decoded_image_obj = Image.fromarray(image_array)
+            elif isinstance(decoded_image, np.ndarray):
+                from PIL import Image
+
+                image_array = np.clip(decoded_image, 0, 255).astype(np.uint8)
+                if image_array.ndim == 3 and image_array.shape[-1] == 1:
+                    image_array = image_array[..., 0]
+                decoded_image_obj = Image.fromarray(image_array)
+
+            decoded_image_path = rollout_dir / f"{safe_sample_id}_{os.getpid()}_{batch_idx}.png"
+            if hasattr(decoded_image_obj, "save"):
+                decoded_image_obj.save(decoded_image_path)
+
+            source_images = example.get("image")
+            if source_images is None:
+                source_images = []
+            elif not isinstance(source_images, list):
+                source_images = [source_images]
+
+            source_enc_images = example.get("image_gen_enc", example.get("image"))
+            if source_enc_images is None:
+                source_enc_images = []
+            elif not isinstance(source_enc_images, list):
+                source_enc_images = [source_enc_images]
+
+            instruction = self._extract_image_edit_instruction(example)
+            image_contexts.append(
+                {
+                    "valid": True,
+                    "latent_shape": tuple(xt[batch_idx].shape),
+                    "decoded_image": decoded_image_obj,
+                    "payload": {
+                        "id": sample_id,
+                        "image_gen": str(decoded_image_path),
+                        "image": source_images,
+                        "image_gen_enc": source_enc_images,
+                        "pad_image_gen": True,
+                        "conversations": [
+                            {
+                                "from": "human",
+                                "value": f"<image> <image_gen_enc>\n{instruction}",
+                            },
+                            {
+                                "from": "gpt",
+                                "value": "<image_gen>",
+                            },
+                        ],
+                    },
+                }
             )
-
-        modality_indices = is_gen | is_gen_enc if getattr(base_model.config, "enc_use_image_branch", False) else is_gen
-        for local_idx, batch_idx in enumerate(valid_indices):
-            batch_latents[batch_idx] = xt[local_idx].detach()
-            image_contexts[batch_idx] = {
-                "valid": True,
-                "inputs_embeds": inputs_embeds[local_idx].detach(),
-                "inputs_embeds_uncond": inputs_embeds_uncond[local_idx].detach(),
-                "is_gen": is_gen[local_idx].detach(),
-                "is_gen_enc": is_gen_enc[local_idx].detach(),
-                "base_inputs_embeds": inputs_embeds[local_idx].detach(),
-                "modality_indices": modality_indices[local_idx].detach(),
-                "gen_shape": gen_shape,
-                "guidance_scale": gen_cfg["guidance_scale"],
-                "latent_shape": tuple(xt[local_idx].shape),
-                "decoded_image": None if decoded_images is None else decoded_images[local_idx],
-            }
-        return torch.stack(batch_latents, dim=0), image_contexts
-
-    def _build_text_score_payload(
-        self,
-        prompt_ids: torch.Tensor,
-        completion_ids: torch.Tensor,
-        completion_mask: torch.Tensor,
-        mask_seeds: list[int],
-    ) -> dict[str, Any]:
-        valid_len = int(completion_mask.sum().item())
-        completion_ids = completion_ids[:valid_len]
-        sequence_ids = torch.cat([prompt_ids, completion_ids], dim=0)
-        seq_len = sequence_ids.size(0)
-        prompt_len = int(prompt_ids.size(0))
-        prompt_index = torch.zeros(seq_len, dtype=torch.bool, device=sequence_ids.device)
-        prompt_index[:prompt_len] = True
-
-        masked_indices = torch.zeros(len(mask_seeds), seq_len, dtype=torch.bool, device=sequence_ids.device)
-        for iter_idx, mask_seed in enumerate(mask_seeds):
-            random_matrix = torch.rand(
-                seq_len,
-                device=sequence_ids.device,
-                generator=self._make_generator(sequence_ids.device, mask_seed),
-            )
-            masked_indices[iter_idx] = (~prompt_index) | (
-                prompt_index & (random_matrix < float(self.args.p_mask_prompt))
-            )
-
-        text_target_ids = torch.full_like(sequence_ids, -100)
-        if valid_len > 0:
-            text_target_ids[prompt_len:] = completion_ids
-
-        return {
-            "valid": valid_len > 0,
-            "sequence_ids": sequence_ids,
-            # Scoring intentionally disables prefix-LM even when rollout uses it.
-            # This avoids the flex-attention `create_block_mask` dependency here.
-            "prompt_len": None,
-            "modality_indices": torch.zeros(seq_len, dtype=torch.bool, device=sequence_ids.device),
-            "new_token_mask": torch.zeros(seq_len, dtype=torch.bool, device=sequence_ids.device),
-            "masked_indices": masked_indices,
-            "text_target_ids": text_target_ids,
-            "gen_targets": None,
-            "gen_latents_masked": None,
-            "gen_shape": None,
-            "completion_axis_text": torch.arange(valid_len, device=sequence_ids.device, dtype=torch.long),
-            "completion_axis_image": torch.empty(0, device=sequence_ids.device, dtype=torch.long),
-        }
-
-    def _build_image_score_payload(
-        self,
-        image_ctx: dict[str, Any],
-        completion_flat: torch.Tensor,
-        valid_len: int,
-        mask_seeds: list[int],
-        device: torch.device,
-    ) -> dict[str, Any]:
-        if image_ctx is None or not image_ctx.get("valid", False):
-            return {
-                "valid": False,
-                "base_inputs_embeds": None,
-                "prompt_len": None,
-                "modality_indices": None,
-                "new_token_mask": None,
-                "masked_indices": None,
-                "text_target_ids": None,
-                "gen_targets": None,
-                "gen_latents_masked": None,
-                "gen_shape": None,
-                "completion_axis_text": torch.empty(0, device=device, dtype=torch.long),
-                "completion_axis_image": torch.empty(0, device=device, dtype=torch.long),
-            }
-
-        latent_shape = tuple(image_ctx["latent_shape"])
-        if len(latent_shape) > 1 and latent_shape[0] == 1:
-            latent_shape = latent_shape[1:]
-        gen_targets = completion_flat[:valid_len].view(*latent_shape).to(device)
-        gen_latents_masked = []
-        for mask_seed in mask_seeds:
-            masked = gen_targets.clone()
-            random_values = torch.rand(
-                masked.shape,
-                device=device,
-                generator=self._make_generator(device, mask_seed),
-            )
-            masked[random_values < 0.5] = 8193
-            gen_latents_masked.append(masked)
-
-        new_token_mask = image_ctx["is_gen"].to(device=device, dtype=torch.bool).squeeze(0)
-        modality_indices = image_ctx["modality_indices"].to(device=device, dtype=torch.bool)
-
-        seq_len = new_token_mask.size(0)
-        return {
-            "valid": True,
-            "base_inputs_embeds": image_ctx["base_inputs_embeds"].to(device=device),
-            "prompt_len": None,
-            "modality_indices": modality_indices,
-            "new_token_mask": new_token_mask,
-            "masked_indices": torch.zeros(len(mask_seeds), seq_len, dtype=torch.bool, device=device),
-            "text_target_ids": torch.full((seq_len,), -100, dtype=torch.long, device=device),
-            "gen_targets": gen_targets,
-            "gen_latents_masked": torch.stack(gen_latents_masked, dim=0),
-            "gen_shape": image_ctx["gen_shape"],
-            "completion_axis_text": torch.empty(0, device=device, dtype=torch.long),
-            "completion_axis_image": torch.arange(valid_len, device=device, dtype=torch.long),
-        }
+        return xt, image_contexts
 
     @staticmethod
     def _resolve_llada_forward_model(model: PreTrainedModel) -> LLaDAModelLM:
@@ -923,317 +1004,167 @@ class DiffuGRPOTrainer(GRPOTrainer):
                         candidates.append(nested)
         raise TypeError(f"Could not resolve an LLaDA model from {type(model)!r}")
 
-    def _compute_unified_per_token_logps(
+    @staticmethod
+    def _repeat_batch_value(value: Any, repeat_count: int) -> Any:
+        if repeat_count == 1 or value is None:
+            return value
+        if torch.is_tensor(value):
+            if value.ndim == 0:
+                return value
+            return torch.cat([value] * repeat_count, dim=0)
+        if isinstance(value, list):
+            repeated = []
+            for _ in range(repeat_count):
+                repeated.extend(copy.deepcopy(value))
+            return repeated
+        if isinstance(value, tuple):
+            repeated = []
+            for _ in range(repeat_count):
+                repeated.extend(copy.deepcopy(list(value)))
+            return tuple(repeated)
+        return value
+
+    def _repeat_batch_inputs(self, inputs: dict[str, Any], repeat_count: int) -> dict[str, Any]:
+        return {
+            key: self._repeat_batch_value(value, repeat_count)
+            for key, value in inputs.items()
+        }
+
+    @staticmethod
+    def _pad_and_concat_logps(logps_per_batch: list[torch.Tensor]) -> torch.Tensor:
+        if not logps_per_batch:
+            return torch.empty(0)
+        max_keep = max(logps.shape[-1] for logps in logps_per_batch)
+        padded = []
+        for logps in logps_per_batch:
+            if logps.shape[-1] == max_keep:
+                padded.append(logps)
+                continue
+            pad_shape = (*logps.shape[:-1], max_keep - logps.shape[-1])
+            pad = torch.zeros(pad_shape, dtype=logps.dtype, device=logps.device)
+            padded.append(torch.cat([logps, pad], dim=-1))
+        return torch.cat(padded, dim=1)
+
+    def _build_masked_indices_gen(
+        self,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+        mask_seeds: list[int],
+        *,
+        is_unitok: bool,
+        is_unitok_submask: bool,
+    ) -> torch.Tensor:
+        masked_indices_gen = []
+        for mask_seed in mask_seeds:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(mask_seed))
+            if is_unitok_submask:
+                random_matrix = torch.rand((batch_size, seq_len * 8), device=device, generator=generator)
+                is_mask_gen = random_matrix < float(self.args.p_mask_image)
+                is_mask_gen = is_mask_gen.view(batch_size, 8, seq_len)
+            else:
+                random_matrix = torch.rand((batch_size, seq_len), device=device, generator=generator)
+                is_mask_gen = random_matrix < float(self.args.p_mask_image)
+                if is_unitok:
+                    is_mask_gen = is_mask_gen.unsqueeze(1).repeat(1, 8, 1)
+            masked_indices_gen.append(is_mask_gen)
+        return torch.cat(masked_indices_gen, dim=0)
+
+    def _get_per_token_logps(
         self,
         model,
-        inputs: dict[str, Any],
+        data_loader: Union[DataLoader, dict[str, Any]],
         mask_seeds: list[int],
     ) -> torch.Tensor:
-        completion_mask = inputs["completion_mask"]
-        batch_size, token_axis = completion_mask.shape
-        num_iterations = len(mask_seeds)
-        out = torch.zeros(num_iterations, batch_size, token_axis, device=completion_mask.device)
-        unwrapped_model = self.accelerator.unwrap_model(model) if hasattr(self, "accelerator") else model
-        llada_model = self._resolve_llada_forward_model(unwrapped_model)
-        multimodal_model = llada_model.get_model()
-        noise_embeddings = multimodal_model.transformer.wte(
-            torch.tensor([self.args.mask_id], device=completion_mask.device)
-        ).view(1, 1, -1)
-        precomputed_mask_seeds = [int(x) for x in inputs.get("score_mask_seeds", mask_seeds)]
-
-        for sample_idx in range(batch_size):
-            payload = inputs["score_payloads"][sample_idx]
-            if not payload.get("valid", False):
-                continue
-
-            masked_indices = payload["masked_indices"]
-            gen_latents_masked = payload["gen_latents_masked"]
-            if masked_indices.size(0) != num_iterations:
-                seed_positions = []
-                for mask_seed in mask_seeds:
-                    try:
-                        seed_positions.append(precomputed_mask_seeds.index(int(mask_seed)))
-                    except ValueError as exc:
-                        raise ValueError("Requested seed was not precomputed for scoring payloads") from exc
-                masked_indices = masked_indices[seed_positions]
-                if gen_latents_masked is not None:
-                    gen_latents_masked = gen_latents_masked[seed_positions]
-
-            if payload.get("sequence_ids") is not None:
-                base_inputs_embeds = multimodal_model.transformer.wte(payload["sequence_ids"].unsqueeze(0))
+        if isinstance(data_loader, dict):
+            if "scoring_data_loader" in data_loader:
+                data_loader = data_loader["scoring_data_loader"]
             else:
-                base_inputs_embeds = payload["base_inputs_embeds"].unsqueeze(0)
-            base_inputs_embeds = base_inputs_embeds.to(device=completion_mask.device, dtype=noise_embeddings.dtype)
-            base_inputs_embeds = base_inputs_embeds.expand(num_iterations, -1, -1).clone()
-            inputs_embeds = torch.where(
-                masked_indices.unsqueeze(-1),
-                noise_embeddings.to(dtype=base_inputs_embeds.dtype),
-                base_inputs_embeds,
-            )
+                data_loader = [data_loader]
 
-            new_token_mask = payload["new_token_mask"].unsqueeze(0).expand(num_iterations, -1)
-            modality_indices = payload["modality_indices"].unsqueeze(0).expand(num_iterations, -1)
-            if gen_latents_masked is not None:
-                gen_latents_comp_embeds = multimodal_model.call_gen_embedding(
-                    gen_latents_masked,
-                    gen_shape=payload["gen_shape"],
-                )
-                gen_latents_comp_embeds = pad_along_last_dim(gen_latents_comp_embeds, llada_model.config.d_model)
-                inputs_embeds = inputs_embeds.masked_scatter(
-                    new_token_mask.unsqueeze(-1),
-                    gen_latents_comp_embeds.reshape(-1, llada_model.config.d_model),
-                )
+        llada_model = self._resolve_llada_forward_model(model)
+        llada_config = getattr(llada_model.get_model(), "config", llada_model.config)
+        is_unitok = "unitok" in getattr(llada_config, "mm_vqvae", "")
+        is_unitok_submask = bool(getattr(llada_config, "mm_submask", False))
+        num_image_tokens = int(getattr(self.args, "num_gen_image_tokens", 0))
+        repeat_count = len(mask_seeds)
+        all_logps: list[torch.Tensor] = []
 
-            prompt_len = payload["prompt_len"]
-            if prompt_len is not None:
-                prompt_len = prompt_len.view(1).repeat(num_iterations)
+        for inputs in data_loader:
+            input_ids = inputs["input_ids"]
+            labels = inputs["labels"]
+            attention_mask = inputs["attention_mask"].bool()
+            prompt_index = attention_mask & labels.eq(IGNORE_INDEX)
+            logits_to_keep = int(labels.ne(IGNORE_INDEX).sum(dim=1).max().item())
 
-            output = LLaDAModelLM.forward(
-                llada_model,
-                input_ids=None,
-                inputs_embeds=inputs_embeds,
-                attention_mask=None,
-                position_ids=None,
-                labels=None,
-                use_cache=False,
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
-                prompt_len=prompt_len,
-                num_items_in_batch=None,
-                modality_indices=modality_indices,
-            )
+            masked_indices = []
+            for mask_seed in mask_seeds:
+                generator = torch.Generator(device=input_ids.device)
+                generator.manual_seed(int(mask_seed))
+                random_matrix = torch.rand(input_ids.shape, device=input_ids.device, generator=generator)
+                is_mask = (~prompt_index) & attention_mask & (random_matrix < float(self.args.p_mask_prompt))
+                masked_indices.append(is_mask)
+            masked_indices = torch.cat(masked_indices, dim=0)
 
-            text_targets = payload["text_target_ids"].unsqueeze(0).expand(num_iterations, -1)
-            text_mask = text_targets.ne(-100)
-            if text_mask.any():
-                text_logps = -F.cross_entropy(
-                    output.logits[text_mask].float(),
-                    text_targets[text_mask],
-                    reduction="none",
-                ).view(num_iterations, -1)
-                text_axis = payload["completion_axis_text"]
-                out[:, sample_idx, text_axis] = text_logps.to(torch.float32)
-
-            gen_targets = payload["gen_targets"]
-            if gen_targets is not None:
-                hidden_states = output.hidden_states[-1]
-                gen_hidden_states = hidden_states[new_token_mask]
-                gen_hidden_states = maybe_truncate_last_dim(gen_hidden_states, llada_model.config.d_model_gen)
-
-                gen_mask = gen_latents_masked == 8193
-                timesteps = gen_mask.float().sum(-1) / gen_mask.shape[-1]
-                expanded_gen_targets = gen_targets.unsqueeze(0).expand(num_iterations, *gen_targets.shape)
-                gen_logits = multimodal_model.call_gen_predictor(
-                    gen_hidden_states,
-                    payload["gen_shape"],
-                    timesteps=timesteps,
+            masked_indices_gen = None
+            gen_latents = inputs.get("gen_latents")
+            if inputs.get("images_gen") is not None and num_image_tokens > 0:
+                masked_indices_gen = self._build_masked_indices_gen(
+                    batch_size=gen_latents.shape[0],
+                    seq_len=num_image_tokens,
+                    device=input_ids.device,
+                    mask_seeds=mask_seeds,
+                    is_unitok=is_unitok,
+                    is_unitok_submask=is_unitok_submask,
                 )
 
-                if expanded_gen_targets.dim() == 3:
-                    batch_dim, depth_dim, seq_dim = expanded_gen_targets.shape
-                    gen_logits = gen_logits.view(batch_dim, seq_dim, *gen_logits.shape[-2:]).permute(0, 2, 1, 3)
-                    image_logps = -F.cross_entropy(
-                        gen_logits.reshape(-1, gen_logits.shape[-1]).float(),
-                        expanded_gen_targets.reshape(-1),
-                        reduction="none",
-                    ).view(batch_dim, depth_dim * seq_dim)
-                else:
-                    image_logps = -F.cross_entropy(
-                        gen_logits.float(),
-                        expanded_gen_targets.reshape(-1),
-                        reduction="none",
-                    ).view(num_iterations, -1)
-
-                image_axis = payload["completion_axis_image"]
-                out[:, sample_idx, image_axis] = image_logps.to(torch.float32)
-        return out
-
-    def _compute_unified_per_token_logps_batched_grad(
-        self,
-        model,
-        inputs: dict[str, Any],
-        mask_seed: int,
-    ) -> torch.Tensor:
-        completion_mask = inputs["completion_mask"]
-        batch_size, token_axis = completion_mask.shape
-        out = torch.zeros(batch_size, token_axis, device=completion_mask.device)
-        unwrapped_model = self.accelerator.unwrap_model(model) if hasattr(self, "accelerator") else model
-        llada_model = self._resolve_llada_forward_model(unwrapped_model)
-        multimodal_model = llada_model.get_model()
-        dtype = multimodal_model.transformer.wte.weight.dtype
-        noise_embedding = multimodal_model.transformer.wte(
-            torch.tensor([self.args.mask_id], device=completion_mask.device)
-        ).view(1, -1)
-        precomputed_mask_seeds = [int(x) for x in inputs.get("score_mask_seeds", [mask_seed])]
-        try:
-            seed_position = precomputed_mask_seeds.index(int(mask_seed))
-        except ValueError as exc:
-            raise ValueError("Requested seed was not precomputed for scoring payloads") from exc
-
-        valid_entries = []
-        for sample_idx, payload in enumerate(inputs["score_payloads"]):
-            if not payload.get("valid", False):
-                continue
-            seq_len = (
-                int(payload["sequence_ids"].size(0))
-                if payload.get("sequence_ids") is not None
-                else int(payload["base_inputs_embeds"].size(0))
+            repeated_inputs = self._repeat_batch_inputs(inputs, repeat_count)
+            output = model.forward(
+                **repeated_inputs,
+                masked_indices=masked_indices,
+                masked_indices_gen=masked_indices_gen,
             )
-            valid_entries.append((sample_idx, payload, seq_len))
 
-        if not valid_entries:
-            return out
-
-        num_valid = len(valid_entries)
-        max_seq_len = max(seq_len for _, _, seq_len in valid_entries)
-        batched_inputs_embeds = torch.zeros(
-            num_valid,
-            max_seq_len,
-            llada_model.config.d_model,
-            dtype=dtype,
-            device=completion_mask.device,
-        )
-        batched_attention_mask = torch.zeros(num_valid, max_seq_len, dtype=torch.long, device=completion_mask.device)
-        batched_masked_indices = torch.zeros(num_valid, max_seq_len, dtype=torch.bool, device=completion_mask.device)
-        batched_modality_indices = torch.zeros(num_valid, max_seq_len, dtype=torch.bool, device=completion_mask.device)
-        batched_new_token_mask = torch.zeros(num_valid, max_seq_len, dtype=torch.bool, device=completion_mask.device)
-        batched_text_targets = torch.full(
-            (num_valid, max_seq_len),
-            -100,
-            dtype=torch.long,
-            device=completion_mask.device,
-        )
-        batched_sequence_ids = torch.zeros(num_valid, max_seq_len, dtype=torch.long, device=completion_mask.device)
-        text_rows = []
-        row_to_sample_idx = []
-
-        for row_idx, (sample_idx, payload, seq_len) in enumerate(valid_entries):
-            row_to_sample_idx.append(sample_idx)
-            batched_attention_mask[row_idx, :seq_len] = 1
-            batched_masked_indices[row_idx, :seq_len] = payload["masked_indices"][seed_position]
-            batched_modality_indices[row_idx, :seq_len] = payload["modality_indices"]
-            batched_new_token_mask[row_idx, :seq_len] = payload["new_token_mask"]
-            batched_text_targets[row_idx, :seq_len] = payload["text_target_ids"]
-            if payload.get("sequence_ids") is not None:
-                batched_sequence_ids[row_idx, :seq_len] = payload["sequence_ids"]
-                text_rows.append(row_idx)
-            else:
-                batched_inputs_embeds[row_idx, :seq_len] = payload["base_inputs_embeds"].to(
-                    device=completion_mask.device, dtype=dtype
+            batch_logps = None
+            answer_logits = output.get("und_logits")
+            if answer_logits is not None and logits_to_keep > 0:
+                answer_logits = answer_logits[:, -logits_to_keep:, :].div(self.temperature)
+                completion_ids = repeated_inputs["input_ids"][:, -logits_to_keep:]
+                batch_logps = selective_log_softmax(answer_logits, completion_ids).view(
+                    repeat_count, input_ids.shape[0], logits_to_keep
                 )
 
-        if text_rows:
-            text_rows_tensor = torch.tensor(text_rows, dtype=torch.long, device=completion_mask.device)
-            text_base_embeds = multimodal_model.transformer.wte(batched_sequence_ids[text_rows_tensor])
-            batched_inputs_embeds[text_rows_tensor] = text_base_embeds.to(dtype=dtype)
-
-        batched_inputs_embeds = torch.where(
-            batched_masked_indices.unsqueeze(-1),
-            noise_embedding.to(dtype=dtype).view(1, 1, -1),
-            batched_inputs_embeds,
-        )
-
-        image_groups: dict[tuple[int, int], list[tuple[int, dict[str, Any], int]]] = {}
-        for row_idx, (sample_idx, payload, _) in enumerate(valid_entries):
-            if payload["gen_latents_masked"] is None:
-                continue
-            gen_shape = tuple(payload["gen_shape"])
-            image_groups.setdefault(gen_shape, []).append((row_idx, payload, sample_idx))
-
-        for gen_shape, group_entries in image_groups.items():
-            group_latents = []
-            for _, payload, _ in group_entries:
-                group_latents.append(payload["gen_latents_masked"][seed_position])
-            group_latents_tensor = torch.stack(group_latents, dim=0)
-            group_embeds = multimodal_model.call_gen_embedding(group_latents_tensor, gen_shape=gen_shape)
-            group_embeds = pad_along_last_dim(group_embeds, llada_model.config.d_model)
-            for local_idx, (row_idx, payload, _) in enumerate(group_entries):
-                row_mask = batched_new_token_mask[row_idx]
-                row_embed = group_embeds[local_idx].reshape(-1, llada_model.config.d_model)
-                batched_inputs_embeds[row_idx] = batched_inputs_embeds[row_idx].masked_scatter(
-                    row_mask.unsqueeze(-1),
-                    row_embed,
+            image_gen_logits = output.get("gen_logits")
+            image_mask = output.get("gen_x_mask")
+            image_targets = output.get("gen_x0_gt")
+            if image_gen_logits is not None and image_mask is not None and image_targets is not None:
+                image_mask = image_mask.reshape(image_mask.shape[0], -1)
+                image_targets = image_targets.reshape(image_targets.shape[0], -1)
+                flat_targets = image_targets[image_mask]
+                image_logps_flat = selective_log_softmax(
+                    image_gen_logits.div(self.temperature),
+                    flat_targets,
                 )
+                counts = image_mask.sum(dim=-1).tolist()
+                max_keep = max(counts) if counts else 0
+                padded_logps = image_gen_logits.new_zeros((image_mask.shape[0], max_keep))
+                cursor = 0
+                for row_idx, keep_count in enumerate(counts):
+                    keep_count = int(keep_count)
+                    if keep_count == 0:
+                        continue
+                    padded_logps[row_idx, :keep_count] = image_logps_flat[cursor : cursor + keep_count]
+                    cursor += keep_count
+                image_logps = padded_logps.view(repeat_count, gen_latents.shape[0], max_keep)
+                if batch_logps is not None:
+                    raise NotImplementedError("Mixed text and image logprob batches are not supported yet.")
+                batch_logps = image_logps
 
-        # One trainable forward for the whole batch avoids ZeRO duplicate gradient reduction.
-        output = LLaDAModelLM.forward(
-            llada_model,
-            input_ids=None,
-            inputs_embeds=batched_inputs_embeds,
-            attention_mask=batched_attention_mask,
-            position_ids=None,
-            labels=None,
-            use_cache=False,
-            output_attentions=False,
-            output_hidden_states=True,
-            return_dict=True,
-            prompt_len=None,
-            num_items_in_batch=None,
-            modality_indices=batched_modality_indices,
-        )
+            if batch_logps is not None:
+                all_logps.append(batch_logps)
 
-        for row_idx, (sample_idx, payload, seq_len) in enumerate(valid_entries):
-            text_axis = payload["completion_axis_text"]
-            if text_axis.numel() > 0:
-                target_mask = batched_text_targets[row_idx, :seq_len].ne(-100)
-                row_text_targets = batched_text_targets[row_idx, :seq_len][target_mask]
-                if row_text_targets.numel() > 0:
-                    row_text_logps = -F.cross_entropy(
-                        output.logits[row_idx, :seq_len][target_mask].float(),
-                        row_text_targets,
-                        reduction="none",
-                    )
-                    out[sample_idx, text_axis] = row_text_logps.to(torch.float32)
-
-        hidden_states = output.hidden_states[-1]
-        for gen_shape, group_entries in image_groups.items():
-            group_targets = []
-            group_latents = []
-            group_hidden_states = []
-            sample_indices = []
-            for row_idx, payload, sample_idx in group_entries:
-                row_mask = batched_new_token_mask[row_idx]
-                group_hidden_states.append(hidden_states[row_idx][row_mask])
-                group_targets.append(payload["gen_targets"])
-                group_latents.append(payload["gen_latents_masked"][seed_position])
-                sample_indices.append(sample_idx)
-
-            group_hidden_states_tensor = torch.stack(group_hidden_states, dim=0)
-            group_hidden_states_tensor = maybe_truncate_last_dim(
-                group_hidden_states_tensor,
-                llada_model.config.d_model_gen,
-            )
-            flat_group_hidden_states = group_hidden_states_tensor.reshape(-1, group_hidden_states_tensor.size(-1))
-            group_targets_tensor = torch.stack(group_targets, dim=0)
-            group_latents_tensor = torch.stack(group_latents, dim=0)
-            timesteps = group_latents_tensor.eq(8193).float().sum(-1) / group_latents_tensor.shape[-1]
-            gen_logits = multimodal_model.call_gen_predictor(
-                flat_group_hidden_states,
-                gen_shape,
-                timesteps=timesteps,
-            )
-
-            if group_targets_tensor.dim() == 3:
-                batch_dim, depth_dim, seq_dim = group_targets_tensor.shape
-                gen_logits = gen_logits.view(batch_dim, seq_dim, *gen_logits.shape[-2:]).permute(0, 2, 1, 3)
-                image_logps = -F.cross_entropy(
-                    gen_logits.reshape(-1, gen_logits.shape[-1]).float(),
-                    group_targets_tensor.reshape(-1),
-                    reduction="none",
-                ).view(batch_dim, depth_dim * seq_dim)
-            else:
-                image_logps = -F.cross_entropy(
-                    gen_logits.float(),
-                    group_targets_tensor.reshape(-1),
-                    reduction="none",
-                ).view(group_targets_tensor.size(0), -1)
-
-            for local_idx, (_, payload, sample_idx) in enumerate(group_entries):
-                image_axis = payload["completion_axis_image"]
-                out[sample_idx, image_axis] = image_logps[local_idx, : image_axis.numel()].to(torch.float32)
-
-        return out
+        return self._pad_and_concat_logps(all_logps)
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -1246,12 +1177,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
         completion_mask = inputs["completion_mask"].float()
         mask_seeds = inputs["mask_seeds"]
         this_itr_idx = self._step % num_iterations
-        if torch.is_tensor(mask_seeds):
-            this_itr_seed = int(mask_seeds[this_itr_idx].item())
-        else:
-            this_itr_seed = int(mask_seeds[this_itr_idx])
-
-        per_token_logps = self._compute_unified_per_token_logps_batched_grad(model, inputs, this_itr_seed)
+        per_token_logps = self._get_per_token_logps(model, inputs, [mask_seeds[this_itr_idx]])
         if beta != 0.0:
             ref_per_token_logps = inputs["ref_per_token_logps"][this_itr_idx]
             per_token_kl = (
@@ -1309,13 +1235,9 @@ class DiffuGRPOTrainer(GRPOTrainer):
         prompts = [x["prompt"] for x in inputs]
         sample_modes = [x.get("task_type", "text") for x in inputs]
 
-        completion_tokens_per_sample = [None] * len(inputs)
-        completion_masks_per_sample = [None] * len(inputs)
-        text_prompt_ids = [None] * len(inputs)
-        text_completion_ids = [None] * len(inputs)
+        # text_completion_ids = [None] * len(inputs)
         image_contexts = [None] * len(inputs)
-        completions_text = [""] * len(inputs)
-        prompts_text = [""] * len(inputs)
+        answer_contexts = [None] * len(inputs)
 
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
             image_edit_indices = [idx for idx, mode in enumerate(sample_modes) if mode == "image_edit"]
@@ -1323,34 +1245,17 @@ class DiffuGRPOTrainer(GRPOTrainer):
             for start_idx in trange(0, len(image_edit_indices), image_edit_batch_size, desc="Image Rollout"):
                 batch_indices = image_edit_indices[start_idx : start_idx + image_edit_batch_size]
                 batch_examples = [inputs[idx] for idx in batch_indices]
-                batch_latents, batch_contexts = self._rollout_image_edit_latents(unwrapped_model, batch_examples)
-                for local_idx, sample_idx in enumerate(batch_indices):
-                    completion_flat = batch_latents[local_idx].flatten()
-                    completion_tokens_per_sample[sample_idx] = completion_flat
-                    completion_masks_per_sample[sample_idx] = torch.ones_like(
-                        completion_flat, dtype=torch.int, device=completion_flat.device
-                    )
-                    image_contexts[sample_idx] = batch_contexts[local_idx]
-                    completions_text[sample_idx] = "<image_latents>"
-                    prompts_text[sample_idx] = self._build_llada_prompt(inputs[sample_idx].get("prompt", []))
+                _, batch_contexts = self._rollout_image_edit_latents(unwrapped_model, batch_examples)
+                for batch_offset, sample_idx in enumerate(batch_indices):
+                    # completion_tokens_per_sample[sample_idx] = image_completion_ids[batch_offset].detach()
+                    image_contexts[sample_idx] = batch_contexts[batch_offset]
+            image_processor = self._get_image_processor(unwrapped_model)
 
             for idx, example in tqdm(enumerate(inputs), desc=f"Text Rollout"):
                 mode = sample_modes[idx]
                 if mode == "image_edit":
                     continue
                 else:
-                    prompt_text = self._build_llada_prompt(example["prompt"])
-                    prompt_ids = tokenizer_image_token(
-                        prompt_text,
-                        self.processing_class,
-                        IMAGE_TOKEN_INDEX,
-                        return_tensors="pt",
-                    ).to(device)
-                    if self.max_prompt_length is not None:
-                        prompt_ids = prompt_ids[-self.max_prompt_length :]
-                    prompt_ids = prompt_ids.unsqueeze(0)
-                    prompt_mask = torch.ones_like(prompt_ids, dtype=torch.long, device=device)
-
                     prefix_lm = bool(getattr(self.args, "prefix_lm", True))
                     generation_kwargs = {
                         "max_new_tokens": int(self.args.max_completion_length),
@@ -1366,113 +1271,65 @@ class DiffuGRPOTrainer(GRPOTrainer):
                         "cfg_scale": self.args.cfg_scale,
                     }
                     generation_kwargs = {k: v for k, v in generation_kwargs.items() if v is not None}
-
-                    generated = unwrapped_model.generate(
-                        inputs=prompt_ids,
-                        attention_mask=prompt_mask,
-                        pad_token_id=self.processing_class.pad_token_id,
-                        use_cache=True,
-                        **generation_kwargs,
+                    _, text_context = self._rollout_multimodal_text_gen(
+                        unwrapped_model,
+                        example,
+                        image_processor,
+                        generation_kwargs,
+                        device,
                     )
-                    if hasattr(generated, "sequences"):
-                        generated = generated.sequences
-                    if isinstance(generated, tuple):
-                        generated = generated[0]
+                
+                # text_completion_ids[idx] = sample_text_completion_ids.squeeze(0).detach()
+                answer_contexts[idx] = text_context
 
-                    norm_prompt_ids, completion_ids = self._normalize_text_rollout(
-                        generated, prompt_ids, prefix_lm
-                    )
-                    completion_mask = self._build_text_completion_mask(completion_ids)
+            image_data_list = [
+                image_context["payload"]
+                for image_context in image_contexts
+            ] # len(image_contexts)
+            text_data_list = [
+                answer_context["payload"] 
+                for answer_context in answer_contexts
+            ] # len(answer_contexts)
+            image_dataset = LazySupervisedDataset(
+                tokenizer=self.processing_class,
+                data_args=self.args,
+                list_data=image_data_list,
+            )
+            text_dataset = LazySupervisedDataset(
+                tokenizer=self.processing_class,
+                data_args=self.args,
+                list_data=text_data_list,
+            )
+            dataset = ConcatDataset(image_dataset, text_dataset)
+            collate_fn = MaskDataCollator(self.processing_class, self.args)
+            data_loader = DataLoader(
+                dataset,
+                batch_size=self.args.batch_size,
+                shuffle=False,
+                collate_fn=collate_fn,
+            )
+            mask_seeds = torch.randint(0, 2**12, (self.args.num_iterations,), device=device)
 
-                    completion_tokens_per_sample[idx] = completion_ids.squeeze(0)
-                    completion_masks_per_sample[idx] = completion_mask.squeeze(0).to(device)
-                    text_prompt_ids[idx] = norm_prompt_ids.squeeze(0)
-                    text_completion_ids[idx] = completion_ids.squeeze(0)
-                    completions_text[idx] = self.processing_class.decode(
-                        completion_ids.squeeze(0), skip_special_tokens=True
-                    )
-                    prompts_text[idx] = prompt_text
-
-        if any(x is None for x in completion_tokens_per_sample):
-            raise ValueError("Missing completion tokens for one or more samples during rollout")
-        max_completion_len = max(x.numel() for x in completion_tokens_per_sample) if completion_tokens_per_sample else 0
-        completion_ids = torch.zeros(
-            len(inputs),
-            max_completion_len,
-            dtype=torch.long,
-            device=device,
-        )
-        completion_mask = torch.zeros(
-            len(inputs),
-            max_completion_len,
-            dtype=torch.int,
-            device=device,
-        )
-        for i, (ids, mask) in enumerate(zip(completion_tokens_per_sample, completion_masks_per_sample)):
-            l = ids.numel()
-            completion_ids[i, :l] = ids.to(device)
-            completion_mask[i, :l] = mask.to(device)
-
-        num_iterations = int(getattr(self.args, "num_iterations", 1))
-        beta = float(getattr(self.args, "beta", 0.0))
-        if self.args.random_masking:
-            mask_seeds = torch.randint(0, 2**12, (num_iterations,), device=device)
-        else:
-            mask_seeds = torch.tensor([42] * num_iterations, device=device)
-        mask_seed_list = [int(x) for x in mask_seeds.tolist()]
-        score_payloads = []
-        for idx, mode in enumerate(sample_modes):
-            valid_len = int(completion_mask[idx].sum().item())
-            if mode == "image_edit":
-                payload = self._build_image_score_payload(
-                    image_contexts[idx],
-                    completion_ids[idx],
-                    valid_len,
-                    mask_seed_list,
-                    device,
-                )
-            else:
-                payload = self._build_text_score_payload(
-                    text_prompt_ids[idx],
-                    text_completion_ids[idx],
-                    completion_mask[idx],
-                    mask_seed_list,
-                )
-            score_payloads.append(self._detach_structure(payload))
-
-        scoring_inputs = {
-            "sample_modes": sample_modes,
-            "text_prompt_ids": text_prompt_ids,
-            "text_completion_ids": text_completion_ids,
-            "image_contexts": image_contexts,
-            "score_payloads": score_payloads,
-            "score_mask_seeds": mask_seed_list,
-            "completion_ids": completion_ids,
-            "completion_mask": completion_mask,
-        }
-
-        all_old_per_token_logps = None
-        all_ref_per_token_logps = None
+        
         with torch.no_grad():
-            if num_iterations > 1:
-                all_old_per_token_logps = self._compute_unified_per_token_logps(
-                    self.model, scoring_inputs, mask_seed_list
-                )
+            old_per_token_logps = self._get_per_token_logps(
+                self.model, data_loader, mask_seeds
+            )
             if beta != 0.0:
                 if getattr(self, "ref_model", None) is not None:
-                    all_ref_per_token_logps = self._compute_unified_per_token_logps(
-                        self.ref_model, scoring_inputs, mask_seed_list
+                    all_ref_per_token_logps = self._get_per_token_logps(
+                        self.ref_model, data_loader, mask_seeds
                     )
                 else:
                     unwrapped = self.accelerator.unwrap_model(self.model)
                     if hasattr(unwrapped, "disable_adapter"):
                         with unwrapped.disable_adapter():
-                            all_ref_per_token_logps = self._compute_unified_per_token_logps(
-                                self.model, scoring_inputs, mask_seed_list
+                            all_ref_per_token_logps = self._get_per_token_logps(
+                                self.model, data_loader, mask_seeds
                             )
                     else:
-                        all_ref_per_token_logps = self._compute_unified_per_token_logps(
-                            self.model, scoring_inputs, mask_seed_list
+                        all_ref_per_token_logps = self._get_per_token_logps(
+                            self.model, data_loader, mask_seeds
                         )
 
         completions = []

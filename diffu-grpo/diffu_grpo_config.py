@@ -558,7 +558,7 @@ class DiffuGRPOConfig(TrainingArguments):
     dataset: Optional[str] = field(
         default="gsm8k",
         metadata={
-            "help": "Training dataset name. Supported values include gsm8k, countdown, sudoku, math, code, thinkmorph_edit, and mixed_placeholder."
+            "help": "Training dataset name. Supported values include gsm8k, countdown, sudoku, math, code, thinkmorph_edit, thinkmorph_answer, and mixed_placeholder."
         },
     )
     p_mask_prompt: float = field(

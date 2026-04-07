@@ -53,7 +53,7 @@ def build_dataset_lazy(data_path: str, tokenizer: transformers.PreTrainedTokeniz
                     cur_data_dict = json.load(file)
                     rank0_print(f"Loaded {len(cur_data_dict)} samples from {full_path}")
                     list_data_dict.extend(cur_data_dict)
-            return LazySupervisedDataset(data_path, tokenizer, data_args, prepend_folder=prepend_folder, list_data=list_data_dict)
+            return LazySupervisedDataset(tokenizer, data_args, prepend_folder=prepend_folder, list_data=list_data_dict)
     elif data_path.endswith(".yaml"):
         prepend_folder = False # we load image root from yaml and ignore args
         with open(data_path, "r") as file:
@@ -146,7 +146,7 @@ def build_dataset_lazy(data_path: str, tokenizer: transformers.PreTrainedTokeniz
                 rank0_print(f"Loaded {len(cur_data_dict)} / {raw_length} samples from {json_path}")
                 dataset_name = dataset.get('name','none')
                 this_dataset = LazySupervisedDataset(
-                    json_path, tokenizer, data_args, prepend_folder=prepend_folder, list_data=cur_data_dict, preprocess_fn=preprocess_fn,name=dataset_name
+                    tokenizer, data_args, prepend_folder=prepend_folder, list_data=cur_data_dict, preprocess_fn=preprocess_fn,name=dataset_name
                 )
                 _ = this_dataset[0]  # Trigger the loading of the first sample for debugging
                 all_dataset_objs.append((this_dataset,length_group))
@@ -193,18 +193,14 @@ def build_dataset_lazy(data_path: str, tokenizer: transformers.PreTrainedTokeniz
             return LazySupervisedDataset(data_path, tokenizer, data_args, prepend_folder=prepend_folder, list_data=cur_data_dict)
 
 class LazySupervisedDataset(Dataset):
-    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer, data_args,prepend_folder: bool = True,list_data=None,preprocess_fn=None,name=None):
+    def __init__(self, tokenizer: transformers.PreTrainedTokenizer, data_args,prepend_folder: bool = True,list_data=None,preprocess_fn=None,name=None):
         super(LazySupervisedDataset, self).__init__()
         self.tokenizer = tokenizer
         self.list_data_dict = list_data
         self.preprocess_fn = preprocess_fn
         self.prepend_folder = prepend_folder
         self.name = name
-        # Handle multiple JSON files specified in the data_path
-
-
-        rank0_print(f"Loaded {len(self.list_data_dict)} samples from {data_path}")
-        rank0_print("Formatting inputs...Skip in lazy mode")
+        rank0_print(f"Loaded {len(self.list_data_dict)} samples")
         self.tokenizer = tokenizer
         self.data_args = data_args
         # self.image_cache = {}
@@ -375,7 +371,6 @@ class LazySupervisedDataset(Dataset):
                 image_gen_enc_dict = [self.process_image_gen(image_file_enc,image_cache=image_cache,pad=True)]
             image_gen_enc = [x['image'] for x in image_gen_enc_dict]
             #micro_conds_texts = [x['micro_conds_text'] for x in image_gen_dict]
-
 
         if "image_gen" in sources[0] and sources[0]["image_gen"] is not None:
             image_file = sources[0]["image_gen"]

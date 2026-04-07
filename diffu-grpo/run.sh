@@ -18,11 +18,11 @@ export TRITON_CACHE_DIR="${SLURM_TMPDIR:-/tmp}/triton-${USER}/${SLURM_JOB_ID:-$$
 
 mkdir -p "$TRITON_CACHE_DIR"
 chmod 700 "$TRITON_CACHE_DIR"
-DATASET="thinkmorph_edit"
+DATASET="thinkmorph_edit" # thinkmorph_edit, thinkmorph_answer
 RUN_NAME=${DATASET}_Test-LavidaO
 # MODEL_PATH=/group2/dgm/yoonjeon/ckpts/sft-lavidao-thinkmorph-complete/checkpoint-2420
-MODEL_PATH="/scratch2/yoonjeon.kim/sft_LaViDa-O-thinkmorph_zebracot-step3000/"
-OUTPUT_DIR=/scratch2/yoonjeon.kim/rl-lavidao-thinkmorph/$RUN_NAME
+MODEL_PATH="/group2/dgm/yoonjeon/ckpts/sft_LaViDa-O-thinkmorph_zebracot/checkpoint-3000"
+OUTPUT_DIR=/group2/dgm/yoonjeon/ckpts/rl-lavidao-thinkmorph/$RUN_NAME
 
 # ----------------------------
 # Model initialization configs
@@ -183,4 +183,5 @@ python -m accelerate.commands.launch \
     --num_generations $NUM_GENERATIONS \
     --per_device_train_batch_size $PER_DEVICE_TRAIN_BS \
     --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
-    --save_steps 20000
+    --save_steps 50 \
+    --log_completions

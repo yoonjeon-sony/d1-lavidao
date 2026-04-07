@@ -3,7 +3,7 @@ export WANDB_PROJECT="rl-lavidao-thinkmorph"
 export MASTER_ADDR=127.0.0.1
 export NCCL_SOCKET_FAMILY=AF_INET
 export GLOO_SOCKET_FAMILY=AF_INET
-DATASET="${DATASET:-thinkmorph_edit}" # thinkmorph, thinkmorph_edit, thinkmorph_grounding
+DATASET="${DATASET:-thinkmorph_edit}" # thinkmorph, thinkmorph_edit, thinkmorph_answer, thinkmorph_grounding
 DEBUG="${DEBUG:-0}"
 if [[ "${DATASET}" == "thinkmorph" ]]; then
     STEPS_PER_GENERATION=1

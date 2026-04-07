@@ -229,6 +229,70 @@ def get_image_edit_placeholder_questions(split: str = "train") -> Dataset:
     return Dataset.from_list(rows)
 
 
+def get_image_answer_placeholder_questions(split: str = "train") -> Dataset:
+    if split != "train":
+        raise ValueError(f"Unsupported split '{split}' for ThinkMorph image answer data. Use 'train'.")
+
+    data_root = THINKMORPH_DEFAULT_DATA_ROOT
+    image_root = THINKMORPH_DEFAULT_IMAGE_ROOT
+    train_data_paths = [os.path.join(data_root, name) for name in THINKMORPH_LOCAL_JSONL_FILES]
+
+    missing_paths = [path for path in train_data_paths if not os.path.isfile(path)]
+    if missing_paths:
+        missing_str = ", ".join(missing_paths)
+        raise FileNotFoundError(f"ThinkMorph jsonl file(s) not found: {missing_str}")
+
+    rows: list[dict] = []
+    for data_path in train_data_paths:
+        with open(data_path, "r", encoding="utf-8") as f:
+            for idx, line in enumerate(
+                tqdm(f, desc=f"Loading {os.path.basename(data_path)}", unit="line")
+            ):
+                if not line.strip():
+                    continue
+
+                example = json.loads(line)
+                sample_id = str(example.get("pid", f"{os.path.basename(data_path)}:{idx}"))
+
+                question = example.get("question")
+                image_input_rel = example.get("problem_image_0")
+                answer = example.get("answer")
+
+                if not isinstance(question, str) or not question.strip():
+                    raise ValueError(
+                        f"ThinkMorph sample '{sample_id}' has invalid question: {question!r}"
+                    )
+                if not isinstance(image_input_rel, str) or not image_input_rel.strip():
+                    raise ValueError(
+                        f"ThinkMorph sample '{sample_id}' has invalid problem_image_0: "
+                        f"{image_input_rel!r}"
+                    )
+                if not isinstance(answer, str) or not answer.strip():
+                    raise ValueError(
+                        f"ThinkMorph sample '{sample_id}' has invalid answer: {answer!r}"
+                    )
+
+                instruction = f"{COT_PROMPT} {question.strip()}"
+                image_input = os.path.join(image_root, image_input_rel)
+
+                rows.append(
+                    {
+                        "task_type": "text",
+                        "prompt": [
+                            {
+                                "role": "user",
+                                "content": f"<image>\n{instruction}",
+                            }
+                        ],
+                        "instruction": instruction,
+                        "image": image_input,
+                        "answer_gt": answer.strip(),
+                    }
+                )
+
+    return Dataset.from_list(rows)
+
+
 def get_mixed_placeholder_questions(split: str = "train") -> Dataset:
     """Placeholder mixed schema for future text+image integration tests."""
     rows = [
