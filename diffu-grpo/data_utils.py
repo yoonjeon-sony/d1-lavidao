@@ -266,9 +266,8 @@ THINKMORPH_LOCAL_JSONL_FILES = (
     "ThinkMorph-Chart_Refocus_loc_train.jsonl",
     "ThinkMorph-Jigsaw_Assembly_loc_train.jsonl",
 )
-THINKMORPH_DEFAULT_DATA_ROOT = "/home/yoonjeon.kim/dLLM-RL/train_sft/data"
-THINKMORPH_DEFAULT_IMAGE_ROOT = "/group2/dgm/yoonjeon/data"
-
+THINKMORPH_DEFAULT_DATA_ROOT = "/home/yoonjeon.kim/dllm-RL/data/"
+THINKMORPH_DEFAULT_IMAGE_ROOT = "/scratch2/yoonjeon.kim/data/"
 ARXIVQA_JSONL = "arxivqa.jsonl"
 ARXIVQA_DEFAULT_IMAGE_ROOT = "/group2/dgm/yoonjeon/data/arxivqa"
 

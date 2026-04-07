@@ -3,8 +3,9 @@ import os
 import sys
 import warnings
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Union, List
 
+from tqdm import tqdm, trange
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -36,21 +37,120 @@ if str(LAVIDA_ROOT) not in sys.path:
 
 from llava.constants import IMAGE_TOKEN_INDEX
 from llava.conversation import conv_templates
-from llava.mm_utils import process_images, tokenizer_image_token
+
+from llava.mm_utils import pad_to_square_and_resize, process_images, tokenizer_image_token
 from llava.model.language_model.llava_llada import (
     LlavaLladaConfig,
     LlavaLladaForMaskedDiffusion,
 )
 from llava.model.language_model.llada.modeling_llada import LLaDAModelLM
 from llava.model.language_model.llada.generate import (
+    add_gumbel_noise,
+    cosine_schedule_2,
+    exp_schedule,
     get_logits as llada_get_logits,
     get_num_transfer_tokens_sch,
+    logit_normal_schedule,
     wte as llada_wte,
 )
 from llava.model.utils import maybe_truncate_last_dim, pad_along_last_dim
 
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
+
+def stratified_random(n: int = 64, seed: Optional[int] = None, shuffle_blocks: bool = True) -> List[int]:
+    """
+    Progressive Multi‑Jittered (PMJ) ordering over an n×n integer grid, n must be a power of two.
+
+    The algorithm recursively subdivides the full grid into 2×2 blocks. At each level, it ensures
+    every sub‑block contains exactly one sample by placing a new integer‑grid point uniformly at
+    random in each sub‑block that doesn't already contain a sample from a previous level. The
+    resulting sequence is progressive: the first 4^k samples are 1‑per‑cell stratified over a
+    (n/2^k)×(n/2^k) tiling of the domain.
+
+    Returns
+    -------
+    List[int]
+        Row‑major linear indices y*n + x for x,y in [0, n).
+    """
+    # Validate power of two
+    if n <= 0 or (n & (n - 1)) != 0:
+        raise ValueError("n must be a positive power of two (e.g., 64)")
+
+    rng = random.Random(seed)
+
+    # Occupancy grid: False means empty, True means already sampled
+    occupied = [[False] * n for _ in range(n)]
+
+    # The progressive sequence (row‑major linear indices)
+    seq: List[int] = []
+
+    # A block is represented as (x0, y0, size)
+    blocks: List[Tuple[int, int, int]] = [(0, 0, n)]
+
+    def block_has_sample(x0: int, y0: int, size: int) -> bool:
+        for yy in range(y0, y0 + size):
+            row = occupied[yy]
+            for xx in range(x0, x0 + size):
+                if row[xx]:
+                    return True
+        return False
+
+    def place_random_in_block(x0: int, y0: int, size: int):
+        # Because we only call this on blocks known to be empty, a single draw suffices.
+        x = rng.randrange(x0, x0 + size)
+        y = rng.randrange(y0, y0 + size)
+        # Safety: loop until we hit an empty cell (should be first try for empty block)
+        attempts = 0
+        while occupied[y][x]:
+            x = rng.randrange(x0, x0 + size)
+            y = rng.randrange(y0, y0 + size)
+            attempts += 1
+            if attempts > 10000:
+                raise RuntimeError("Too many attempts to place a sample; logic error?")
+        occupied[y][x] = True
+        seq.append(y * n + x)
+
+    # Iterate levels until block size == 1
+    size = n
+    while size > 1:
+        # Subdivide each block into 4 children
+        half = size // 2
+        children: List[Tuple[int, int, int]] = []
+        for (x0, y0, s) in blocks:
+            assert s == size
+            children.extend([
+                (x0, y0, half),                # NW
+                (x0 + half, y0, half),         # NE
+                (x0, y0 + half, half),         # SW
+                (x0 + half, y0 + half, half),  # SE
+            ])
+        # Optionally randomize visitation order to reduce directional bias in sequence order
+        if shuffle_blocks:
+            rng.shuffle(children)
+        # For each child, if empty, place a random sample inside it
+        for (x0, y0, s) in children:
+            if not block_has_sample(x0, y0, s):
+                place_random_in_block(x0, y0, s)
+        # Next level
+        blocks = children
+        size = half
+
+    # At this point, every 1×1 cell is a block; any still‑empty cells need to be appended
+    # (these are exactly those not yet selected at previous levels).
+    # To preserve the progressive property, all remaining cells are appended in a random order.
+    # (Any order works because they are all 1×1; using random makes ties less structured.)
+    remaining: List[int] = []
+    for y in range(n):
+        for x in range(n):
+            if not occupied[y][x]:
+                remaining.append(y * n + x)
+    rng.shuffle(remaining)
+    seq.extend(remaining)
+
+    assert len(seq) == n * n, (len(seq), n * n)
+
+    return seq
 
 def _register_lavida_architectures() -> None:
     # TRL resolves ref-model classes via `getattr(transformers, config.architectures[0])`.
@@ -120,9 +220,11 @@ class DiffuGRPOTrainer(GRPOTrainer):
         return value
 
     def _get_image_edit_gen_dict(self) -> dict[str, Any]:
-        token_map = {256: 256, 512: 1024, 1024: 4096}
+        latent_token_map = {256: 256, 512: 1024, 1024: 4096}
+        prompt_token_map = {256: 64, 512: 256, 1024: 1024}
         res = int(self.args.image_edit_resolution)
-        n_tokens = token_map.get(res, int(self.args.image_edit_n_tokens))
+        n_tokens = latent_token_map.get(res, int(self.args.image_edit_n_tokens))
+        prompt_n_tokens = prompt_token_map.get(res, max(1, n_tokens // 4))
         return {
             "sample_policy": self.args.image_edit_sample_policy,
             "confidence_policy": self.args.image_edit_confidence_policy,
@@ -131,6 +233,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
             "batch_size": int(self.args.image_edit_batch_size),
             "image_resolution": res,
             "n_tokens": n_tokens,
+            "prompt_n_tokens": prompt_n_tokens,
             "shift": int(self.args.image_edit_shift),
             "n_steps": int(self.args.image_edit_n_steps),
             "schedule": self.args.image_edit_schedule,
@@ -233,6 +336,50 @@ class DiffuGRPOTrainer(GRPOTrainer):
             return self._load_image(image_like[0])
         return image_like
 
+    @staticmethod
+    def _debug_mm_image_shapes_enabled() -> bool:
+        flag = os.environ.get("DEBUG_MM_IMAGE_SHAPES", "")
+        return flag.lower() not in {"", "0", "false", "no"}
+
+    @staticmethod
+    def _describe_mm_image_payload(images: Any) -> str:
+        if isinstance(images, list):
+            shapes = [tuple(img.shape) if torch.is_tensor(img) else type(img).__name__ for img in images]
+            ranks = [img.ndim if torch.is_tensor(img) else None for img in images]
+            return f"type=list len={len(images)} ranks={ranks} shapes={shapes}"
+        if torch.is_tensor(images):
+            return f"type=tensor rank={images.ndim} shape={tuple(images.shape)}"
+        return f"type={type(images).__name__}"
+
+    # def _log_mm_image_shapes(self, message: str, **payload: Any) -> None:
+        # if not self._debug_mm_image_shapes_enabled():
+        #     return
+        # details = ", ".join(f"{key}={value}" for key, value in payload.items())
+        # print(f"[DEBUG_MM_IMAGE_SHAPES] {message}: {details}")
+
+    def _normalize_mm_image_payload(self, image_tensor: Any, *, dtype: torch.dtype, device: torch.device) -> list[torch.Tensor]:
+        if isinstance(image_tensor, list):
+            return [_x.to(dtype=dtype, device=device) for _x in image_tensor]
+        image_tensor = image_tensor.to(dtype=dtype, device=device)
+        return [img for img in image_tensor]
+
+    def _check_mm_payload_before_prepare_inputs(self, images: list[torch.Tensor]) -> None:
+        normalized_images = [image.unsqueeze(0) if image.ndim == 3 else image for image in images]
+        predicted_shapes = [tuple(image.shape) for image in normalized_images]
+        concat_images = torch.cat(normalized_images, dim=0)
+        # self._log_mm_image_shapes(
+        #     "rollout_image_edit_latents.predicted_prepare_inputs",
+        #     normalized_shapes=predicted_shapes,
+        #     concat_shape=tuple(concat_images.shape),
+        # )
+        if concat_images.ndim != 4:
+            raise ValueError(
+                "Image payload would become non-4D before encode_images: "
+                f"input={self._describe_mm_image_payload(images)}, "
+                f"normalized_shapes={predicted_shapes}, "
+                f"concat_shape={tuple(concat_images.shape)}"
+            )
+
     def _get_image_processor(self, model):
         if hasattr(model, "get_vision_tower"):
             vt = model.get_vision_tower()
@@ -246,135 +393,287 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     return vt.image_processor
         return None
 
-    def _rollout_image_edit_latents(self, model, example: dict[str, Any]) -> tuple[torch.Tensor, dict[str, Any]]:
-        gen_cfg = self._get_image_edit_gen_dict()
-        instruction = example.get("instruction")
-        if instruction is None:
-            prompt_data = example.get("prompt", [{"role": "user", "content": ""}])
-            if isinstance(prompt_data, list) and len(prompt_data) > 0:
-                instruction = prompt_data[-1].get("content", "")
-            else:
-                instruction = ""
+    @staticmethod
+    def _left_pad_2d(tensors: list[torch.Tensor], pad_value: int, dtype_: torch.dtype) -> torch.Tensor:
+        if len(tensors) == 0:
+            return torch.empty(0, 0, dtype=dtype_)
+        max_len = max(t.shape[1] for t in tensors)
+        out = []
+        for t in tensors:
+            pad_len = max_len - t.shape[1]
+            if pad_len > 0:
+                pad_t = torch.full((t.shape[0], pad_len), pad_value, dtype=dtype_, device=t.device)
+                t = torch.cat([pad_t, t], dim=1)
+            out.append(t)
+        return torch.cat(out, dim=0)
 
+    @staticmethod
+    def _image_edit_gumbel_noise(tensor: torch.Tensor) -> torch.Tensor:
+        noise = torch.zeros_like(tensor, dtype=torch.float32).uniform_(0, 1)
+        return -torch.log(-torch.log(noise))
+
+    def _extract_image_edit_instruction(self, example: dict[str, Any]) -> str:
+        instruction = example.get("instruction")
+        if instruction is not None:
+            return instruction
+        prompt_data = example.get("prompt", [{"role": "user", "content": ""}])
+        if isinstance(prompt_data, list) and len(prompt_data) > 0:
+            return prompt_data[-1].get("content", "")
+        return ""
+
+    def _make_invalid_image_edit_ctx(
+        self,
+        latent_template: torch.Tensor,
+    ) -> dict[str, Any]:
+        return {
+            "valid": False,
+            "latent_shape": tuple(latent_template.shape),
+            "decoded_image": None,
+        }
+
+    def _build_image_edit_temperature_schedule(
+        self,
+        n_steps: int,
+        schedule_name: str,
+        min_temperature: float,
+        shift: int,
+    ) -> torch.Tensor:
+        temperatures = torch.linspace(0, 1, n_steps, device="cpu").numpy()
+        if schedule_name == "linear":
+            temperatures = (1 - temperatures) * (1 - min_temperature) + min_temperature
+        elif schedule_name == "cosine2":
+            temperatures = cosine_schedule_2(1 - temperatures) * (1 - min_temperature) + min_temperature
+        elif schedule_name == "shift":
+            temperatures = logit_normal_schedule(shift, 1 - temperatures) * (1 - min_temperature) + min_temperature
+        elif schedule_name == "exp":
+            temperatures = exp_schedule(1 - temperatures) * (1 - min_temperature) + min_temperature
+        else:
+            raise NotImplementedError(f"Unknown image-edit temperature schedule: {schedule_name}")
+        return torch.tensor(temperatures, dtype=torch.float32)
+
+    def _rollout_image_edit_latents(
+        self,
+        model,
+        examples: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, list[dict[str, Any]]]:
+        if isinstance(examples, dict):
+            examples = [examples]
+        gen_cfg = self._get_image_edit_gen_dict()
+        device = model.device
+        batch_size = len(examples)
         reserve_id = 126089
         reserve_id2 = 126090
         img_mask_id = 8193
-
-        image = self._load_image(example.get("image"))
+        reserve_token = "<|reserved_token_5|>"
+        reserve_token_2 = "<|reserved_token_6|>"
         image_processor = self._get_image_processor(model)
-        if image is None or image_processor is None:
-            fake_latents = torch.full(
-                (1, gen_cfg["n_tokens"]),
-                img_mask_id,
-                dtype=torch.long,
-                device=model.device,
+        base_model = model.get_model() if hasattr(model, "get_model") else model
+        conv_version = getattr(self.args, "version", "llada")
+        if conv_version not in conv_templates:
+            conv_version = "llada"
+        gen_shape_map = {1024: (64, 64), 512: (32, 32), 256: (16, 16)}
+        gen_shape = gen_shape_map.get(gen_cfg["image_resolution"], (32, 32))
+        is_unitok = "unitok" in getattr(base_model.config, "mm_vqvae", "")
+        latent_shape = (8, gen_cfg["n_tokens"]) if is_unitok else (gen_cfg["n_tokens"],)
+
+        batch_latents = [
+            torch.full(latent_shape, img_mask_id, dtype=torch.long, device=device) for _ in range(batch_size)
+        ]
+        image_contexts = [self._make_invalid_image_edit_ctx(batch_latents[idx]) for idx in range(batch_size)]
+
+        if (
+            image_processor is None
+            or not hasattr(model, "encode_image_gen")
+            or not hasattr(base_model, "call_gen_embedding")
+            or not hasattr(base_model, "image_processor_gen")
+        ):
+            return torch.stack(batch_latents, dim=0), image_contexts
+
+        valid_indices = []
+        all_input_ids = []
+        all_edit_images = []
+        image_sizes = []
+        all_enc_embeddings = []
+        vq_latents = []
+        for batch_idx, example in enumerate(examples):
+            edit_image = self._load_image(example.get("image"))
+            if edit_image is None:
+                continue
+            instruction = self._extract_image_edit_instruction(example)
+            valid_indices.append(batch_idx)
+            image_sizes.append(edit_image.size)
+            all_edit_images.append(edit_image)
+
+            image_1024 = pad_to_square_and_resize(edit_image.convert("RGB"), gen_cfg["image_resolution"])
+            vq_latent = base_model.image_processor_gen.preprocess(image_1024).to(device, dtype=model.dtype)
+            vq_latents.append(vq_latent)
+
+            enc_latents, enc_shape = model.encode_image_gen(vq_latent, enc=True)
+            enc_embeddings = base_model.call_gen_embedding(enc_latents, enc_shape, enc=True)
+            all_enc_embeddings.append(enc_embeddings)
+
+            conv = copy.deepcopy(conv_templates[conv_version])
+            conv.append_message(
+                conv.roles[0],
+                f"<image> {reserve_token_2 * enc_embeddings.shape[1]}\n {instruction} ",
             )
-            ctx = {"valid": False, "latent_shape": tuple(fake_latents.shape), "decoded_image": None}
-            return fake_latents.flatten(1), ctx
+            conv.append_message(conv.roles[1], reserve_token * gen_cfg["prompt_n_tokens"])
+            prompt_question = conv.get_prompt()
+            prompt_question = prompt_question.removesuffix(
+                "<|start_header_id|>assistant<|end_header_id|>\n\n"
+            )
+            input_ids = tokenizer_image_token(
+                prompt_question,
+                self.processing_class,
+                IMAGE_TOKEN_INDEX,
+                return_tensors="pt",
+            ).unsqueeze(0).to(device)
+            all_input_ids.append(input_ids)
 
-        image_tensor = process_images([image], image_processor, model.config)
-        if isinstance(image_tensor, list):
-            image_tensor = [_x.to(dtype=model.dtype, device=model.device) for _x in image_tensor]
-        else:
-            image_tensor = image_tensor.to(dtype=model.dtype, device=model.device)
-            image_tensor = [image_tensor]
+        if not valid_indices:
+            return torch.stack(batch_latents, dim=0), image_contexts
 
-        n_tokens = gen_cfg["n_tokens"]
-        conv = copy.deepcopy(conv_templates[getattr(self.args, "version", "llada")])
-        conv.append_message(conv.roles[0], f"<image>\n{instruction}")
-        conv.append_message(conv.roles[1], "<|reserved_token_5|>" * n_tokens)
-        prompt_question = conv.get_prompt()
-        input_ids = tokenizer_image_token(
-            prompt_question, self.processing_class, IMAGE_TOKEN_INDEX, return_tensors="pt"
-        ).unsqueeze(0).to(model.device)
+        all_input_ids = self._left_pad_2d(all_input_ids, self.processing_class.pad_token_id, torch.long)
+        attention_mask = (all_input_ids != self.processing_class.pad_token_id).long()
+        image_tensor = process_images(all_edit_images, image_processor, model.config)
+        image_tensor = self._normalize_mm_image_payload(image_tensor, dtype=model.dtype, device=device)
+        self._check_mm_payload_before_prepare_inputs(image_tensor)
 
         inputs = model.prepare_inputs_labels_for_multimodal(
-            input_ids=input_ids,
+            input_ids=all_input_ids,
             position_ids=None,
-            attention_mask=None,
+            attention_mask=attention_mask,
             past_key_values=None,
             labels=None,
             images=image_tensor,
-            modalities=["image"],
-            image_sizes=[image.size],
+            modalities=["image"] * all_input_ids.shape[0],
+            image_sizes=image_sizes,
             return_inputs=True,
         )
-        _, _, _, _, inputs_embeds, _, raw_input_ids = inputs
+        _, _, attention_mask, _, inputs_embeds, _, raw_input_ids = inputs
 
-        # Optional edit-encoder branch (<|reserved_token_6|>).
-        is_gen_enc = raw_input_ids == reserve_id2
-        if is_gen_enc.any() and hasattr(model, "encode_image_gen"):
-            base_model = model.get_model()
-            if hasattr(base_model, "image_processor_gen"):
-                image_1024 = image.resize((gen_cfg["image_resolution"], gen_cfg["image_resolution"]))
-                enc_latents, gen_shape_enc = model.encode_image_gen(
-                    base_model.image_processor_gen.preprocess(image_1024).to(model.device, model.dtype),
-                    enc=True,
-                )
-                enc_embeddings = base_model.call_gen_embedding(enc_latents, gen_shape_enc, enc=True)
-                if enc_embeddings.numel() > 0:
-                    inputs_embeds[raw_input_ids == reserve_id2] = 0
-                    enc_pad = torch.zeros_like(inputs_embeds[raw_input_ids == reserve_id2])
-                    enc_pad[:, : enc_embeddings.shape[-1]] = enc_embeddings.flatten(0, 1)
-                    inputs_embeds[raw_input_ids == reserve_id2] = enc_pad
+        init_latents, _ = model.encode_image_gen(torch.cat(vq_latents, dim=0))
+        enc_embeddings = pad_along_last_dim(torch.cat(all_enc_embeddings, dim=0), size=inputs_embeds.shape[-1])
+        inputs_embeds = inputs_embeds.to(dtype=enc_embeddings.dtype)
+        inputs_embeds[raw_input_ids == reserve_id2] = 0
+        inputs_embeds[raw_input_ids == reserve_id2] = enc_embeddings.flatten(0, 1)
 
-        is_gen = raw_input_ids == reserve_id
         is_prompt = torch.zeros_like(raw_input_ids, dtype=torch.bool)
-        eot_pos = torch.where(raw_input_ids == 126348)[1]
-        if len(eot_pos) >= 2:
-            prompt_cutoff = int(eot_pos[1].item())
-            is_prompt[:, : prompt_cutoff + 1] = True
+        for row_idx in range(raw_input_ids.shape[0]):
+            row_eot = torch.where(raw_input_ids[row_idx] == 126348)[0]
+            if row_eot.numel() >= 2:
+                prompt_cutoff = int(row_eot[1].item())
+                is_prompt[row_idx, : prompt_cutoff + 1] = True
+        is_gen = raw_input_ids == reserve_id
+        is_gen_enc = raw_input_ids == reserve_id2
 
-        noise_embed = model.get_model().transformer.wte(
-            torch.tensor([self.args.mask_id], device=model.device)
-        )
+        noise_embed = base_model.transformer.wte(torch.tensor([self.args.mask_id], device=device))
         inputs_embeds_uncond = inputs_embeds.clone()
         inputs_embeds_uncond[is_prompt] = noise_embed
 
-        gen_shape_map = {1024: (64, 64), 512: (32, 32), 256: (16, 16)}
-        gen_shape = gen_shape_map.get(gen_cfg["image_resolution"], (32, 32))
-        xt = torch.full(
-            (1, gen_cfg["n_tokens"]),
-            img_mask_id,
-            dtype=torch.long,
-            device=model.device,
-        )
+        inputs_embeds_uncond_enc = inputs_embeds.clone()
+        edit_mode = gen_cfg["edit_mode"]
+        if edit_mode == 0:
+            inputs_embeds_uncond_enc[~is_gen_enc] = noise_embed
+            is_gen_enc_ccc = is_gen_enc
+        elif edit_mode == 1:
+            inputs_embeds_uncond_enc[is_gen_enc] = noise_embed
+            is_gen_enc_ccc = torch.zeros_like(is_gen_enc, dtype=torch.bool)
+        elif edit_mode == 2:
+            inputs_embeds_uncond_enc[is_gen_enc | (raw_input_ids < 0)] = noise_embed
+            is_gen_enc_ccc = torch.zeros_like(is_gen_enc, dtype=torch.bool)
+        elif edit_mode == 3:
+            inputs_embeds_uncond_enc[(~is_gen_enc) & (raw_input_ids > 0)] = noise_embed
+            is_gen_enc_ccc = is_gen_enc
+        else:
+            raise ValueError("Not Supported edit_mode")
+        is_gen_enc_null = torch.zeros_like(is_gen_enc, dtype=torch.bool)
 
+        xt = init_latents.clone()
+        xt[:] = img_mask_id
+        use_3d = False
         mask_idx_sched = xt == img_mask_id
-        transfer_schedule = get_num_transfer_tokens_sch(
-            mask_idx_sched, gen_cfg["n_steps"], schedule=gen_cfg["schedule"], schedule_kwargs={"shift": gen_cfg["shift"]}
-        )
+        if is_unitok and not use_3d:
+            mask_idx_sched = mask_idx_sched[:, 0, :]
+        if gen_cfg["schedule"] == "shift":
+            num_transfer_tokens = get_num_transfer_tokens_sch(
+                mask_idx_sched,
+                gen_cfg["n_steps"],
+                schedule="shift",
+                schedule_kwargs={"shift": gen_cfg["shift"]},
+            )
+        else:
+            num_transfer_tokens = get_num_transfer_tokens_sch(
+                mask_idx_sched,
+                gen_cfg["n_steps"],
+                schedule=gen_cfg["schedule"],
+                schedule_kwargs={"shift": gen_cfg["shift"]},
+            )
 
         confidence_policy = gen_cfg["confidence_policy"]
         if confidence_policy == "halton":
             confidence_policy = "mmada"
+        unmask_order = None
+        if confidence_policy == "stratified":
+            unmask_order = stratified_random(n=int(np.sqrt(gen_cfg["n_tokens"])), seed=42, shuffle_blocks=True)
 
-        for step_idx, num_transfer in enumerate(transfer_schedule[0]):
+        sch_temperatures = self._build_image_edit_temperature_schedule(
+            gen_cfg["n_steps"],
+            gen_cfg["schedule_temp"],
+            gen_cfg["min_temperature"],
+            gen_cfg["shift"],
+        ).to(device=device)
+        sch_temperatures_samp = self._build_image_edit_temperature_schedule(
+            gen_cfg["n_steps"],
+            gen_cfg["schedule_temp_samp"],
+            gen_cfg["min_temperature_samp"],
+            gen_cfg["shift"],
+        ).to(device=device)
+        cfg_start = int(gen_cfg["cfg_interval"][0] * gen_cfg["n_steps"])
+        cfg_end = int(gen_cfg["cfg_interval"][1] * gen_cfg["n_steps"])
+
+        x0 = xt.clone()
+        active_steps = torch.nonzero(num_transfer_tokens.sum(dim=0) > 0, as_tuple=False).squeeze(-1)
+        for step_idx, step_col in enumerate(active_steps, start=1):
+            local_temp = sch_temperatures[min(step_idx - 1, sch_temperatures.numel() - 1)]
+            local_temp_samp = sch_temperatures_samp[min(step_idx - 1, sch_temperatures_samp.numel() - 1)]
+            step_confidence_policy = confidence_policy
+            if step_idx / max(gen_cfg["n_steps"], 1) > gen_cfg["order_cutoff"]:
+                step_confidence_policy = "mmada"
             mask_idx = xt == img_mask_id
-            timesteps = torch.tensor(
-                [mask_idx.sum().float() / mask_idx.numel()],
-                device=model.device,
-                dtype=torch.float32,
-            )
+            if is_unitok and not use_3d:
+                mask_idx = mask_idx[:, 0, :]
+            n_mask_per_sample = mask_idx.sum(dim=1)
+            if n_mask_per_sample.max().item() == 0:
+                break
+
+            timesteps = n_mask_per_sample.float() / mask_idx.shape[1]
             do_cfg = gen_cfg["guidance_scale"] > 0 and (
-                int(gen_cfg["cfg_interval"][0] * gen_cfg["n_steps"]) <= step_idx
-                <= int(gen_cfg["cfg_interval"][1] * gen_cfg["n_steps"])
+                cfg_start <= step_idx <= cfg_end
             )
 
             if do_cfg:
-                xt_input = torch.cat([xt, xt], dim=0)
-                embed_input = torch.cat([inputs_embeds_uncond, inputs_embeds], dim=0)
-                new_token_mask = is_gen.repeat(2, 1)
-                modality_indices = new_token_mask
-                timesteps = timesteps.repeat(2)
+                embed_input = torch.cat(
+                    [inputs_embeds_uncond, inputs_embeds_uncond_enc, inputs_embeds], dim=0
+                )
+                xt_input = torch.cat([xt, xt, xt], dim=0)
+                new_token_mask = is_gen.repeat(3, 1)
+                is_gen_enc_mask = torch.cat([is_gen_enc_null, is_gen_enc_ccc, is_gen_enc], dim=0)
+                timesteps_input = timesteps.repeat(3)
             else:
-                xt_input = xt
                 embed_input = inputs_embeds
+                xt_input = xt
                 new_token_mask = is_gen
+                is_gen_enc_mask = is_gen_enc
+                timesteps_input = timesteps
+
+            if getattr(base_model.config, "enc_use_image_branch", False):
+                modality_indices = new_token_mask | is_gen_enc_mask
+            else:
                 modality_indices = new_token_mask
 
             all_input_embeddings, new_token_mask = llada_wte(
-                model.get_model(),
+                base_model,
                 None,
                 True,
                 x_gen=xt_input,
@@ -383,66 +682,115 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 new_token_mask=new_token_mask,
             )
             logits = llada_get_logits(
-                model.get_model(),
+                base_model,
                 all_input_embeddings,
                 new_token_mask,
                 True,
                 gen_shape=gen_shape,
                 input_modality_indices=modality_indices,
-                timesteps=timesteps,
+                timesteps=timesteps_input,
             )
+            if is_unitok:
+                logits[..., 4096:] = float("-inf")
             if do_cfg:
-                logits_un, logits = logits.chunk(2)
+                _, _, new_token_mask = new_token_mask.chunk(3)
+                logits_un, logits_un_enc, logits = logits.chunk(3)
                 logits_is_ninf = logits == -np.inf
-                logits = (1 + gen_cfg["guidance_scale"]) * logits - gen_cfg["guidance_scale"] * logits_un
+                if edit_mode in [0, 3]:
+                    logits_cond = (1 + gen_cfg["guidance_scale_image"]) * logits - (
+                        gen_cfg["guidance_scale_image"] * logits_un_enc
+                    )
+                elif edit_mode in [1, 2]:
+                    logits_cond = (logits + gen_cfg["guidance_scale_image"] * logits_un_enc) / (
+                        1 + gen_cfg["guidance_scale_image"]
+                    )
+                else:
+                    raise ValueError("Not Supported edit_mode")
+                logits = (1 + gen_cfg["guidance_scale"]) * logits_cond - gen_cfg["guidance_scale"] * logits_un
                 logits[logits_is_ninf] = -np.inf
 
+            safe_logits = torch.nan_to_num(logits.to(torch.float32), nan=-1e9, posinf=1e9, neginf=-1e9)
+            probs = safe_logits.softmax(-1)
             if gen_cfg["sample_policy"] == "argmax":
-                x0 = logits.argmax(-1)
+                x0 = safe_logits.argmax(-1)
             else:
-                x0 = torch.distributions.Categorical(logits=logits).sample()
-
-            probs = logits.softmax(-1)
+                temperature = 1.0
+                if gen_cfg["dynamic_temperature_samp"]:
+                    temperature = temperature * float(local_temp_samp)
+                if temperature <= 0:
+                    x0 = safe_logits.argmax(-1)
+                else:
+                    x0 = torch.distributions.Categorical(logits=safe_logits / temperature).sample()
             x0_p = torch.gather(probs, -1, x0.long()[..., None]).squeeze(-1)
-            x0 = torch.where(mask_idx, x0, xt)
-            confidence = torch.where(mask_idx, x0_p, -np.inf)
-
-            if confidence_policy == "mmada":
-                confidence = torch.log(confidence.clamp(1e-20))
-            k = int(num_transfer.item())
-            if k <= 0:
-                continue
-            _, select_index = torch.topk(confidence[0], k=k)
             transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
-            transfer_index[0, select_index] = True
+
+            if is_unitok:
+                x0 = x0.permute(0, 2, 1)
+                if use_3d:
+                    x0 = torch.where(mask_idx, x0, xt)
+                    x0_p = x0_p.permute(0, 2, 1).max(dim=1)[0]
+                else:
+                    x0 = torch.where(mask_idx.unsqueeze(1).repeat(1, 8, 1), x0, xt)
+                    x0_p = x0_p.permute(0, 2, 1).max(dim=1)[0]
+            else:
+                x0 = torch.where(mask_idx, x0, xt)
+
+            for batch_idx in range(len(valid_indices)):
+                b_mask = mask_idx[batch_idx]
+                b_n_mask = int(b_mask.sum().item())
+                if b_n_mask == 0:
+                    continue
+                k = min(int(num_transfer_tokens[batch_idx, step_col].item()), b_n_mask)
+                if k <= 0:
+                    continue
+
+                if step_confidence_policy == "mask_git":
+                    alg_temp = gen_cfg["alg_temp"] * float(local_temp) if gen_cfg["dynamic_temperature"] else gen_cfg["alg_temp"]
+                    confidence = x0_p[batch_idx] / max(alg_temp, 1e-6)
+                    confidence = torch.where(b_mask, confidence, -np.inf)
+                    confidence = torch.softmax(confidence, dim=-1)
+                    select_index = torch.multinomial(confidence, num_samples=k)
+                elif step_confidence_policy == "stratified" and unmask_order is not None:
+                    start = gen_cfg["n_tokens"] - b_n_mask
+                    select_index = torch.tensor(unmask_order[start : start + k], device=device, dtype=torch.long)
+                else:
+                    alg_temp = gen_cfg["alg_temp"] * float(local_temp) if gen_cfg["dynamic_temperature"] else gen_cfg["alg_temp"]
+                    confidence = torch.log(x0_p[batch_idx].clamp(1e-20)) + alg_temp * self._image_edit_gumbel_noise(x0_p[batch_idx])
+                    confidence = torch.where(b_mask, confidence, -np.inf)
+                    _, select_index = torch.topk(confidence, k=k)
+
+                if is_unitok:
+                    transfer_index[batch_idx, :, select_index] = True
+                else:
+                    transfer_index[batch_idx, select_index] = True
             xt[transfer_index] = x0[transfer_index]
 
-        xt[xt == img_mask_id] = 0
-        decoded_image = None
+        xt[xt == img_mask_id] = x0[xt == img_mask_id]
+        decoded_images = None
         if hasattr(model, "decode_image_gen"):
             decoded_images = model.decode_image_gen(
                 xt,
                 gen_cfg["image_resolution"],
                 gen_cfg["image_resolution"],
             )
-            if len(decoded_images) > 0:
-                decoded_image = decoded_images[0]
-        ctx = {
-            "valid": True,
-            "inputs_embeds": inputs_embeds.detach(),
-            "inputs_embeds_uncond": inputs_embeds_uncond.detach(),
-            "is_gen": is_gen.detach(),
-            "is_gen_enc": is_gen_enc.detach(),
-            "base_inputs_embeds": inputs_embeds.detach().squeeze(0),
-            "modality_indices": (
-                is_gen | is_gen_enc if getattr(model.get_model().config, "enc_use_image_branch", False) else is_gen
-            ).detach().squeeze(0),
-            "gen_shape": gen_shape,
-            "guidance_scale": gen_cfg["guidance_scale"],
-            "latent_shape": tuple(xt.shape),
-            "decoded_image": decoded_image,
-        }
-        return xt.flatten(1), ctx
+
+        modality_indices = is_gen | is_gen_enc if getattr(base_model.config, "enc_use_image_branch", False) else is_gen
+        for local_idx, batch_idx in enumerate(valid_indices):
+            batch_latents[batch_idx] = xt[local_idx].detach()
+            image_contexts[batch_idx] = {
+                "valid": True,
+                "inputs_embeds": inputs_embeds[local_idx].detach(),
+                "inputs_embeds_uncond": inputs_embeds_uncond[local_idx].detach(),
+                "is_gen": is_gen[local_idx].detach(),
+                "is_gen_enc": is_gen_enc[local_idx].detach(),
+                "base_inputs_embeds": inputs_embeds[local_idx].detach(),
+                "modality_indices": modality_indices[local_idx].detach(),
+                "gen_shape": gen_shape,
+                "guidance_scale": gen_cfg["guidance_scale"],
+                "latent_shape": tuple(xt[local_idx].shape),
+                "decoded_image": None if decoded_images is None else decoded_images[local_idx],
+            }
+        return torch.stack(batch_latents, dim=0), image_contexts
 
     def _build_text_score_payload(
         self,
@@ -961,8 +1309,8 @@ class DiffuGRPOTrainer(GRPOTrainer):
         prompts = [x["prompt"] for x in inputs]
         sample_modes = [x.get("task_type", "text") for x in inputs]
 
-        completion_tokens_per_sample = []
-        completion_masks_per_sample = []
+        completion_tokens_per_sample = [None] * len(inputs)
+        completion_masks_per_sample = [None] * len(inputs)
         text_prompt_ids = [None] * len(inputs)
         text_completion_ids = [None] * len(inputs)
         image_contexts = [None] * len(inputs)
@@ -970,18 +1318,26 @@ class DiffuGRPOTrainer(GRPOTrainer):
         prompts_text = [""] * len(inputs)
 
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
-            for idx, example in enumerate(inputs):
+            image_edit_indices = [idx for idx, mode in enumerate(sample_modes) if mode == "image_edit"]
+            image_edit_batch_size = max(1, int(getattr(self.args, "image_edit_batch_size", 1)))
+            for start_idx in trange(0, len(image_edit_indices), image_edit_batch_size, desc="Image Rollout"):
+                batch_indices = image_edit_indices[start_idx : start_idx + image_edit_batch_size]
+                batch_examples = [inputs[idx] for idx in batch_indices]
+                batch_latents, batch_contexts = self._rollout_image_edit_latents(unwrapped_model, batch_examples)
+                for local_idx, sample_idx in enumerate(batch_indices):
+                    completion_flat = batch_latents[local_idx].flatten()
+                    completion_tokens_per_sample[sample_idx] = completion_flat
+                    completion_masks_per_sample[sample_idx] = torch.ones_like(
+                        completion_flat, dtype=torch.int, device=completion_flat.device
+                    )
+                    image_contexts[sample_idx] = batch_contexts[local_idx]
+                    completions_text[sample_idx] = "<image_latents>"
+                    prompts_text[sample_idx] = self._build_llada_prompt(inputs[sample_idx].get("prompt", []))
+
+            for idx, example in tqdm(enumerate(inputs), desc=f"Text Rollout"):
                 mode = sample_modes[idx]
                 if mode == "image_edit":
-                    completion_latents, image_ctx = self._rollout_image_edit_latents(unwrapped_model, example)
-                    completion_flat = completion_latents.flatten()
-                    completion_tokens_per_sample.append(completion_flat)
-                    completion_masks_per_sample.append(
-                        torch.ones_like(completion_flat, dtype=torch.int, device=completion_flat.device)
-                    )
-                    image_contexts[idx] = image_ctx
-                    completions_text[idx] = "<image_latents>"
-                    prompts_text[idx] = self._build_llada_prompt(example.get("prompt", []))
+                    continue
                 else:
                     prompt_text = self._build_llada_prompt(example["prompt"])
                     prompt_ids = tokenizer_image_token(
@@ -1028,8 +1384,8 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     )
                     completion_mask = self._build_text_completion_mask(completion_ids)
 
-                    completion_tokens_per_sample.append(completion_ids.squeeze(0))
-                    completion_masks_per_sample.append(completion_mask.squeeze(0).to(device))
+                    completion_tokens_per_sample[idx] = completion_ids.squeeze(0)
+                    completion_masks_per_sample[idx] = completion_mask.squeeze(0).to(device)
                     text_prompt_ids[idx] = norm_prompt_ids.squeeze(0)
                     text_completion_ids[idx] = completion_ids.squeeze(0)
                     completions_text[idx] = self.processing_class.decode(
@@ -1037,6 +1393,8 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     )
                     prompts_text[idx] = prompt_text
 
+        if any(x is None for x in completion_tokens_per_sample):
+            raise ValueError("Missing completion tokens for one or more samples during rollout")
         max_completion_len = max(x.numel() for x in completion_tokens_per_sample) if completion_tokens_per_sample else 0
         completion_ids = torch.zeros(
             len(inputs),

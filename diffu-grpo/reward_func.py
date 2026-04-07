@@ -11,9 +11,18 @@ import shutil
 
 import torch
 import torch.nn.functional as F
-
+import lpips
 from math500_utils import remove_boxed, last_boxed_only_string, is_equiv, boxed_in_answer
 
+_LPIPS_LOSS_FN = None
+
+def _get_lpips_loss_fn():
+    global _LPIPS_LOSS_FN
+    if _LPIPS_LOSS_FN is None:
+        import lpips
+
+        _LPIPS_LOSS_FN = lpips.LPIPS(net='vgg').eval()
+    return _LPIPS_LOSS_FN
 
 def extract_xml_answer(text: str) -> str:
     answer = text.split("<answer>")[-1]
@@ -109,8 +118,8 @@ def perceptual_score_reward_func(prompts, completions, image_gt, step=None, run_
     Computes perceptual similarity score between generated image and ground truth image.
     Higher is better.
     """
-    import lpips
-    loss_fn = lpips.LPIPS(net='vgg')  # perceptual similarity
+    
+    loss_fn = _get_lpips_loss_fn()
 
     def _to_tensor(img):
         """

@@ -302,12 +302,12 @@ REWARD_REQUIRED_COLUMNS = {
     "correctness_reward_func": {"answer_gt"},
     "correctness_reward_func_math": {"answer"},
     "countdown_reward_func": {"target", "numbers"},
+    "correct_grounding_reward_func": {"ground_gt"},
     "perceptual_score_reward_func": {"image_gt"},
     "sudoku_reward_func": {"puzzle", "solution"},
 }
 
 REWARD_RESERVED_ARGS = {"self", "prompts", "completions", "step", "run_name", "rank"}
-
 
 def _get_reward_required_columns(reward_func) -> set[str]:
     if isinstance(reward_func, torch.nn.Module):

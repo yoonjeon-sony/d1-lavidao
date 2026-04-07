@@ -18,11 +18,11 @@ export TRITON_CACHE_DIR="${SLURM_TMPDIR:-/tmp}/triton-${USER}/${SLURM_JOB_ID:-$$
 
 mkdir -p "$TRITON_CACHE_DIR"
 chmod 700 "$TRITON_CACHE_DIR"
-DATASET="thinkmorph-edit"
+DATASET="thinkmorph_edit"
 RUN_NAME=${DATASET}_Test-LavidaO
 # MODEL_PATH=/group2/dgm/yoonjeon/ckpts/sft-lavidao-thinkmorph-complete/checkpoint-2420
-MODEL_PATH="/group2/dgm/yoonjeon/ckpts/sft_LaViDa-O-thinkmorph_zebracot/checkpoint-3000/"
-OUTPUT_DIR=/group2/dgm/yoonjeon/ckpts/$RUN_NAME
+MODEL_PATH="/scratch2/yoonjeon.kim/sft_LaViDa-O-thinkmorph_zebracot-step3000/"
+OUTPUT_DIR=/scratch2/yoonjeon.kim/rl-lavidao-thinkmorph/$RUN_NAME
 
 # ----------------------------
 # Model initialization configs
@@ -107,9 +107,9 @@ if ! command -v accelerate >/dev/null 2>&1; then
   exit 127
 fi
 
-source /home/yoonjeon.kim/dLLM-RL/train_sft/.venv/bin/activate
-/home/yoonjeon.kim/dLLM-RL/train_sft/.venv/bin/python -m accelerate.commands.launch \
-    --config_file /home/yoonjeon.kim/d1/diffu-grpo/accelerate.yaml \
+
+python -m accelerate.commands.launch \
+    --config_file ./diffu-grpo/accelerate.yaml \
     --num_processes $NUM_PROCESSES \
     --num_machines 1 \
     --machine_rank 0 \
@@ -138,6 +138,7 @@ source /home/yoonjeon.kim/dLLM-RL/train_sft/.venv/bin/activate
     --mm_spatial_pool_stride $MM_SPATIAL_POOL_STRIDE \
     --mm_spatial_pool_out_channels $MM_SPATIAL_POOL_OUT_CHANNELS \
     --image_aspect_ratio $IMAGE_ASPECT_RATIO \
+    --image_edit_batch_size 4 \
     --image_grid_pinpoints "$IMAGE_GRID_PINPOINTS" \
     --image_gen_size $IMAGE_GEN_SIZE \
     --num_gen_image_tokens $NUM_GEN_IMAGE_TOKENS \
