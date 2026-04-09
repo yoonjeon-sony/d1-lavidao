@@ -1,7 +1,3 @@
-# Ignore specific files
-interleaved_inferencer.py
-llava_llada.py
-
 # Images
 *.png
 *.jpg
