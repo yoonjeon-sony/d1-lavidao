@@ -208,10 +208,10 @@ def perceptual_score_reward_func(prompts, completions, image_gt, step=None, run_
     RED = "\033[91m"
     YELLOW = "\033[93m"
     RESET = "\033[0m"
-
+    prmpt = prompts[0].replace("<|reserved_token_5|>", "*").replace("<|reserved_token_6|>", ".")
     print(
         "-" * 20,
-        f"\n{RED}Prompt:{RESET}\n{prompts[0]}\n",
+        f"\n{RED}Prompt:{RESET}\n{prmpt}\n",
         "-" * 20,
         f"\n{YELLOW}Perceptual Score:{RESET}\n{rewards[0]}\n",
     )

@@ -389,11 +389,11 @@ def main(grpo_config, model_config):
             correctness_reward_func,
         ]
     elif grpo_config.dataset == "thinkmorph_interleave":
-        dataset = get_thinkmorph_interleave_questions("train")
-        # Reward dispatch for mixed tasks is handled inside _generate_and_score_completions:
-        #   image_edit samples → perceptual_score_reward_func
-        #   text samples       → strict_format_reward_func, correctness_reward_func
-        # Pass the union here so _validate_reward_dataset_compatibility can check columns.
+        # Load gen (image-edit) and und (text-answer) as two independent datasets
+        # so each gets its own RepeatSampler + DistributedSampler — no paired
+        # striding issues and each rank always has a balanced modality mix.
+        dataset = get_image_edit_placeholder_questions("train")
+        und_dataset = get_image_answer_placeholder_questions("train")
         reward_functions = [
             perceptual_score_reward_func,
             strict_format_reward_func,
@@ -405,13 +405,14 @@ def main(grpo_config, model_config):
     else:
         raise ValueError(f"Unsupported dataset: {grpo_config.dataset}")
 
-    _validate_reward_dataset_compatibility(grpo_config.dataset, dataset, reward_functions)
+    # _validate_reward_dataset_compatibility(grpo_config.dataset, dataset, reward_functions)
 
-    # For interleave datasets the row ordering encodes paired structure
-    # (even=image_edit, odd=text).  PairedRepeatSampler shuffles at the
-    # pair level, so a dataset-level shuffle here would break the pairing.
-    if grpo_config.dataset != "thinkmorph_interleave":
-        dataset = dataset.shuffle(seed=grpo_config.seed)
+    dataset = dataset.shuffle(seed=grpo_config.seed)
+    # For interleave, also shuffle the und dataset independently.
+    und_train_set = None
+    if "und_dataset" in locals():
+        und_dataset = und_dataset.shuffle(seed=grpo_config.seed)
+        und_train_set = und_dataset
     if grpo_config.dataset in ["countdown", "sudoku"] and len(dataset) > 500:
         train_set = dataset.select(range(0, len(dataset) - 500))
     else:
@@ -428,6 +429,7 @@ def main(grpo_config, model_config):
         processing_class=tokenizer,
         reward_funcs=reward_functions,
         train_dataset=train_set,
+        train_dataset_und=und_train_set,
         optimizers=(optimizer, None),
     )
 

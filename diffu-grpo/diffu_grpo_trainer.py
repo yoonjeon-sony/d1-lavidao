@@ -14,10 +14,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import transformers
-from accelerate.utils import gather, gather_object
+from accelerate.utils import DistributedType, gather, gather_object
 from datasets import Dataset, IterableDataset
 from torch import nn
 from torch.utils.data import DataLoader
+import math
+
+import wandb
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, Trainer, TrainerCallback
 from transformers.utils import is_peft_available
 from trl.extras.profiling import profiling_context, profiling_decorator
@@ -255,80 +258,6 @@ class MaskDataCollator:
 
         return batch
 
-class PairedRepeatSampler(torch.utils.data.Sampler):
-    """RepeatSampler variant that keeps consecutive index pairs together.
-
-    The thinkmorph_interleave dataset emits rows in strict pairs:
-      index 2k   → image_edit
-      index 2k+1 → text
-    Shuffling must happen at the *pair* level so that every sampler chunk
-    always contains both task types.  This guarantees that after the
-    DistributedSampler strides across the yielded indices, every rank
-    receives at least one image-edit and one text sample — preventing
-    DeepSpeed gradient-reduction deadlocks from unused parameters.
-
-    The yielded index order is identical to ``RepeatSampler`` except that
-    the two indices in each chunk are always a paired (2k, 2k+1) rather
-    than two arbitrary indices drawn from the shuffled pool.
-    """
-
-    def __init__(
-        self,
-        data_source,
-        mini_repeat_count: int,
-        batch_size: int = 2,
-        repeat_count: int = 1,
-        shuffle: bool = True,
-        seed: Optional[int] = None,
-    ):
-        self.num_samples = len(data_source)
-        if self.num_samples % 2 != 0:
-            raise ValueError(
-                f"PairedRepeatSampler requires an even dataset size, got {self.num_samples}"
-            )
-        if batch_size % 2 != 0:
-            raise ValueError(
-                f"PairedRepeatSampler requires an even batch_size, got {batch_size}"
-            )
-        self.num_pairs = self.num_samples // 2
-        self.pairs_per_chunk = batch_size // 2  # unique pairs per chunk
-        self.mini_repeat_count = mini_repeat_count
-        self.batch_size = batch_size
-        self.repeat_count = repeat_count
-        self.shuffle = shuffle
-        if shuffle:
-            self.generator = torch.Generator()
-            if seed is not None:
-                self.generator.manual_seed(seed)
-
-    def __iter__(self):
-        if self.shuffle:
-            pair_order = torch.randperm(self.num_pairs, generator=self.generator).tolist()
-        else:
-            pair_order = list(range(self.num_pairs))
-
-        # Build chunks of `pairs_per_chunk` pairs each, drop incomplete tail
-        chunks = [
-            pair_order[i : i + self.pairs_per_chunk]
-            for i in range(0, len(pair_order), self.pairs_per_chunk)
-        ]
-        chunks = [c for c in chunks if len(c) == self.pairs_per_chunk]
-
-        for chunk in chunks:
-            for _ in range(self.repeat_count):
-                for pair_idx in chunk:
-                    idx_a = 2 * pair_idx      # image_edit
-                    idx_b = 2 * pair_idx + 1   # text
-                    for _ in range(self.mini_repeat_count):
-                        yield idx_a
-                    for _ in range(self.mini_repeat_count):
-                        yield idx_b
-
-    def __len__(self) -> int:
-        usable_pairs = (self.num_pairs // self.pairs_per_chunk) * self.pairs_per_chunk
-        return usable_pairs * 2 * self.mini_repeat_count * self.repeat_count
-
-
 class DiffuGRPOTrainer(GRPOTrainer):
     """GRPO trainer adapted for LaVida-O text + image rollouts with unified token-level scoring."""
 
@@ -338,6 +267,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
         reward_funcs: Union[RewardFunc, list[RewardFunc]],
         args: Optional[GRPOConfig] = None,
         train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
+        train_dataset_und: Optional[Union[Dataset, IterableDataset]] = None,
         eval_dataset: Optional[
             Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]
         ] = None,
@@ -352,6 +282,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
         ),
         peft_config: Optional["PeftConfig"] = None,
     ):
+        self.und_dataset = train_dataset_und
         _register_lavida_architectures()
         super().__init__(
             model=model,
@@ -366,30 +297,77 @@ class DiffuGRPOTrainer(GRPOTrainer):
             peft_config=peft_config,
         )
         args.use_fast_dlm = False
+
+        # Initialize wandb on the main process only.
+        if self.accelerator.is_main_process:
+            wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "huggingface"),
+                entity=os.environ.get("WANDB_ENTITY", None),
+                name=args.run_name,
+                config=args.to_dict(),
+            )
+
         grad_accum_steps = int(getattr(self.args, "gradient_accumulation_steps", 1) or 1)
         if getattr(self, "_buffered_inputs", None) is None:
             self._buffered_inputs = [None] * grad_accum_steps
+        # Dual-modality buffers for interleave training (gen + und).
+        self._gen_buffered_inputs = [None] * grad_accum_steps
+        self._und_buffered_inputs = [None] * grad_accum_steps
+        # Set up a separate DataLoader for the understanding dataset.
+        self._und_dataloader = None
+        self._und_iter = None
+        if self.und_dataset is not None:
+            self._init_und_dataloader()
+
+    def _init_und_dataloader(self):
+        """Build a DataLoader for the understanding dataset using the same
+        RepeatSampler logic as the primary (gen) DataLoader."""
+        from trl.trainer.grpo_trainer import RepeatSampler
+        from torch.utils.data import DistributedSampler, SequentialSampler
+
+        und_sampler = RepeatSampler(
+            data_source=self.und_dataset,
+            mini_repeat_count=self.num_generations,
+            batch_size=self.args.generation_batch_size // self.num_generations,
+            repeat_count=self.num_iterations * self.args.steps_per_generation,
+            shuffle=self.shuffle_dataset,
+            seed=self.args.seed,
+        )
+        # Wrap with DistributedSampler when running multi-GPU, matching HF Trainer behaviour.
+        if self.accelerator.num_processes > 1:
+            dist_sampler = DistributedSampler(
+                list(range(len(und_sampler))),
+                num_replicas=self.accelerator.num_processes,
+                rank=self.accelerator.process_index,
+                shuffle=False,  # RepeatSampler already handles shuffling
+            )
+            # Use dist_sampler to stride into und_sampler's output
+            sampler_indices = list(und_sampler)
+            class _IndexedSampler(torch.utils.data.Sampler):
+                """Applies DistributedSampler striding over a pre-built index list."""
+                def __init__(self, indices, dist_sampler):
+                    self._indices = indices
+                    self._dist = dist_sampler
+                def __iter__(self):
+                    for i in self._dist:
+                        yield self._indices[i]
+                def __len__(self):
+                    return len(self._dist)
+            final_sampler = _IndexedSampler(sampler_indices, dist_sampler)
+        else:
+            final_sampler = und_sampler
+
+        self._und_dataloader = DataLoader(
+            self.und_dataset,
+            batch_size=self.args.per_device_train_batch_size,
+            sampler=final_sampler,
+            collate_fn=lambda batch: batch,  # keep as list of dicts
+        )
+        self._und_iter = iter(self._und_dataloader)
 
     def _get_train_sampler(self, dataset=None):
-        """Use PairedRepeatSampler for interleave datasets to guarantee type balance per rank."""
-        if dataset is None:
-            dataset = self.train_dataset
-        is_paired = (
-            hasattr(dataset, "__len__")
-            and len(dataset) >= 2
-            and len(dataset) % 2 == 0
-            and hasattr(dataset, "__getitem__")
-            and dataset[0].get("task_type") != dataset[1].get("task_type")
-        )
-        if is_paired:
-            return PairedRepeatSampler(
-                data_source=dataset,
-                mini_repeat_count=self.num_generations,
-                batch_size=self.args.generation_batch_size // self.num_generations,
-                repeat_count=self.num_iterations * self.args.steps_per_generation,
-                shuffle=self.shuffle_dataset,
-                seed=self.args.seed,
-            )
+        """Always use RepeatSampler (parent default). PairedRepeatSampler is no longer needed
+        because interleave training uses two separate datasets with independent samplers."""
         return super()._get_train_sampler(dataset)
 
     @staticmethod
@@ -1319,29 +1297,30 @@ class DiffuGRPOTrainer(GRPOTrainer):
         return completion_log_probs, completion_masks  # both (num_iterations, batch_size, seq_len)
 
     @profiling_decorator
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        if return_outputs:
-            raise ValueError("The GRPOTrainer does not support returning outputs")
+    def _compute_modality_loss(
+        self, model, inputs: dict[str, Any], modality: str = "",
+    ) -> torch.Tensor:
+        """Compute GRPO clipped loss for a single-modality mini-batch.
 
+        Args:
+            model: the (possibly wrapped) model.
+            inputs: a single mini-batch dict with scoring_data_loader, advantages,
+                    completion_mask, old_per_token_logps, ref_per_token_logps, mask_seeds.
+            modality: prefix for metric keys (e.g. "gen", "und", or "" for single-modality).
+        """
         beta = float(getattr(self.args, "beta", 0.0))
         epsilon = float(getattr(self.args, "epsilon", 0.0))
         num_iterations = int(getattr(self.args, "num_iterations", 1))
         assert num_iterations > 1, "num_iterations must be greater than 1"
+        prefix = f"{modality}/" if modality else ""
 
-        # `inputs` is a self-contained per-mini-batch dict produced by _prepare_inputs.
-        # `scoring_data_loader` holds only model-input keys; training tensors are top-level.
         mask_seeds = inputs["mask_seeds"]
-        # Use global_step (optimizer-step counter) to select the GRPO iteration index so
-        # that all N gradient-accumulation micro-steps within one optimizer step use the
-        # same iteration's old logprobs / completion masks.
         this_itr_idx = self.state.global_step % num_iterations
 
         current_mask_seed = mask_seeds[this_itr_idx]
         if torch.is_tensor(current_mask_seed):
             current_mask_seed = int(current_mask_seed.item())
 
-        # Each call is a single micro-batch forward; no inner DataLoader loop.
-        # _get_per_token_logps sees a dict with "scoring_data_loader" and uses it directly.
         _t0_curr = time.perf_counter()
         per_token_logps, per_token_mask = self._get_per_token_logps(model, inputs, [current_mask_seed])
         per_token_logps = per_token_logps.squeeze(0)
@@ -1360,23 +1339,12 @@ class DiffuGRPOTrainer(GRPOTrainer):
             completion_mask = completion_mask.unsqueeze(0)
         completion_mask = completion_mask.float()
 
-        # old_per_token_logps / ref / completion_mask were padded to the global max completion
-        # length across all mini-batches.  per_token_logps is computed for this mini-batch only
-        # and may be shorter.  Trailing positions are zero-padding with completion_mask==0, so
-        # truncating is safe.
         seq_len = per_token_logps.shape[-1]
         old_per_token_logps = old_per_token_logps[..., :seq_len]
         if ref_per_token_logps is not None:
             ref_per_token_logps = ref_per_token_logps[..., :seq_len]
         completion_mask = completion_mask[..., :seq_len]
 
-        # Intersect the stored completion_mask (from the old forward) with
-        # per_token_mask (from the current forward) so only positions that are
-        # valid in BOTH forwards contribute to the loss.  Then apply this
-        # canonical mask to ALL logps tensors — including old and ref — so that
-        # no tensor carries stale values at positions the other tensors have as 0.
-        # Without this, e.g. ref=-90 at a position where curr=0 gives
-        # log_ratio=90, exp(90)=inf, and inf*mask(=0)=NaN in IEEE 754.
         per_token_mask = per_token_mask[..., :seq_len]
         completion_mask = completion_mask * per_token_mask
         per_token_logps = per_token_logps * completion_mask
@@ -1389,12 +1357,11 @@ class DiffuGRPOTrainer(GRPOTrainer):
         per_token_loss1 = coef_1 * advantages.unsqueeze(1)
         per_token_loss2 = coef_2 * advantages.unsqueeze(1)
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
-        
+
         if beta != 0.0:
             log_ratio = ref_per_token_logps - per_token_logps
             per_token_kl = torch.exp(log_ratio) - log_ratio - 1
 
-            # --- KL NaN diagnostics (rank-aware) ---
             _rank = self.accelerator.process_index
             _has_bad_kl = per_token_kl.isinf().any() or per_token_kl.isnan().any()
             _has_bad_loss_inputs = (
@@ -1406,7 +1373,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
             if _log_kl_diag:
                 _cm = completion_mask.bool()
                 print(
-                    f"[KL-diag rank={_rank} step={self.state.global_step}] "
+                    f"[KL-diag {modality} rank={_rank} step={self.state.global_step}] "
                     f"shapes: curr={tuple(per_token_logps.shape)} old={tuple(old_per_token_logps.shape)} "
                     f"ref={tuple(ref_per_token_logps.shape)} mask={tuple(completion_mask.shape)} | "
                     f"mask_sum={completion_mask.sum().item():.0f} total_elems={completion_mask.numel()} | "
@@ -1420,7 +1387,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 for _i in range(_n_show):
                     _idx = tuple(_bad_pos[_i].tolist())
                     print(
-                        f"  [BAD KL rank={_rank} pos={_idx}] "
+                        f"  [BAD KL {modality} rank={_rank} pos={_idx}] "
                         f"kl={per_token_kl[_idx].item():.6g} "
                         f"log_ratio={log_ratio[_idx].item():.6g} "
                         f"curr={per_token_logps[_idx].item():.6g} "
@@ -1431,12 +1398,11 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     )
                 _outside_mask = ~_cm
                 print(
-                    f"  [LEAK CHECK rank={_rank}] nonzero outside mask: "
+                    f"  [LEAK CHECK {modality} rank={_rank}] nonzero outside mask: "
                     f"curr={( per_token_logps[_outside_mask] != 0).sum().item()} "
                     f"ref={( ref_per_token_logps[_outside_mask] != 0).sum().item()} "
                     f"old={( old_per_token_logps[_outside_mask] != 0).sum().item()}"
                 )
-            # --- end KL NaN diagnostics ---
             per_token_loss = per_token_loss + beta * per_token_kl
 
         denom = completion_mask.sum().clamp_min(1.0)
@@ -1446,17 +1412,16 @@ class DiffuGRPOTrainer(GRPOTrainer):
         if beta != 0.0:
             mean_kl = ((per_token_kl * completion_mask).sum() / denom).detach()
             gathered_kl = self.accelerator.gather_for_metrics(mean_kl)
-            # Check which ranks contributed NaN to the gathered KL
             if gathered_kl.isnan().any():
                 _nan_ranks = gathered_kl.isnan().nonzero(as_tuple=False).flatten().tolist()
                 print(
-                    f"[KL-NaN GATHERED rank={_rank} step={self.state.global_step}] "
+                    f"[KL-NaN GATHERED {modality} rank={self.accelerator.process_index} "
+                    f"step={self.state.global_step}] "
                     f"mean_kl={mean_kl.item():.6g} gathered={gathered_kl.tolist()} "
                     f"nan_from_ranks={_nan_ranks} loss={loss.item():.6g}"
                 )
-            self._metrics[mode]["kl"].append(gathered_kl.mean().item())
+            self._metrics[mode][f"{prefix}kl"].append(gathered_kl.mean().item())
 
-        # Compute the clipped probability ratios
         epsilon_low = self.epsilon_low if hasattr(self, "epsilon_low") else epsilon
         epsilon_high = self.epsilon_high if hasattr(self, "epsilon_high") else epsilon
         is_low_clipped = (coef_1 < 1 - epsilon_low) & (advantages.unsqueeze(1) < 0)
@@ -1468,37 +1433,152 @@ class DiffuGRPOTrainer(GRPOTrainer):
         clip_ratio = ((is_region_clipped.float() * completion_mask).sum() / denom).detach()
 
         gathered_low_clip = self.accelerator.gather_for_metrics(low_clip)
-        self._metrics[mode]["clip_ratio/low_mean"].append(gathered_low_clip.nanmean().item())
-        self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
+        self._metrics[mode][f"{prefix}clip_ratio/low_mean"].append(gathered_low_clip.nanmean().item())
+        self._metrics[mode][f"{prefix}clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
         gathered_high_clip = self.accelerator.gather_for_metrics(high_clip)
-        self._metrics[mode]["clip_ratio/high_mean"].append(gathered_high_clip.nanmean().item())
-        self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
+        self._metrics[mode][f"{prefix}clip_ratio/high_mean"].append(gathered_high_clip.nanmean().item())
+        self._metrics[mode][f"{prefix}clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
         gathered_clip_ratio = self.accelerator.gather_for_metrics(clip_ratio)
-        self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
+        self._metrics[mode][f"{prefix}clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
 
-        # Log curr_logprobs time (covers the forward pass inside compute_loss)
         torch.cuda.synchronize() if torch.cuda.is_available() else None
         _elapsed_curr = time.perf_counter() - _t0_curr
-        self._metrics[mode]["time_profile/curr_logprobs_and_update"].append(_elapsed_curr)
-
-        _dummy = torch.zeros(1, device=loss.device, dtype=loss.dtype)
-        for p in model.parameters():
-            if p.requires_grad:
-                _dummy = _dummy + p.view(-1)[0]  # single scalar per param — cheap
-        loss = loss + _dummy * 0.0
+        self._metrics[mode][f"{prefix}time_profile/curr_logprobs_and_update"].append(_elapsed_curr)
 
         return loss
+
+    def _wandb_log_metrics(self):
+        """Average self._metrics and log to wandb every ``logging_steps``."""
+        if not self.accelerator.is_main_process:
+            return
+        if self.state.global_step % self.args.logging_steps != 0:
+            return
+
+        mode = "train" if self.model.training else "eval"
+        raw = self._metrics.get(mode, {})
+        if not raw:
+            return
+
+        averaged = {}
+        for key, vals in raw.items():
+            valid = [v for v in vals if not math.isnan(v)]
+            averaged[key] = sum(valid) / len(valid) if valid else None
+
+        if mode == "eval":
+            averaged = {f"eval_{k}": v for k, v in averaged.items()}
+
+        logs = {k: v for k, v in averaged.items() if v is not None}
+        if logs:
+            wandb.log({**logs, "train/global_step": self.state.global_step})
+
+        raw.clear()
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """Single-modality compute_loss (used when no und_dataset is configured)."""
+        if return_outputs:
+            raise ValueError("The GRPOTrainer does not support returning outputs")
+        loss = self._compute_modality_loss(model, inputs)
+        return loss
+
+    def training_step(
+        self,
+        model: nn.Module,
+        inputs: dict[str, Union[torch.Tensor, Any]],
+        num_items_in_batch: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Override HF Trainer's training_step to support dual-modality backward passes.
+
+        For single-modality (no und_dataset), falls back to the default Trainer behaviour.
+        For dual-modality (interleave), performs two separate forward+backward passes
+        (gen then und) so that each rank activates the same parameter subsets in the
+        same order — preventing DeepSpeed ZeRO-2 NCCL deadlocks.
+        """
+        time_before = time.perf_counter()
+        model.train()
+        if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+            self.optimizer.train()
+
+        inputs = self._prepare_inputs(inputs)
+
+        # --- Single-modality path: delegate to default Trainer ---
+        if "gen_batch" not in inputs:
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
+            del inputs
+
+            kwargs = {}
+            if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+                kwargs["scale_wrt_gas"] = False
+            self.accelerator.backward(loss, **kwargs)
+            self._wandb_log_metrics()
+            return loss.detach()
+
+        # --- Dual-modality path: separate gen + und backward ---
+        gen_batch = inputs["gen_batch"]
+        und_batch = inputs["und_batch"]
+        del inputs
+
+        kwargs = {}
+        from accelerate.utils import DistributedType
+        if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+            kwargs["scale_wrt_gas"] = False
+
+        # Generation branch forward + backward
+        with self.compute_loss_context_manager():
+            gen_loss = self._compute_modality_loss(model, gen_batch, modality="gen")
+        self.accelerator.backward(gen_loss, **kwargs)
+
+        # Understanding branch forward + backward
+        with self.compute_loss_context_manager():
+            und_loss = self._compute_modality_loss(model, und_batch, modality="und")
+        self.accelerator.backward(und_loss, **kwargs)
+
+        self._step += 1
+        time_after = time.perf_counter()
+        self._current_train_step_time += time_after - time_before
+        if self._step % self.current_gradient_accumulation_steps == 0:
+            self._metrics["train"]["step_time"].append(self._current_train_step_time)
+            self._current_train_step_time = 0.0
+
+        self._wandb_log_metrics()
+
+        return (gen_loss + und_loss).detach()
 
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         mode = "eval" if self.control.should_evaluate else "train"
         num_iterations = int(getattr(self.args, "num_iterations", 1))
+
+        # --- Single-modality path (no und dataset) ---
+        if self._und_dataloader is None:
+            if mode == "train":
+                generate_every = self.args.steps_per_generation * num_iterations
+                if self._step % generate_every == 0 or self._buffered_inputs is None:
+                    self._buffered_inputs = self._generate_and_score_completions(inputs)
+                slot = self._step % len(self._buffered_inputs)
+                result = self._buffered_inputs[slot]
+                self._step += 1
+                return result
+            else:
+                batches = self._generate_and_score_completions(inputs)
+                return batches[0] if batches else inputs
+
+        # --- Dual-modality path (gen + und) ---
         if mode == "train":
             generate_every = self.args.steps_per_generation * num_iterations
-            if self._step % generate_every == 0 or self._buffered_inputs is None:
-                # Each element is a self-contained per-mini-batch dict.
-                self._buffered_inputs = self._generate_and_score_completions(inputs)
-            slot = self._step % len(self._buffered_inputs)
-            result = self._buffered_inputs[slot]
+            if self._step % generate_every == 0 or self._gen_buffered_inputs[0] is None:
+                # Draw und batch from separate DataLoader.
+                try:
+                    und_inputs = next(self._und_iter)
+                except StopIteration:
+                    self._und_iter = iter(self._und_dataloader)
+                    und_inputs = next(self._und_iter)
+                self._gen_buffered_inputs, self._und_buffered_inputs = \
+                    self._generate_and_score_completions_dual(inputs, und_inputs)
+            slot = self._step % len(self._gen_buffered_inputs)
+            result = {
+                "gen_batch": self._gen_buffered_inputs[slot],
+                "und_batch": self._und_buffered_inputs[slot],
+            }
             self._step += 1
             return result
         else:
@@ -1724,10 +1804,10 @@ class DiffuGRPOTrainer(GRPOTrainer):
         zero_std_count = (std_grouped_rewards < 1e-6).sum().item()  # Using a small threshold
         total_prompts = std_grouped_rewards.size(0)
         zero_std_ratio = zero_std_count / total_prompts if total_prompts > 0 else 0.0
-        is_std_zero = std_grouped_rewards < 1e-6
+
         process_slice = slice(
-            self.accelerator.process_index * local_n,
-            (self.accelerator.process_index + 1) * local_n,
+            self.accelerator.process_index * local_num_prompts,
+            (self.accelerator.process_index + 1) * local_num_prompts,
         )
         advantages = advantages[process_slice]
 
@@ -1781,3 +1861,247 @@ class DiffuGRPOTrainer(GRPOTrainer):
             }
             for batch in prepared_batches  # DataLoader is iterable; no need to materialise separately
         ]
+
+    # ------------------------------------------------------------------
+    # Dual-modality generation + scoring (interleave training)
+    # ------------------------------------------------------------------
+    def _generate_and_score_completions_dual(
+        self,
+        gen_inputs: list[dict[str, Any]],
+        und_inputs: list[dict[str, Any]],
+    ) -> tuple[list[dict], list[dict]]:
+        """Generate and score completions for gen (image-edit) and und (text) modalities
+        independently, returning two separate buffer lists for dual backward passes.
+
+        This eliminates the NCCL deadlock caused by mixed-modality batches activating
+        different parameter subsets on different ranks.
+        """
+        device = self.accelerator.device
+        beta = float(getattr(self.args, "beta", 0.0))
+        num_iterations = int(getattr(self.args, "num_iterations", 1))
+        mode = "eval" if self.control.should_evaluate else "train"
+        _timings: dict[str, float] = {}
+        grad_accum_steps = int(getattr(self.args, "gradient_accumulation_steps", 1) or 1)
+
+        with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
+            image_processor = self._get_image_processor(unwrapped_model)
+
+            # ---- Image-edit (gen) rollouts ----
+            image_contexts: list[Optional[dict]] = [None] * len(gen_inputs)
+            image_edit_batch_size = max(1, int(getattr(self.args, "image_edit_batch_size", 1)))
+            with _timer(_timings, "image_rollout"):
+                for start_idx in trange(0, len(gen_inputs), image_edit_batch_size, desc="Image Rollout"):
+                    batch_examples = gen_inputs[start_idx : start_idx + image_edit_batch_size]
+                    _, batch_contexts = self._rollout_image_edit_latents(unwrapped_model, batch_examples)
+                    for offset, ctx in enumerate(batch_contexts):
+                        image_contexts[start_idx + offset] = ctx
+
+            # ---- Text (und) rollouts ----
+            answer_contexts: list[Optional[dict]] = [None] * len(und_inputs)
+            text_batch_size = 4
+            prefix_lm = bool(getattr(self.args, "prefix_lm", True))
+            generation_kwargs = {
+                "max_new_tokens": int(self.args.max_completion_length),
+                "block_length": int(min(self.args.block_length, self.args.max_completion_length)),
+                "step_per_block": self.args.text_rollout_step_per_block
+                if self.args.text_rollout_step_per_block is not None
+                else int(min(self.args.block_length, self.args.max_completion_length)),
+                "temperature": float(self.args.temperature),
+                "do_sample": bool(self.args.text_rollout_do_sample),
+                "prefix_lm": prefix_lm,
+                "use_fast_dlm": False,
+                "remasking": self.args.remasking,
+                "cfg_scale": self.args.cfg_scale,
+            }
+            generation_kwargs = {k: v for k, v in generation_kwargs.items() if v is not None}
+            with _timer(_timings, "text_rollout"):
+                for start_idx in trange(0, len(und_inputs), text_batch_size, desc="Text Rollout"):
+                    batch_examples = und_inputs[start_idx : start_idx + text_batch_size]
+                    _, batch_contexts = self._rollout_multimodal_text_gen(
+                        unwrapped_model, batch_examples, image_processor,
+                        generation_kwargs, device,
+                    )
+                    for offset, ctx in enumerate(batch_contexts):
+                        answer_contexts[start_idx + offset] = ctx
+
+            # ---- Build scoring examples per modality ----
+            collate_fn = MaskDataCollator(self.processing_class, self.args)
+            dataset_args = self._build_lazy_supervised_data_args(unwrapped_model, image_processor)
+
+            def _build_scoring_items(data_list: list[dict]) -> list[dict]:
+                ds = LazySupervisedDataset(
+                    tokenizer=self.processing_class,
+                    data_args=dataset_args,
+                    list_data=data_list,
+                )
+                return [{**ds[idx], "_sample_idx": idx} for idx in range(len(ds))]
+
+            gen_data_list = [ctx["payload"] for ctx in image_contexts if ctx is not None]
+            und_data_list = [ctx["payload"] for ctx in answer_contexts if ctx is not None]
+
+            gen_scoring = _build_scoring_items(gen_data_list) if gen_data_list else []
+            und_scoring = _build_scoring_items(und_data_list) if und_data_list else []
+
+            if not gen_scoring:
+                raise ValueError("No gen (image-edit) scoring examples were built.")
+            if not und_scoring:
+                raise ValueError("No und (text) scoring examples were built.")
+
+        # ---- Shared mask seeds across modalities and ranks ----
+        mask_seeds = torch.randint(0, 2**12, (num_iterations,), device=device)
+        mask_seed_list = mask_seeds.detach().cpu().tolist()
+
+        # ---- Helper: compute old/ref logps for a modality ----
+        def _compute_logps(scoring_examples):
+            with torch.no_grad():
+                old_logps, comp_masks = self._get_per_token_logps(
+                    self.model, scoring_examples, mask_seed_list,
+                )
+                old_logps = old_logps * comp_masks
+                ref_logps = None
+                if beta != 0.0:
+                    if getattr(self, "ref_model", None) is not None:
+                        ref_logps, _ = self._get_per_token_logps(
+                            self.ref_model, scoring_examples, mask_seed_list,
+                        )
+                    else:
+                        unwrapped = self.accelerator.unwrap_model(self.model)
+                        if hasattr(unwrapped, "disable_adapter"):
+                            with unwrapped.disable_adapter():
+                                ref_logps, _ = self._get_per_token_logps(
+                                    self.model, scoring_examples, mask_seed_list,
+                                )
+                        else:
+                            ref_logps, _ = self._get_per_token_logps(
+                                self.model, scoring_examples, mask_seed_list,
+                            )
+                    ref_logps = ref_logps * comp_masks
+            return old_logps, comp_masks, ref_logps
+
+        with _timer(_timings, "gen_old_logprobs"):
+            gen_old_logps, gen_comp_masks, gen_ref_logps = _compute_logps(gen_scoring)
+        with _timer(_timings, "und_old_logprobs"):
+            und_old_logps, und_comp_masks, und_ref_logps = _compute_logps(und_scoring)
+
+        # ---- Rewards per modality ----
+        with _timer(_timings, "reward"):
+            # Gen rewards (image-edit → perceptual)
+            gen_reward_inputs = [ex for ex, ctx in zip(gen_inputs, image_contexts) if ctx is not None]
+            gen_prompts = [ctx["prompt"] for ctx in image_contexts if ctx is not None]
+            gen_completions = [ctx["decoded_image"] for ctx in image_contexts if ctx is not None]
+            gen_reward_fns = [perceptual_score_reward_func]
+
+            gen_rewards_per_func = torch.zeros(len(gen_completions), len(gen_reward_fns), device=device)
+            for i, reward_func in enumerate(gen_reward_fns):
+                reward_func_name = reward_func.__name__
+                with profiling_context(self, reward_func_name):
+                    keys = [k for k in gen_reward_inputs[0] if k not in ["prompt", "completion"]]
+                    reward_kwargs = {k: [ex.get(k) for ex in gen_reward_inputs] for k in keys}
+                    try:
+                        output = reward_func(
+                            prompts=gen_prompts, completions=gen_completions,
+                            step=self._step, run_name=self.args.output_dir, **reward_kwargs,
+                        )
+                    except Exception:
+                        output = [torch.nan for _ in gen_completions]
+                    output = [r if r is not None else torch.nan for r in output]
+                    gen_rewards_per_func[:, i] = torch.tensor(output, dtype=torch.float32, device=device)
+                self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(torch.nanmean(gen_rewards_per_func[:, i]).item())
+                self._metrics[mode][f"rewards/{reward_func_name}/std"].append(nanstd(gen_rewards_per_func[:, i]).item())
+            gen_local_rewards = gen_rewards_per_func.nansum(dim=1)
+
+            # Und rewards (text → format + correctness)
+            und_reward_inputs = [ex for ex, ctx in zip(und_inputs, answer_contexts) if ctx is not None]
+            und_prompts = [ctx["prompt"] for ctx in answer_contexts if ctx is not None]
+            und_completions = [
+                [{"role": "assistant", "content": ctx["decoded_text"]}]
+                for ctx in answer_contexts if ctx is not None
+            ]
+            und_reward_fns = [strict_format_reward_func, correctness_reward_func]
+
+            und_rewards_per_func = torch.zeros(len(und_completions), len(und_reward_fns), device=device)
+            for i, reward_func in enumerate(und_reward_fns):
+                reward_func_name = reward_func.__name__
+                with profiling_context(self, reward_func_name):
+                    keys = [k for k in und_reward_inputs[0] if k not in ["prompt", "completion"]]
+                    reward_kwargs = {k: [ex.get(k) for ex in und_reward_inputs] for k in keys}
+                    try:
+                        output = reward_func(
+                            prompts=und_prompts, completions=und_completions,
+                            step=self._step, run_name=self.args.output_dir, **reward_kwargs,
+                        )
+                    except Exception:
+                        output = [torch.nan for _ in und_completions]
+                    output = [r if r is not None else torch.nan for r in output]
+                    und_rewards_per_func[:, i] = torch.tensor(output, dtype=torch.float32, device=device)
+                self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(torch.nanmean(und_rewards_per_func[:, i]).item())
+                self._metrics[mode][f"rewards/{reward_func_name}/std"].append(nanstd(und_rewards_per_func[:, i]).item())
+            und_local_rewards = und_rewards_per_func.nansum(dim=1)
+
+        # ---- Advantages per modality ----
+        def _compute_advantages(local_rewards, comp_masks, tag):
+            local_n = local_rewards.size(0)
+            rewards = gather(local_rewards)
+            mean_grouped = rewards.view(-1, self.num_generations).mean(dim=1)
+            std_grouped = rewards.view(-1, self.num_generations).std(dim=1)
+            mean_grouped = mean_grouped.repeat_interleave(self.num_generations, dim=0)
+            std_grouped = std_grouped.repeat_interleave(self.num_generations, dim=0)
+            process_slice = slice(
+                self.accelerator.process_index * local_n,
+                (self.accelerator.process_index + 1) * local_n,
+            )
+            advantages = (rewards - mean_grouped)[process_slice]
+            # Metrics
+            is_std_zero = std_grouped < 1e-6
+            comp_length = self.accelerator.gather_for_metrics(
+                comp_masks.float().sum(-1).mean(dim=0)
+            ).float().mean().item()
+            self._metrics[mode][f"{tag}/completion_length"].append(comp_length)
+            self._metrics[mode][f"{tag}/reward"].append(rewards.mean().item())
+            self._metrics[mode][f"{tag}/reward_std"].append(rewards.std().item())
+            self._metrics[mode][f"{tag}/frac_reward_zero_std"].append(is_std_zero.float().mean().item())
+            return advantages
+
+        gen_advantages = _compute_advantages(gen_local_rewards, gen_comp_masks, "gen")
+        und_advantages = _compute_advantages(und_local_rewards, und_comp_masks, "und")
+
+        # ---- Build prepared batches per modality ----
+        collate_fn = MaskDataCollator(self.processing_class, self.args)
+        mask_seeds_val = mask_seeds.detach()
+
+        _TRAINING_KEYS = frozenset({"advantages", "completion_mask", "completion_masks",
+                                    "old_per_token_logps", "ref_per_token_logps"})
+
+        def _build_buffer(scoring_examples, advantages, comp_masks, old_logps, ref_logps):
+            # Choose batch_size so total mini-batches == grad_accum_steps.
+            n = len(scoring_examples)
+            batch_size = max(1, n // grad_accum_steps)
+            prepared = DataLoader(
+                scoring_examples,
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=self._build_scored_batch_collator(
+                    collate_fn, advantages, comp_masks, old_logps, ref_logps, num_iterations,
+                ),
+            )
+            return [
+                {
+                    "scoring_data_loader": batch["scoring_instances"],
+                    **{k: v for k, v in batch.items() if k in _TRAINING_KEYS},
+                    "mask_seeds": mask_seeds_val,
+                }
+                for batch in prepared
+            ]
+
+        gen_buffer = _build_buffer(gen_scoring, gen_advantages, gen_comp_masks, gen_old_logps, gen_ref_logps)
+        und_buffer = _build_buffer(und_scoring, und_advantages, und_comp_masks, und_old_logps, und_ref_logps)
+
+        # Ensure both buffers have grad_accum_steps entries. Truncate or pad if needed.
+        min_len = min(len(gen_buffer), len(und_buffer), grad_accum_steps)
+        gen_buffer = gen_buffer[:min_len]
+        und_buffer = und_buffer[:min_len]
+
+        for k, v in _timings.items():
+            self._metrics[mode][f"time_profile/{k}"].append(v)
+
+        return gen_buffer, und_buffer

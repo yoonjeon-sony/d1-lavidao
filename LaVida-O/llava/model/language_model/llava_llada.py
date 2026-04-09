@@ -557,7 +557,7 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
                     _loss_mask = gen_latents_comp_labels_is_mask.flatten()
                     gen_loss = torch.nn.functional.cross_entropy(gen_logits.flatten(0,2)[_loss_mask],gen_latents_comp_labels.flatten()[_loss_mask])
                     per_token_ce = torch.nn.functional.cross_entropy(
-                        gen_logits.flatten(0, 2)[_loss_mask_flat].float() / temperature,
+                        gen_logits.flatten(0, 2)[_loss_mask_flat].float(),
                         gen_latents_comp_labels.flatten()[_loss_mask_flat],
                         reduction='none',
                     )
@@ -572,8 +572,8 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
                         loss_weight = loss_weight.flatten()[_loss_mask].to(gen_loss.dtype)
                         gen_loss = (gen_loss * loss_weight).mean()
                         per_token_ce = torch.nn.functional.cross_entropy(
-                            gen_logits[_loss_mask_flat].float() / temperature,
-                            gen_latents_comp_labels.flatten()[_loss_mask_flat],
+                            gen_logits[_loss_mask].float(),
+                            gen_latents_comp_labels.flatten()[_loss_mask],
                             reduction='none',
                         )
                     else:
