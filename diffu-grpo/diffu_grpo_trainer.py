@@ -1441,7 +1441,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
 
         denom = completion_mask.sum().clamp_min(1.0)
         loss = (per_token_loss * completion_mask).sum() / denom
-        mode = "eval" if self.control.should_evaluate else "train"
+        mode = "train" if self.model.training else "eval"
 
         if beta != 0.0:
             mean_kl = ((per_token_kl * completion_mask).sum() / denom).detach()
@@ -1480,6 +1480,12 @@ class DiffuGRPOTrainer(GRPOTrainer):
         torch.cuda.synchronize() if torch.cuda.is_available() else None
         _elapsed_curr = time.perf_counter() - _t0_curr
         self._metrics[mode]["time_profile/curr_logprobs_and_update"].append(_elapsed_curr)
+
+        _dummy = torch.zeros(1, device=loss.device, dtype=loss.dtype)
+        for p in model.parameters():
+            if p.requires_grad:
+                _dummy = _dummy + p.view(-1)[0]  # single scalar per param — cheap
+        loss = loss + _dummy * 0.0
 
         return loss
 
@@ -1656,10 +1662,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
             ]
             local_rewards = []
             for reward_inputs, branch_prompts, branch_completions, reward_fns in reward_specs:
-                # Always create a rewards tensor (possibly empty) so that every
-                # rank calls `gather` the same number of times.  Skipping the
-                # gather when a rank has no samples of a given type causes NCCL
-                # deadlocks because the collectives are FIFO-matched across ranks.
                 n_branch = len(branch_completions) if branch_completions else 0
                 rewards_per_func = torch.zeros(n_branch, len(reward_fns), device=device)
                 if branch_completions:
@@ -1688,53 +1690,51 @@ class DiffuGRPOTrainer(GRPOTrainer):
                             ]
                             rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
-                    if torch.isnan(rewards_per_func).all(dim=1).any():
-                        nan_row_idx = torch.isnan(rewards_per_func).all(dim=1).nonzero(as_tuple=True)[0][0]
-                        row_reward_kwargs = {key: value[nan_row_idx] for key, value in reward_kwargs.items()}
-                        row_reward_kwargs["prompt"] = branch_prompts[nan_row_idx]
-                        row_reward_kwargs["completion"] = branch_completions[nan_row_idx]
-                        warnings.warn(
-                            f"All reward functions returned None for kwargs: {row_reward_kwargs}. "
-                            "Ensure at least one reward function returns a valid reward."
-                        )
-
-                    gathered_rewards_per_func = gather(rewards_per_func)
+                    
+                    
                     for i, reward_func in enumerate(reward_fns):
                         if isinstance(reward_func, nn.Module):
                             reward_func_name = reward_func.config._name_or_path.split("/")[-1]
                         else:
                             reward_func_name = reward_func.__name__
-                        if gathered_rewards_per_func.numel() > 0:
-                            mean_rewards = torch.nanmean(gathered_rewards_per_func[:, i]).item()
-                            std_rewards = nanstd(gathered_rewards_per_func[:, i]).item()
-                        else:
-                            mean_rewards = float("nan")
-                            std_rewards = float("nan")
+                        
+                        mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
+                        std_rewards = nanstd(rewards_per_func[:, i]).item()
                         self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
                         self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_rewards)
-                    if n_branch > 0:
-                        local_rewards.append(rewards_per_func.nansum(dim=1))
+                    local_rewards.append(rewards_per_func.nansum(dim=1))
 
         if not local_rewards:
             raise ValueError("No rewards were produced for generated completions.")
 
-        local_rewards = torch.cat(local_rewards, dim=0)
-        rewards = gather(local_rewards)
+        rewards = torch.cat(local_rewards, dim=0)
+        local_n = rewards.size(0)
+        rewards = gather(rewards)
+
+        # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
         std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+
+        # Normalize the rewards to compute the advantages
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        local_sample_count = local_rewards.size(0)
-        process_slice = slice(
-            self.accelerator.process_index * local_sample_count,
-            (self.accelerator.process_index + 1) * local_sample_count,
-        )
-        advantages = local_rewards - mean_grouped_rewards[process_slice]
-        is_std_zero = std_grouped_rewards < 1e-6
+        advantages = rewards - mean_grouped_rewards
 
-        completion_length = self.accelerator.gather_for_metrics(
-            completion_masks.float().sum(dim=-1).mean(dim=0)
-        ).float().mean().item()
+        # Count prompts with zero std deviation
+        zero_std_count = (std_grouped_rewards < 1e-6).sum().item()  # Using a small threshold
+        total_prompts = std_grouped_rewards.size(0)
+        zero_std_ratio = zero_std_count / total_prompts if total_prompts > 0 else 0.0
+        is_std_zero = std_grouped_rewards < 1e-6
+        process_slice = slice(
+            self.accelerator.process_index * local_n,
+            (self.accelerator.process_index + 1) * local_n,
+        )
+        advantages = advantages[process_slice]
+
+        # Log the metrics
+        completion_length = self.accelerator.gather_for_metrics(completion_masks.float().sum(-1).mean(dim=0)).float().mean().item()
+        self._metrics[mode]["completion_length"].append(completion_length)
+        self._metrics[mode]["zero_std_ratio"].append(zero_std_ratio)
         self._metrics[mode]["completion_length"].append(completion_length)
         self._metrics[mode]["reward"].append(rewards.mean().item())
         self._metrics[mode]["reward_std"].append(rewards.std().item())

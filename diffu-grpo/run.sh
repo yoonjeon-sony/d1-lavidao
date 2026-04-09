@@ -1,15 +1,12 @@
+DEBUG="${DEBUG:-0}"
 NUM_PROCESSES=8
-export WANDB_ENTITY="jeoni"
+
 export WANDB_PROJECT="RL_clean_d1"
 export DEBUG_FIX_PADDING=1
 export NOT_ALWASY_DO_2DPOOL=1
 export SKIP_COMPLEMENTARY_MASKING=1
-export TRITON_CACHE_DIR="${SLURM_TMPDIR:-/tmp}/triton-${USER}/${SLURM_JOB_ID:-$$}-${LOCAL_RANK:-0}"
-DEBUG="${DEBUG:-0}"
 
-mkdir -p "$TRITON_CACHE_DIR"
-chmod 700 "$TRITON_CACHE_DIR"
-DATASET="thinkmorph_answer" # thinkmorph_interleave thinkmorph_answer thinkmorph_edit
+DATASET="thinkmorph_interleave" # thinkmorph_interleave thinkmorph_answer thinkmorph_edit
 RUN_NAME=${DATASET}_Test-LavidaO
 # MODEL_PATH=/group2/dgm/yoonjeon/ckpts/sft-lavidao-thinkmorph-complete/checkpoint-2420
 MODEL_PATH="/scratch2/yoonjeon.kim/sft_LaViDa-O-thinkmorph_zebracot-step3000/"
@@ -86,13 +83,13 @@ IMAGE_EDIT_MIN_TEMPERATURE=0.5
 NUM_ITER=2
 BETA=0.04
 EPSILON=0.5
-SYNC_REF_MODEL="false"
+SYNC_REF_MODEL="true"
 REF_MODEL_SYNC_STEPS=64
 
 if [[ "${DEBUG}" == "1" || "${DEBUG,,}" == "true" ]]; then
     echo "Running in debug mode!!!!"
-    BATCH_SIZE=4
-    NUM_GENERATIONS=2
+    BATCH_SIZE=8
+    NUM_GENERATIONS=8
     PER_DEVICE_BATCH_SIZE=1
     MAX_STEPS=20
     LOGGING_STEPS=1
@@ -104,8 +101,8 @@ else
     NUM_GENERATIONS=8
     PER_DEVICE_BATCH_SIZE=4
     MAX_STEPS="${MAX_STEPS:-}"
-    LOGGING_STEPS="${LOGGING_STEPS:-1}"
-    SAVE_STEPS="${SAVE_STEPS:-50}"
+    LOGGING_STEPS=1
+    SAVE_STEPS=50
     RETURN_DEBUG_ARTIFACTS=false
     RESUME=false
 fi
@@ -194,4 +191,5 @@ python -m accelerate.commands.launch \
     --per_device_train_batch_size $PER_DEVICE_BATCH_SIZE \
     --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
     --report_to wandb \
-    --save_steps $SAVE_STEPS
+    --save_steps $SAVE_STEPS \
+    --logging_steps $LOGGING_STEPS
