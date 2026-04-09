@@ -15,8 +15,11 @@ from llava.model.builder import load_pretrained_model
 from trl import ModelConfig, TrlParser
 
 # Required by LaVida-O sampling paths.
+# IMPORTANT: these must be set BEFORE any llava imports, because llava_llada.py
+# reads them at module-load time into module-level constants.
 os.environ.setdefault("DEBUG_FIX_PADDING", "1")
 os.environ.setdefault("NOT_ALWASY_DO_2DPOOL", "1")
+os.environ.setdefault("SKIP_COMPLEMENTARY_MASKING", "1")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LAVIDA_ROOT = REPO_ROOT / "LaVida-O"
@@ -36,6 +39,7 @@ from data_utils import (
     get_math_questions,
     get_mixed_placeholder_questions,
     get_sudoku_questions,
+    get_thinkmorph_interleave_questions,
     set_random_seed,
 )
 from diffu_grpo_config import DiffuGRPOConfig
@@ -384,6 +388,17 @@ def main(grpo_config, model_config):
             strict_format_reward_func,
             correctness_reward_func,
         ]
+    elif grpo_config.dataset == "thinkmorph_interleave":
+        dataset = get_thinkmorph_interleave_questions("train")
+        # Reward dispatch for mixed tasks is handled inside _generate_and_score_completions:
+        #   image_edit samples → perceptual_score_reward_func
+        #   text samples       → strict_format_reward_func, correctness_reward_func
+        # Pass the union here so _validate_reward_dataset_compatibility can check columns.
+        reward_functions = [
+            perceptual_score_reward_func,
+            strict_format_reward_func,
+            correctness_reward_func,
+        ]
     elif grpo_config.dataset == "mixed_placeholder":
         dataset = get_mixed_placeholder_questions("train")
         reward_functions = [neutral_reward_func]
@@ -392,7 +407,11 @@ def main(grpo_config, model_config):
 
     _validate_reward_dataset_compatibility(grpo_config.dataset, dataset, reward_functions)
 
-    dataset = dataset.shuffle(seed=grpo_config.seed)
+    # For interleave datasets the row ordering encodes paired structure
+    # (even=image_edit, odd=text).  PairedRepeatSampler shuffles at the
+    # pair level, so a dataset-level shuffle here would break the pairing.
+    if grpo_config.dataset != "thinkmorph_interleave":
+        dataset = dataset.shuffle(seed=grpo_config.seed)
     if grpo_config.dataset in ["countdown", "sudoku"] and len(dataset) > 500:
         train_set = dataset.select(range(0, len(dataset) - 500))
     else:

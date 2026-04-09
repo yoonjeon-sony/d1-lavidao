@@ -193,20 +193,16 @@ def ensure_finite_(x: torch.Tensor, check_neg_inf: bool = True, check_pos_inf: b
     if check_pos_inf:
         x.masked_fill_(x == float("inf"), torch.finfo(x.dtype).max)
 
-import deepspeed
 def activation_checkpoint_function(cfg: ModelConfig):
     preserve_rng_state = (
         (cfg.attention_dropout == 0.0) and (cfg.embedding_dropout == 0.0) and (cfg.residual_dropout == 0.0)
     )
     from torch.utils.checkpoint import checkpoint
-
-    # return partial(
-    #     checkpoint,
-    #     preserve_rng_state=preserve_rng_state,
-    #     use_reentrant=False,
-    # )
-    # raise NotImplementedError()
-    return deepspeed.checkpointing.checkpoint
+    return partial(
+        checkpoint,
+        preserve_rng_state=preserve_rng_state,
+        use_reentrant=False,
+    )
 
 
 class BufferCache(dict, MutableMapping[str, torch.Tensor]):
@@ -1776,7 +1772,8 @@ class LLaDAModelLM(PreTrainedModel):
         prompt_len: Optional[torch.Tensor] = None,
         num_items_in_batch=None,
         modality_indices: Optional[torch.Tensor] = None,
-        replace_position: Optional[torch.Tensor] = None,  # This is a 
+        replace_position: Optional[torch.Tensor] = None,  # This is a
+        temperature: float = 1.0,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if use_cache is None:
             use_cache = self.config.use_cache
@@ -1824,16 +1821,24 @@ class LLaDAModelLM(PreTrainedModel):
             # import warnings
             loss = token_loss
             # warnings.warn("Note that for LLaDA, you cannot calculate the loss here.", UserWarning)
+            und_loss_none_reduction = F.cross_entropy(
+                (logits / temperature).view(-1, logits.shape[-1]),
+                labels.view(-1),
+                reduction='none',
+            ).view(logits.shape[0], logits.shape[1])  # (B, L)
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
+        result = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.attn_key_values,
             hidden_states=hidden_states,
         )
+        if labels is not None:
+            result['und_loss_none_reduction'] = und_loss_none_reduction
+        return result
 
     def can_generate(self) -> bool:
         return True

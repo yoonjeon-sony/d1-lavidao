@@ -8,7 +8,7 @@ deepspeed_config:
   offload_param_device: none
   zero3_init_flag: false
   zero_stage: 2
-  overlap_comm: true
+  overlap_comm: false
   gradient_clip: 1
 distributed_type: DEEPSPEED
 downcast_bf16: 'auto'

@@ -1,28 +1,19 @@
-#!/bin/bash
-#SBATCH --partition=dgm
-#SBATCH --account=dgm
-#SBATCH --job-name=RL-DiffuGRPO-NEW
-#SBATCH --nodes=1
-#SBATCH --ntasks=1                    # 1 task per GPU
-#SBATCH --gres=gpu:8
-#SBATCH --time=24:00:00               # Max time
-#SBATCH --requeue                     # allow requeue if preempted
-#SBATCH --output=/home/yoonjeon.kim/dLLM-RL/train_sft/slurm-logs/output.%j.log
-#SBATCH --error=/home/yoonjeon.kim/dLLM-RL/train_sft/slurm-logs/error.%j.log
-
 NUM_PROCESSES=8
-
+export WANDB_ENTITY="jeoni"
+export WANDB_PROJECT="RL_clean_d1"
 export DEBUG_FIX_PADDING=1
 export NOT_ALWASY_DO_2DPOOL=1
+export SKIP_COMPLEMENTARY_MASKING=1
 export TRITON_CACHE_DIR="${SLURM_TMPDIR:-/tmp}/triton-${USER}/${SLURM_JOB_ID:-$$}-${LOCAL_RANK:-0}"
+DEBUG="${DEBUG:-0}"
 
 mkdir -p "$TRITON_CACHE_DIR"
 chmod 700 "$TRITON_CACHE_DIR"
-DATASET="thinkmorph_edit" # thinkmorph_edit, thinkmorph_answer
+DATASET="thinkmorph_answer" # thinkmorph_interleave thinkmorph_answer thinkmorph_edit
 RUN_NAME=${DATASET}_Test-LavidaO
 # MODEL_PATH=/group2/dgm/yoonjeon/ckpts/sft-lavidao-thinkmorph-complete/checkpoint-2420
-MODEL_PATH="/group2/dgm/yoonjeon/ckpts/sft_LaViDa-O-thinkmorph_zebracot/checkpoint-3000"
-OUTPUT_DIR=/group2/dgm/yoonjeon/ckpts/rl-lavidao-thinkmorph/$RUN_NAME
+MODEL_PATH="/scratch2/yoonjeon.kim/sft_LaViDa-O-thinkmorph_zebracot-step3000/"
+OUTPUT_DIR=/scratch2/yoonjeon.kim/rl-lavidao-thinkmorph/$RUN_NAME
 
 # ----------------------------
 # Model initialization configs
@@ -95,18 +86,37 @@ IMAGE_EDIT_MIN_TEMPERATURE=0.5
 NUM_ITER=2
 BETA=0.04
 EPSILON=0.5
-SYNC_REF_MODEL="true"
+SYNC_REF_MODEL="false"
 REF_MODEL_SYNC_STEPS=64
-NUM_GENERATIONS=8
-GRAD_ACCUM_STEPS=4
-# steps_per_generation = gradient_accumulation_steps and generation_batch_size = per_device_train_batch_size * world_size * steps_per_generation in grpo_config.py. With your values, that becomes 64 global, so each GPU gets a local generation batch of 8, not 2.
-PER_DEVICE_TRAIN_BS=2
 
-if ! command -v accelerate >/dev/null 2>&1; then
-  echo "ERROR: 'accelerate' not found in PATH. Activate your training environment first."
-  exit 127
+if [[ "${DEBUG}" == "1" || "${DEBUG,,}" == "true" ]]; then
+    echo "Running in debug mode!!!!"
+    BATCH_SIZE=4
+    NUM_GENERATIONS=2
+    PER_DEVICE_BATCH_SIZE=1
+    MAX_STEPS=20
+    LOGGING_STEPS=1
+    SAVE_STEPS=100000
+    RETURN_DEBUG_ARTIFACTS=true
+    RESUME=false
+else
+    BATCH_SIZE=64
+    NUM_GENERATIONS=8
+    PER_DEVICE_BATCH_SIZE=4
+    MAX_STEPS="${MAX_STEPS:-}"
+    LOGGING_STEPS="${LOGGING_STEPS:-1}"
+    SAVE_STEPS="${SAVE_STEPS:-50}"
+    RETURN_DEBUG_ARTIFACTS=false
+    RESUME=false
 fi
 
+GRAD_ACCUM_STEPS=$(
+  echo $(( 
+    BATCH_SIZE * NUM_GENERATIONS
+    / NUM_PROCESSES 
+    / PER_DEVICE_BATCH_SIZE
+  ))
+)
 
 python -m accelerate.commands.launch \
     --config_file ./diffu-grpo/accelerate.yaml \
@@ -181,7 +191,7 @@ python -m accelerate.commands.launch \
     --sync_ref_model $SYNC_REF_MODEL \
     --ref_model_sync_steps $REF_MODEL_SYNC_STEPS \
     --num_generations $NUM_GENERATIONS \
-    --per_device_train_batch_size $PER_DEVICE_TRAIN_BS \
+    --per_device_train_batch_size $PER_DEVICE_BATCH_SIZE \
     --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
-    --save_steps 50 \
-    --log_completions
+    --report_to wandb \
+    --save_steps $SAVE_STEPS

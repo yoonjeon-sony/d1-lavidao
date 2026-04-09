@@ -155,7 +155,7 @@ def get_logits(model,input_emnbeddings,modality_indices=None,t2i_inference=False
         gen_hidden_states = hidden_states[modality_indices]
         gen_hidden_states = maybe_truncate_last_dim(gen_hidden_states,model.config.d_model_gen)
         gen_logits = model.call_gen_predictor(gen_hidden_states,gen_shape,timesteps=timesteps) # * 8 D
-        seq_len_per_img = np.product(gen_shape)
+        seq_len_per_img = np.prod(gen_shape)
         if len(gen_logits.shape) == 2:
             gen_logits = gen_logits.view(-1,seq_len_per_img,gen_logits.shape[-1])
         else:
@@ -255,19 +255,18 @@ def generate(model, prompt=None, steps=None, max_new_tokens=128, block_length=12
         assert inputs_embeds is not None
         bsz, seq_len = inputs_embeds.shape[:2]
         prompt = torch.full((bsz, seq_len), 0, dtype=torch.long).to(model.device)
+    else:
+        bsz = prompt.shape[0]
     past_key_values = None
     if prefix_lm:
-        print("HH2")
         if input_modality_indices is None and t2i_inference:
             input_modality_indices = torch.zeros(inputs_embeds.shape[:-1], dtype=torch.bool, device=inputs_embeds.device)
         past_key_values = model(None,input_embeddings=inputs_embeds,use_cache=True,modality_indices=input_modality_indices).attn_key_values
-        # breakpoint()
-        # print(past_key_values is None)
         x = torch.full((bsz, gen_length), mask_id, dtype=torch.long).to(model.device)
         prompt = torch.full((bsz, 0), 0, dtype=torch.long).to(model.device)
         # x[:, :prompt.shape[1]] = prompt.clone()
     else:
-        x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
+        x = torch.full((bsz, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
         x[:, :prompt.shape[1]] = prompt.clone()
 
     if prompt_index is None:
@@ -502,6 +501,7 @@ def generate_with_dual_cache(model, prompt=None,steps=128,max_new_tokens=128, bl
         assert inputs_embeds is not None
         bsz, seq_len = inputs_embeds.shape[:2]
         prompt = torch.full((bsz, seq_len), 0, dtype=torch.long).to(model.device)
+
     x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
 

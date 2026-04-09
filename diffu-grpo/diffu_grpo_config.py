@@ -639,6 +639,13 @@ class DiffuGRPOConfig(TrainingArguments):
     mm_spatial_pool_mode: str = field(default="conv")
     mm_spatial_pool_stride: Optional[int] = field(default=2)
     mm_spatial_pool_out_channels: Optional[int] = field(default=1152)
+    image_folder: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional base folder for relative image paths used by LazySupervisedDataset."},
+    )
+    image_processor: Optional[object] = field(default=None, init=False, repr=False)
+    image_processor_gen: Optional[object] = field(default=None, init=False, repr=False)
+    
     image_aspect_ratio: str = field(default="anyres")
     image_grid_pinpoints: Optional[str] = field(
         default="[(384, 768), (768, 384), (768, 768), (1152, 384), (384, 1152)]"

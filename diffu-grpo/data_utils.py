@@ -293,6 +293,91 @@ def get_image_answer_placeholder_questions(split: str = "train") -> Dataset:
     return Dataset.from_list(rows)
 
 
+def get_thinkmorph_interleave_questions(split: str = "train") -> Dataset:
+    """Returns a dataset interleaving image-edit and text-answer rows from the same ThinkMorph JSONL files.
+
+    Each JSONL sample contributes two rows:
+      - An image_edit row (task_type="image_edit") for perceptual-reward training.
+      - A text row        (task_type="text")       for correctness-reward training.
+
+    Both rows carry the full column schema so HuggingFace Dataset is uniform:
+      image_gt   – populated for edit rows, None for text rows.
+      answer_gt  – populated for text rows, None for edit rows.
+    """
+    if split != "train":
+        raise ValueError(f"Unsupported split '{split}' for ThinkMorph interleave data. Use 'train'.")
+
+    data_root = THINKMORPH_DEFAULT_DATA_ROOT
+    image_root = THINKMORPH_DEFAULT_IMAGE_ROOT
+    train_data_paths = [os.path.join(data_root, name) for name in THINKMORPH_LOCAL_JSONL_FILES]
+
+    missing_paths = [path for path in train_data_paths if not os.path.isfile(path)]
+    if missing_paths:
+        raise FileNotFoundError(f"ThinkMorph jsonl file(s) not found: {', '.join(missing_paths)}")
+
+    rows: list[dict] = []
+    for data_path in train_data_paths:
+        with open(data_path, "r", encoding="utf-8") as f:
+            for idx, line in enumerate(
+                tqdm(f, desc=f"Loading {os.path.basename(data_path)}", unit="line")
+            ):
+                if not line.strip():
+                    continue
+
+                example = json.loads(line)
+                sample_id = str(example.get("pid", f"{os.path.basename(data_path)}:{idx}"))
+
+                question = example.get("question")
+                image_input_rel = example.get("problem_image_0")
+                image_gt_rel = example.get("reasoning_image_0")
+                answer = example.get("answer")
+
+                if not isinstance(question, str) or not question.strip():
+                    raise ValueError(f"ThinkMorph sample '{sample_id}' has invalid question: {question!r}")
+                if not isinstance(image_input_rel, str) or not image_input_rel.strip():
+                    raise ValueError(
+                        f"ThinkMorph sample '{sample_id}' has invalid problem_image_0: {image_input_rel!r}"
+                    )
+                if not isinstance(image_gt_rel, str) or not image_gt_rel.strip():
+                    raise ValueError(
+                        f"ThinkMorph sample '{sample_id}' has invalid reasoning_image_0: {image_gt_rel!r}"
+                    )
+                if not isinstance(answer, str) or not answer.strip():
+                    raise ValueError(f"ThinkMorph sample '{sample_id}' has invalid answer: {answer!r}")
+
+                image_input = os.path.join(image_root, image_input_rel)
+                image_gt = os.path.join(image_root, image_gt_rel)
+                edit_instruction = f"{EDIT_PROMPT} {question.strip()}"
+                cot_instruction = f"{COT_PROMPT} {question.strip()}"
+
+                # Image-edit row
+                rows.append(
+                    {
+                        "task_type": "image_edit",
+                        "prompt": [{"role": "user", "content": f"<image>\n{edit_instruction}"}],
+                        "instruction": edit_instruction,
+                        "image": image_input,
+                        "image_gen_enc": image_input,
+                        "image_gt": image_gt,
+                        "answer_gt": None,
+                    }
+                )
+                # Text-answer row
+                rows.append(
+                    {
+                        "task_type": "text",
+                        "prompt": [{"role": "user", "content": f"<image>\n{cot_instruction}"}],
+                        "instruction": cot_instruction,
+                        "image": image_input,
+                        "image_gen_enc": None,
+                        "image_gt": None,
+                        "answer_gt": answer.strip(),
+                    }
+                )
+
+    return Dataset.from_list(rows)
+
+
 def get_mixed_placeholder_questions(split: str = "train") -> Dataset:
     """Placeholder mixed schema for future text+image integration tests."""
     rows = [

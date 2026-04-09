@@ -1,17 +1,19 @@
 import copy
+import inspect
 import os
 import random
 import sys
+import time
 import warnings
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
-
+from types import SimpleNamespace
 from tqdm import tqdm, trange
 import numpy as np
 import torch
 import torch.nn.functional as F
 import transformers
-import wandb
 from accelerate.utils import gather, gather_object
 from datasets import Dataset, IterableDataset
 from torch import nn
@@ -22,21 +24,25 @@ from trl.extras.profiling import profiling_context, profiling_decorator
 # from trl.import_utils import is_rich_available
 from trl.models import unwrap_model_for_generation
 from trl.trainer.grpo_config import GRPOConfig
-from trl.trainer.grpo_trainer import GRPOTrainer
+from trl.trainer.grpo_trainer import GRPOTrainer, nanstd, nanmin, nanmax
 from trl.trainer.utils import print_prompt_completions_sample, selective_log_softmax
 from trl.trainer.utils import (
     generate_model_card,
     get_comet_experiment_url,
     pad,
     print_prompt_completions_sample,
-    ,
 )
 if is_peft_available():
     from peft import PeftConfig
+from reward_func import perceptual_score_reward_func, strict_format_reward_func, correctness_reward_func
 
 # Required by LaVida-O sampling path.
 os.environ.setdefault("DEBUG_FIX_PADDING", "1")
 os.environ.setdefault("NOT_ALWASY_DO_2DPOOL", "1")
+# Disable complementary masking (do_inv) during GRPO forward passes.
+# do_inv doubles the batch size (B → 2B) which causes shape mismatches between
+# per_token_logps (2B, L) and the stored old_per_token_logps (B, L).
+os.environ.setdefault("SKIP_COMPLEMENTARY_MASKING", "1")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LAVIDA_ROOT = REPO_ROOT / "LaVida-O"
@@ -171,6 +177,19 @@ def _register_lavida_architectures() -> None:
         setattr(transformers, "LlavaLladaConfig", LlavaLladaConfig)
 
 
+@contextmanager
+def _timer(timings: dict, key: str):
+    """Accumulate wall-clock seconds into *timings[key]* and print a status line."""
+    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    print(f"[time_profile] {key} started")
+    t0 = time.perf_counter()
+    yield
+    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    elapsed = time.perf_counter() - t0
+    timings[key] = timings.get(key, 0.0) + elapsed
+    print(f"[time_profile] {key} finished in {elapsed:.2f}s")
+
+
 class MaskDataCollator:
     def __init__(self, tokenizer, args):
         self.tokenizer = tokenizer
@@ -224,9 +243,91 @@ class MaskDataCollator:
             batch['images_gen_enc']  = None
         batch['image_gen_weight'] = None
 
+        # Per-sample flag: True if the sample has image generation targets (image_edit),
+        # False otherwise (text/multimodal-understanding).  Used in _get_per_token_logps
+        # to route each sample to gen_loss_none_reduction vs und_loss_none_reduction.
+        batch['sample_is_image_edit'] = torch.tensor(
+            [instance.get('image_gen') is not None for instance in instances],
+            dtype=torch.bool,
+        )
+
         batch['do_not_mask_text'] = [x['do_not_mask_text'] for x in instances]
 
         return batch
+
+class PairedRepeatSampler(torch.utils.data.Sampler):
+    """RepeatSampler variant that keeps consecutive index pairs together.
+
+    The thinkmorph_interleave dataset emits rows in strict pairs:
+      index 2k   → image_edit
+      index 2k+1 → text
+    Shuffling must happen at the *pair* level so that every sampler chunk
+    always contains both task types.  This guarantees that after the
+    DistributedSampler strides across the yielded indices, every rank
+    receives at least one image-edit and one text sample — preventing
+    DeepSpeed gradient-reduction deadlocks from unused parameters.
+
+    The yielded index order is identical to ``RepeatSampler`` except that
+    the two indices in each chunk are always a paired (2k, 2k+1) rather
+    than two arbitrary indices drawn from the shuffled pool.
+    """
+
+    def __init__(
+        self,
+        data_source,
+        mini_repeat_count: int,
+        batch_size: int = 2,
+        repeat_count: int = 1,
+        shuffle: bool = True,
+        seed: Optional[int] = None,
+    ):
+        self.num_samples = len(data_source)
+        if self.num_samples % 2 != 0:
+            raise ValueError(
+                f"PairedRepeatSampler requires an even dataset size, got {self.num_samples}"
+            )
+        if batch_size % 2 != 0:
+            raise ValueError(
+                f"PairedRepeatSampler requires an even batch_size, got {batch_size}"
+            )
+        self.num_pairs = self.num_samples // 2
+        self.pairs_per_chunk = batch_size // 2  # unique pairs per chunk
+        self.mini_repeat_count = mini_repeat_count
+        self.batch_size = batch_size
+        self.repeat_count = repeat_count
+        self.shuffle = shuffle
+        if shuffle:
+            self.generator = torch.Generator()
+            if seed is not None:
+                self.generator.manual_seed(seed)
+
+    def __iter__(self):
+        if self.shuffle:
+            pair_order = torch.randperm(self.num_pairs, generator=self.generator).tolist()
+        else:
+            pair_order = list(range(self.num_pairs))
+
+        # Build chunks of `pairs_per_chunk` pairs each, drop incomplete tail
+        chunks = [
+            pair_order[i : i + self.pairs_per_chunk]
+            for i in range(0, len(pair_order), self.pairs_per_chunk)
+        ]
+        chunks = [c for c in chunks if len(c) == self.pairs_per_chunk]
+
+        for chunk in chunks:
+            for _ in range(self.repeat_count):
+                for pair_idx in chunk:
+                    idx_a = 2 * pair_idx      # image_edit
+                    idx_b = 2 * pair_idx + 1   # text
+                    for _ in range(self.mini_repeat_count):
+                        yield idx_a
+                    for _ in range(self.mini_repeat_count):
+                        yield idx_b
+
+    def __len__(self) -> int:
+        usable_pairs = (self.num_pairs // self.pairs_per_chunk) * self.pairs_per_chunk
+        return usable_pairs * 2 * self.mini_repeat_count * self.repeat_count
+
 
 class DiffuGRPOTrainer(GRPOTrainer):
     """GRPO trainer adapted for LaVida-O text + image rollouts with unified token-level scoring."""
@@ -269,23 +370,33 @@ class DiffuGRPOTrainer(GRPOTrainer):
         if getattr(self, "_buffered_inputs", None) is None:
             self._buffered_inputs = [None] * grad_accum_steps
 
+    def _get_train_sampler(self, dataset=None):
+        """Use PairedRepeatSampler for interleave datasets to guarantee type balance per rank."""
+        if dataset is None:
+            dataset = self.train_dataset
+        is_paired = (
+            hasattr(dataset, "__len__")
+            and len(dataset) >= 2
+            and len(dataset) % 2 == 0
+            and hasattr(dataset, "__getitem__")
+            and dataset[0].get("task_type") != dataset[1].get("task_type")
+        )
+        if is_paired:
+            return PairedRepeatSampler(
+                data_source=dataset,
+                mini_repeat_count=self.num_generations,
+                batch_size=self.args.generation_batch_size // self.num_generations,
+                repeat_count=self.num_iterations * self.args.steps_per_generation,
+                shuffle=self.shuffle_dataset,
+                seed=self.args.seed,
+            )
+        return super()._get_train_sampler(dataset)
+
     @staticmethod
     def _make_generator(device: torch.device, seed: int) -> torch.Generator:
         gen = torch.Generator(device=device)
         gen.manual_seed(int(seed))
         return gen
-
-    @staticmethod
-    def _detach_structure(value: Any) -> Any:
-        if torch.is_tensor(value):
-            return value.detach()
-        if isinstance(value, dict):
-            return {k: DiffuGRPOTrainer._detach_structure(v) for k, v in value.items()}
-        if isinstance(value, list):
-            return [DiffuGRPOTrainer._detach_structure(v) for v in value]
-        if isinstance(value, tuple):
-            return tuple(DiffuGRPOTrainer._detach_structure(v) for v in value)
-        return value
 
     def _get_image_edit_gen_dict(self) -> dict[str, Any]:
         latent_token_map = {256: 256, 512: 1024, 1024: 4096}
@@ -345,6 +456,35 @@ class DiffuGRPOTrainer(GRPOTrainer):
         conv.append_message(conv.roles[1], None)
         return conv.get_prompt()
 
+    def _build_lazy_supervised_data_args(self, model, image_processor):
+        base_model = model.get_model() if hasattr(model, "get_model") else model
+        data_args = vars(self.args).copy()
+        data_args.update(
+            {
+                "is_multimodal": True,
+                "early_mix_text": data_args.get("early_mix_text", False),
+                "image_folder": data_args.get("image_folder"),
+                "image_processor": image_processor,
+                "image_processor_gen": data_args.get(
+                    "image_processor_gen", getattr(base_model, "image_processor_gen", None)
+                ),
+                "image_aspect_ratio": data_args.get("image_aspect_ratio", "square"),
+                "image_grid_pinpoints": data_args.get("image_grid_pinpoints"),
+                "image_crop_resolution": data_args.get("image_crop_resolution"),
+                "image_split_resolution": data_args.get("image_split_resolution"),
+                "video_folder": data_args.get("video_folder"),
+                "video_fps": data_args.get("video_fps", 1),
+                "frames_upbound": data_args.get("frames_upbound", 0),
+                "add_time_instruction": data_args.get("add_time_instruction", False),
+                "force_sample": data_args.get("force_sample", False),
+                "image_gen_size": data_args.get("image_gen_size", 1024),
+                "num_gen_image_tokens": data_args.get("num_gen_image_tokens", 1024),
+                "num_gen_image_tokens_enc_ds": data_args.get("num_gen_image_tokens_enc_ds", 1),
+                "mm_edit_area_weight": data_args.get("mm_edit_area_weight", 5.0),
+            }
+        )
+        return SimpleNamespace(**data_args)
+
     def _normalize_text_rollout(
         self,
         generated: torch.Tensor,
@@ -364,24 +504,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 normalized_prompt_ids = prompt_ids
         return normalized_prompt_ids, completion_ids
 
-    def _build_text_completion_mask(self, completion_ids: torch.Tensor) -> torch.Tensor:
-        if completion_ids.numel() == 0:
-            return torch.zeros_like(completion_ids, dtype=torch.int)
-        eos_id = self.processing_class.eos_token_id
-        if eos_id is None:
-            return torch.ones_like(completion_ids, dtype=torch.int)
-        is_eos = completion_ids == eos_id
-        eos_idx = torch.full(
-            (is_eos.size(0),),
-            is_eos.size(1),
-            dtype=torch.long,
-            device=completion_ids.device,
-        )
-        has_eos = is_eos.any(dim=1)
-        eos_idx[has_eos] = is_eos.int().argmax(dim=1)[has_eos]
-        seq_idx = torch.arange(is_eos.size(1), device=completion_ids.device).unsqueeze(0)
-        return (seq_idx <= eos_idx.unsqueeze(1)).int()
-
     def _load_image(self, image_like):
         if image_like is None:
             return None
@@ -396,60 +518,82 @@ class DiffuGRPOTrainer(GRPOTrainer):
     def _rollout_multimodal_text_gen(
         self,
         model,
-        example: dict[str, Any],
+        examples: Union[dict[str, Any], list[dict[str, Any]]],
         image_processor,
         generation_kwargs: dict[str, Any],
         device: torch.device,
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        prompt_text = self._build_llada_prompt(example["prompt"])
-        if example.get("image") is not None and "<image>" not in prompt_text:
-            raise ValueError(
-                "Text rollout example includes an image but the prompt does not contain '<image>': "
-                f"sample_index={idx}"
-            )
-        prompt_ids = tokenizer_image_token(
-            prompt_text,
-            self.processing_class,
-            IMAGE_TOKEN_INDEX,
-            return_tensors="pt",
-        ).to(device)
-        if self.max_prompt_length is not None:
-            prompt_ids = prompt_ids[-self.max_prompt_length :]
-        prompt_ids = prompt_ids.unsqueeze(0)
-        prompt_mask = torch.ones_like(prompt_ids, dtype=torch.long, device=device)
-        image = self._load_image(example.get("image"))
-        if image is None:
-            return None, None
-        if image_processor is None:
-            return None, None
+    ) -> tuple[torch.Tensor, list[dict[str, Any]]]:
+        if isinstance(examples, dict):
+            examples = [examples]
 
+        prompt_texts = []
+        all_input_ids = []
+        all_images = []
+        image_sizes = []
+        source_images_per_example = []
         resolution = int(self.args.image_edit_resolution)
-        processed_image = pad_to_square_and_resize(image.convert("RGB"), resolution)
-        image_tensor = process_images([processed_image], image_processor, model.config)
+        if image_processor is None:
+            raise ValueError("Text rollout requires an image processor for multimodal prompts.")
+
+        for example in examples:
+            prompt_text = self._build_llada_prompt(example["prompt"])
+            if "<image>" not in prompt_text:
+                sample_id = example.get("id", example.get("pid", "unknown"))
+                raise ValueError(
+                    "Text rollout example includes an image but the prompt does not contain '<image>': "
+                    f"sample_id={sample_id}"
+                )
+            prompt_ids = tokenizer_image_token(
+                prompt_text,
+                self.processing_class,
+                IMAGE_TOKEN_INDEX,
+                return_tensors="pt",
+            ).to(device)
+            if self.max_prompt_length is not None:
+                prompt_ids = prompt_ids[-self.max_prompt_length :]
+            all_input_ids.append(prompt_ids.unsqueeze(0))
+            prompt_texts.append(prompt_text)
+
+            image = self._load_image(example.get("image"))
+            if image is None:
+                sample_id = example.get("id", example.get("pid", "unknown"))
+                raise ValueError(f"Text rollout example is missing an image: sample_id={sample_id}")
+            processed_image = pad_to_square_and_resize(image.convert("RGB"), resolution)
+            all_images.append(processed_image)
+            image_sizes.append(processed_image.size)
+
+            source_images = example.get("image")
+            if source_images is None:
+                source_images = []
+            elif not isinstance(source_images, list):
+                source_images = [source_images]
+            source_images_per_example.append(source_images)
+
+        prompt_ids = self._left_pad_2d(
+            all_input_ids,
+            self.processing_class.pad_token_id,
+            torch.long,
+        ).to(device)
+        prompt_mask = (prompt_ids != self.processing_class.pad_token_id).long()
+        position_ids = None
+        image_tensor = process_images(all_images, image_processor, model.config)
         image_tensor = self._normalize_mm_image_payload(
             image_tensor,
             dtype=model.dtype,
             device=device,
         )
-        self._check_mm_payload_before_prepare_inputs(image_tensor)
-        image_sizes = [processed_image.size]
-
-        position_ids = None
-        attention_mask = prompt_mask
-        if image_tensor is not None:
-            inputs, position_ids, attention_mask, _, inputs_embeds, _ = model.prepare_inputs_labels_for_multimodal(
-                input_ids=prompt_ids,
-                position_ids=position_ids,
-                attention_mask=prompt_mask,
-                past_key_values=None,
-                labels=None,
-                images=image_tensor,
-                modalities=["image"] * prompt_ids.shape[0],
-                image_sizes=image_sizes,
-            )
-            del inputs
-        else:
-            inputs_embeds = model.get_model().embed_tokens(prompt_ids)
+        
+        inputs, position_ids, attention_mask, _, inputs_embeds, _ = model.prepare_inputs_labels_for_multimodal(
+            input_ids=prompt_ids,
+            position_ids=position_ids,
+            attention_mask=prompt_mask,
+            past_key_values=None,
+            labels=None,
+            images=image_tensor,
+            modalities=["image"] * prompt_ids.shape[0],
+            image_sizes=image_sizes,
+        )
+        del inputs
 
         generated = llada_generate(
             model.get_model(),
@@ -463,40 +607,29 @@ class DiffuGRPOTrainer(GRPOTrainer):
             generated = generated[0]
 
         prefix_lm = bool(generation_kwargs.get("prefix_lm", False))
-        norm_prompt_ids, completion_ids = self._normalize_text_rollout(generated, prompt_ids, prefix_lm)
-        decoded_text = self.processing_class.decode(
-            completion_ids.squeeze(0), skip_special_tokens=True
-        )
-        source_images = example.get("image")
-        if source_images is None:
-            source_images = []
-        elif not isinstance(source_images, list):
-            source_images = [source_images]
+        _, completion_ids = self._normalize_text_rollout(generated, prompt_ids, prefix_lm)
+        decoded_texts = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
 
-        return completion_ids.detach(), {
-            "id": str(example.get("pid", example.get("id", ""))),
-            "image": source_images,
-            "conversations": [
-                {"from": "human", "value": example["prompt"]["content"]},
-                {"from": "gpt", "value": decoded_text},
-            ],
-        }
-        
+        image_contexts = []
+        for batch_idx, example in enumerate(examples):
+            prompt_data = example.get("prompt", "")
+            human_value = prompt_data[0]["content"] if isinstance(prompt_data, list) and len(prompt_data) > 0 else prompt_data
+            image_contexts.append(
+                {
+                    "decoded_text": decoded_texts[batch_idx],
+                    "prompt": prompt_texts[batch_idx],
+                    "payload": {
+                        "id": str(example.get("pid", example.get("id", ""))),
+                        "image": source_images_per_example[batch_idx],
+                        "conversations": [
+                            {"from": "human", "value": human_value},
+                            {"from": "gpt", "value": decoded_texts[batch_idx]},
+                        ],
+                    },
+                }
+            )
 
-    @staticmethod
-    def _debug_mm_image_shapes_enabled() -> bool:
-        flag = os.environ.get("DEBUG_MM_IMAGE_SHAPES", "")
-        return flag.lower() not in {"", "0", "false", "no"}
-
-    @staticmethod
-    def _describe_mm_image_payload(images: Any) -> str:
-        if isinstance(images, list):
-            shapes = [tuple(img.shape) if torch.is_tensor(img) else type(img).__name__ for img in images]
-            ranks = [img.ndim if torch.is_tensor(img) else None for img in images]
-            return f"type=list len={len(images)} ranks={ranks} shapes={shapes}"
-        if torch.is_tensor(images):
-            return f"type=tensor rank={images.ndim} shape={tuple(images.shape)}"
-        return f"type={type(images).__name__}"
+        return completion_ids.detach(), image_contexts
 
 
     def _normalize_mm_image_payload(self, image_tensor: Any, *, dtype: torch.dtype, device: torch.device) -> list[torch.Tensor]:
@@ -505,22 +638,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
         image_tensor = image_tensor.to(dtype=dtype, device=device)
         return [img for img in image_tensor]
 
-    def _check_mm_payload_before_prepare_inputs(self, images: list[torch.Tensor]) -> None:
-        normalized_images = [image.unsqueeze(0) if image.ndim == 3 else image for image in images]
-        predicted_shapes = [tuple(image.shape) for image in normalized_images]
-        concat_images = torch.cat(normalized_images, dim=0)
-        # self._log_mm_image_shapes(
-        #     "rollout_image_edit_latents.predicted_prepare_inputs",
-        #     normalized_shapes=predicted_shapes,
-        #     concat_shape=tuple(concat_images.shape),
-        # )
-        if concat_images.ndim != 4:
-            raise ValueError(
-                "Image payload would become non-4D before encode_images: "
-                f"input={self._describe_mm_image_payload(images)}, "
-                f"normalized_shapes={predicted_shapes}, "
-                f"concat_shape={tuple(concat_images.shape)}"
-            )
+
 
     def _get_image_processor(self, model):
         if hasattr(model, "get_vision_tower"):
@@ -637,6 +755,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
         image_sizes = []
         all_enc_embeddings = []
         vq_latents = []
+        prompts = []
         for batch_idx, example in enumerate(examples):
             edit_image = self._load_image(example.get("image"))
             
@@ -664,6 +783,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
             prompt_question = prompt_question.removesuffix(
                 "<|start_header_id|>assistant<|end_header_id|>\n\n"
             )
+            prompts.append(prompt_question)
             input_ids = tokenizer_image_token(
                 prompt_question,
                 self.processing_class,
@@ -676,7 +796,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
         attention_mask = (all_input_ids != self.processing_class.pad_token_id).long()
         image_tensor = process_images(all_edit_images, image_processor, model.config)
         image_tensor = self._normalize_mm_image_payload(image_tensor, dtype=model.dtype, device=device)
-        self._check_mm_payload_before_prepare_inputs(image_tensor)
 
         inputs = model.prepare_inputs_labels_for_multimodal(
             input_ids=all_input_ids,
@@ -914,6 +1033,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
         rollout_dir.mkdir(parents=True, exist_ok=True)
         image_contexts = []
         for batch_idx, (example, decoded_image) in enumerate(zip(examples, decoded_images)):
+            prompt = prompts[batch_idx]
             sample_id = str(example.get("id", example.get("pid", batch_idx)))
             safe_sample_id = sample_id.replace("/", "_").replace(os.sep, "_").replace(" ", "_")
             decoded_image_obj = decoded_image
@@ -957,6 +1077,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     "valid": True,
                     "latent_shape": tuple(xt[batch_idx].shape),
                     "decoded_image": decoded_image_obj,
+                    "prompt": prompt,
                     "payload": {
                         "id": sample_id,
                         "image_gen": str(decoded_image_path),
@@ -1004,30 +1125,51 @@ class DiffuGRPOTrainer(GRPOTrainer):
                         candidates.append(nested)
         raise TypeError(f"Could not resolve an LLaDA model from {type(model)!r}")
 
-    @staticmethod
-    def _repeat_batch_value(value: Any, repeat_count: int) -> Any:
-        if repeat_count == 1 or value is None:
-            return value
-        if torch.is_tensor(value):
-            if value.ndim == 0:
-                return value
-            return torch.cat([value] * repeat_count, dim=0)
-        if isinstance(value, list):
-            repeated = []
-            for _ in range(repeat_count):
-                repeated.extend(copy.deepcopy(value))
-            return repeated
-        if isinstance(value, tuple):
-            repeated = []
-            for _ in range(repeat_count):
-                repeated.extend(copy.deepcopy(list(value)))
-            return tuple(repeated)
-        return value
 
-    def _repeat_batch_inputs(self, inputs: dict[str, Any], repeat_count: int) -> dict[str, Any]:
+    def _build_scored_batch_collator(
+        self,
+        base_collate_fn: Callable[[Sequence[Dict]], Dict[str, torch.Tensor]],
+        advantages: torch.Tensor,
+        completion_masks: torch.Tensor,
+        old_per_token_logps: torch.Tensor,
+        ref_per_token_logps: Optional[torch.Tensor],
+        num_iterations: int,
+    ) -> Callable[[Sequence[Dict[str, Any]]], Dict[str, Any]]:
+        detached_advantages = advantages.detach()
+        detached_completion_masks = completion_masks.detach()
+        detached_old_per_token_logps = old_per_token_logps.detach()
+        detached_ref_per_token_logps = None if ref_per_token_logps is None else ref_per_token_logps.detach()
+
+        def collate_scored_instances(instances: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+            sample_indices = [instance["_sample_idx"] for instance in instances]
+            base_instances = [
+                {key: value for key, value in instance.items() if key != "_sample_idx"}
+                for instance in instances
+            ]
+            batch = self._prepare_input(base_collate_fn(base_instances))
+            batch["scoring_instances"] = base_instances
+            batch["advantages"] = detached_advantages[sample_indices]
+            batch["completion_mask"] = detached_completion_masks[:, sample_indices, :]
+            if num_iterations > 1:
+                batch["old_per_token_logps"] = detached_old_per_token_logps[:, sample_indices, :]
+            if detached_ref_per_token_logps is not None:
+                batch["ref_per_token_logps"] = detached_ref_per_token_logps[:, sample_indices, :]
+            return batch
+
+        return collate_scored_instances
+
+    @staticmethod
+    def _select_model_forward_kwargs(model: PreTrainedModel, inputs: dict[str, Any]) -> dict[str, Any]:
+        forward_signature = inspect.signature(model.forward)
+        if any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in forward_signature.parameters.values()
+        ):
+            return dict(inputs)
         return {
-            key: self._repeat_batch_value(value, repeat_count)
+            key: value
             for key, value in inputs.items()
+            if key in forward_signature.parameters
         }
 
     @staticmethod
@@ -1035,6 +1177,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
         if not logps_per_batch:
             return torch.empty(0)
         max_keep = max(logps.shape[-1] for logps in logps_per_batch)
+        concat_dim = logps_per_batch[0].ndim - 2
         padded = []
         for logps in logps_per_batch:
             if logps.shape[-1] == max_keep:
@@ -1043,33 +1186,22 @@ class DiffuGRPOTrainer(GRPOTrainer):
             pad_shape = (*logps.shape[:-1], max_keep - logps.shape[-1])
             pad = torch.zeros(pad_shape, dtype=logps.dtype, device=logps.device)
             padded.append(torch.cat([logps, pad], dim=-1))
-        return torch.cat(padded, dim=1)
+        return torch.cat(padded, dim=concat_dim)
 
-    def _build_masked_indices_gen(
-        self,
-        batch_size: int,
-        seq_len: int,
-        device: torch.device,
-        mask_seeds: list[int],
-        *,
-        is_unitok: bool,
-        is_unitok_submask: bool,
-    ) -> torch.Tensor:
-        masked_indices_gen = []
-        for mask_seed in mask_seeds:
-            generator = torch.Generator(device=device)
-            generator.manual_seed(int(mask_seed))
-            if is_unitok_submask:
-                random_matrix = torch.rand((batch_size, seq_len * 8), device=device, generator=generator)
-                is_mask_gen = random_matrix < float(self.args.p_mask_image)
-                is_mask_gen = is_mask_gen.view(batch_size, 8, seq_len)
-            else:
-                random_matrix = torch.rand((batch_size, seq_len), device=device, generator=generator)
-                is_mask_gen = random_matrix < float(self.args.p_mask_image)
-                if is_unitok:
-                    is_mask_gen = is_mask_gen.unsqueeze(1).repeat(1, 8, 1)
-            masked_indices_gen.append(is_mask_gen)
-        return torch.cat(masked_indices_gen, dim=0)
+    @staticmethod
+    def _pad_and_stack_logps(logps_per_iteration: list[torch.Tensor]) -> torch.Tensor:
+        if not logps_per_iteration:
+            return torch.empty(0)
+        max_keep = max(logps.shape[-1] for logps in logps_per_iteration)
+        padded = []
+        for logps in logps_per_iteration:
+            if logps.shape[-1] == max_keep:
+                padded.append(logps)
+                continue
+            pad_shape = (*logps.shape[:-1], max_keep - logps.shape[-1])
+            pad = torch.zeros(pad_shape, dtype=logps.dtype, device=logps.device)
+            padded.append(torch.cat([logps, pad], dim=-1))
+        return torch.stack(padded, dim=0)
 
     def _get_per_token_logps(
         self,
@@ -1077,6 +1209,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
         data_loader: Union[DataLoader, dict[str, Any]],
         mask_seeds: list[int],
     ) -> torch.Tensor:
+        single_batch_call = isinstance(data_loader, dict) and "scoring_data_loader" in data_loader
         if isinstance(data_loader, dict):
             if "scoring_data_loader" in data_loader:
                 data_loader = data_loader["scoring_data_loader"]
@@ -1084,87 +1217,106 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 data_loader = [data_loader]
 
         llada_model = self._resolve_llada_forward_model(model)
-        llada_config = getattr(llada_model.get_model(), "config", llada_model.config)
-        is_unitok = "unitok" in getattr(llada_config, "mm_vqvae", "")
-        is_unitok_submask = bool(getattr(llada_config, "mm_submask", False))
-        num_image_tokens = int(getattr(self.args, "num_gen_image_tokens", 0))
-        repeat_count = len(mask_seeds)
-        all_logps: list[torch.Tensor] = []
-
-        for inputs in data_loader:
-            input_ids = inputs["input_ids"]
-            labels = inputs["labels"]
-            attention_mask = inputs["attention_mask"].bool()
-            prompt_index = attention_mask & labels.eq(IGNORE_INDEX)
-            logits_to_keep = int(labels.ne(IGNORE_INDEX).sum(dim=1).max().item())
-
-            masked_indices = []
-            for mask_seed in mask_seeds:
-                generator = torch.Generator(device=input_ids.device)
-                generator.manual_seed(int(mask_seed))
-                random_matrix = torch.rand(input_ids.shape, device=input_ids.device, generator=generator)
-                is_mask = (~prompt_index) & attention_mask & (random_matrix < float(self.args.p_mask_prompt))
-                masked_indices.append(is_mask)
-            masked_indices = torch.cat(masked_indices, dim=0)
-
-            masked_indices_gen = None
-            gen_latents = inputs.get("gen_latents")
-            if inputs.get("images_gen") is not None and num_image_tokens > 0:
-                masked_indices_gen = self._build_masked_indices_gen(
-                    batch_size=gen_latents.shape[0],
-                    seq_len=num_image_tokens,
-                    device=input_ids.device,
-                    mask_seeds=mask_seeds,
-                    is_unitok=is_unitok,
-                    is_unitok_submask=is_unitok_submask,
-                )
-
-            repeated_inputs = self._repeat_batch_inputs(inputs, repeat_count)
-            output = model.forward(
-                **repeated_inputs,
-                masked_indices=masked_indices,
-                masked_indices_gen=masked_indices_gen,
+        collate_fn = MaskDataCollator(self.processing_class, self.args)
+        if isinstance(data_loader, DataLoader):
+            scoring_loader = data_loader
+        elif data_loader and torch.is_tensor(data_loader[0].get("input_ids")) and data_loader[0]["input_ids"].ndim == 1:
+            batch_size = len(data_loader) if single_batch_call else min(4, len(data_loader))
+            scoring_loader = DataLoader(
+                data_loader,
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=collate_fn,
             )
+        else:
+            scoring_loader = data_loader
 
-            batch_logps = None
-            answer_logits = output.get("und_logits")
-            if answer_logits is not None and logits_to_keep > 0:
-                answer_logits = answer_logits[:, -logits_to_keep:, :].div(self.temperature)
-                completion_ids = repeated_inputs["input_ids"][:, -logits_to_keep:]
-                batch_logps = selective_log_softmax(answer_logits, completion_ids).view(
-                    repeat_count, input_ids.shape[0], logits_to_keep
+        all_logps: list[torch.Tensor] = []
+        all_masks: list[torch.Tensor] = []
+
+        p_mask_prompt = float(getattr(self.args, "p_mask_prompt", 0.15))
+        for seed in mask_seeds:
+            seed_logps: list[torch.Tensor] = []
+            seed_masks: list[torch.Tensor] = []
+            for inputs in scoring_loader:
+                inputs = self._prepare_input(inputs)
+                labels = inputs["labels"]
+
+                forward_inputs = self._select_model_forward_kwargs(llada_model, inputs)
+                output = model.forward(
+                    **forward_inputs,
+                    mask_seeds=[int(seed)],
+                    p_mask_prompt=p_mask_prompt,
+                    temperature=self.temperature,
                 )
 
-            image_gen_logits = output.get("gen_logits")
-            image_mask = output.get("gen_x_mask")
-            image_targets = output.get("gen_x0_gt")
-            if image_gen_logits is not None and image_mask is not None and image_targets is not None:
-                image_mask = image_mask.reshape(image_mask.shape[0], -1)
-                image_targets = image_targets.reshape(image_targets.shape[0], -1)
-                flat_targets = image_targets[image_mask]
-                image_logps_flat = selective_log_softmax(
-                    image_gen_logits.div(self.temperature),
-                    flat_targets,
-                )
-                counts = image_mask.sum(dim=-1).tolist()
-                max_keep = max(counts) if counts else 0
-                padded_logps = image_gen_logits.new_zeros((image_mask.shape[0], max_keep))
-                cursor = 0
-                for row_idx, keep_count in enumerate(counts):
-                    keep_count = int(keep_count)
-                    if keep_count == 0:
-                        continue
-                    padded_logps[row_idx, :keep_count] = image_logps_flat[cursor : cursor + keep_count]
-                    cursor += keep_count
-                image_logps = padded_logps.view(repeat_count, gen_latents.shape[0], max_keep)
+                # Shape reference (SKIP_COMPLEMENTARY_MASKING=1, so no batch doubling):
+                #   gen_loss_none_reduction: (N_edit, latent_total)
+                #     N_edit = number of image-edit samples in this batch, in batch order.
+                #   und_loss_none_reduction: (B, L_text)
+                #     B = full batch size (edit + text samples).
+                #
+                # Edit-sample rows in und_loss_none are NOT all-zero: the
+                # <|reserved_token_126095|>/<|reserved_token_126096|> sentinels keep
+                # their token IDs as labels.  Use sample_is_image_edit for explicit routing.
+                gen_loss_none = output.get("gen_loss_none_reduction")  # (N_edit, latent_total) or None
+                und_loss_none = output.get("und_loss_none_reduction")  # (B, L_text)
+                is_edit: torch.Tensor = inputs.get("sample_is_image_edit")  # (B,) bool
+
+                batch_logps = None
+                batch_mask = None
+                if und_loss_none is None:
+                    pass  # no labels passed; skip
+                elif gen_loss_none is None or is_edit is None or not is_edit.any():
+                    # Text-only batch
+                    batch_logps = -und_loss_none  # (B, L_text)
+                    # The model's forward_process masked random completion positions;
+                    # F.cross_entropy returns >0 only at those positions (ignore_index=-100
+                    # yields exactly 0).  Track them explicitly so the mask survives
+                    # _pad_and_concat_logps zero-padding.
+                    batch_mask = (und_loss_none != 0).float()  # (B, L_text)
+                elif is_edit.all():
+                    # Image-edit-only batch
+                    batch_logps = -gen_loss_none  # (N_edit=B, latent_total)
+                    batch_mask = (gen_loss_none != 0).float()  # (N_edit, latent_total)
+                else:
+                    # Mixed batch: route each sample to its own loss source.
+                    # Zero-pad to a common length so the output is a rectangular tensor.
+                    B = und_loss_none.shape[0]
+                    L_text = und_loss_none.shape[-1]
+                    latent_total = gen_loss_none.shape[-1]
+                    max_len = max(L_text, latent_total)
+                    batch_logps = torch.zeros(
+                        B, max_len, dtype=und_loss_none.dtype, device=und_loss_none.device
+                    )
+                    batch_mask = torch.zeros(
+                        B, max_len, dtype=und_loss_none.dtype, device=und_loss_none.device
+                    )
+                    # Text samples
+                    batch_logps[~is_edit, :L_text] = -und_loss_none[~is_edit]
+                    batch_mask[~is_edit, :L_text] = (und_loss_none[~is_edit] != 0).float()
+                    # Edit samples
+                    batch_logps[is_edit, :latent_total] = -gen_loss_none
+                    batch_mask[is_edit, :latent_total] = (gen_loss_none != 0).float()
+
                 if batch_logps is not None:
-                    raise NotImplementedError("Mixed text and image logprob batches are not supported yet.")
-                batch_logps = image_logps
+                    seed_logps.append(batch_logps)
+                    seed_masks.append(batch_mask)
 
-            if batch_logps is not None:
-                all_logps.append(batch_logps)
+            # _pad_and_concat_logps zero-pads all tensors to the same last dim before
+            # concatenating, so edit batches (latent_total) and text batches (L_text)
+            # can be combined when both types appear across DataLoader iterations.
+            # The mask is padded identically — padded positions stay 0 (non-completion).
+            all_logps.append(self._pad_and_concat_logps(seed_logps))  # (total_samples, max_seq_len)
+            all_masks.append(self._pad_and_concat_logps(seed_masks))
 
-        return self._pad_and_concat_logps(all_logps)
+        num_iterations = len(mask_seeds)
+        # Stack across seeds; pad seeds to the same last dim in case different seeds
+        # happen to produce different max-sequence-length batches.
+        completion_log_probs = self._pad_and_stack_logps(all_logps)  # (num_iterations, total_samples, max_seq_len)
+        completion_masks = self._pad_and_stack_logps(all_masks)
+        batch_size = completion_log_probs.shape[1]
+        return completion_log_probs, completion_masks  # both (num_iterations, batch_size, seq_len)
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -1174,28 +1326,117 @@ class DiffuGRPOTrainer(GRPOTrainer):
         beta = float(getattr(self.args, "beta", 0.0))
         epsilon = float(getattr(self.args, "epsilon", 0.0))
         num_iterations = int(getattr(self.args, "num_iterations", 1))
-        completion_mask = inputs["completion_mask"].float()
-        mask_seeds = inputs["mask_seeds"]
-        this_itr_idx = self._step % num_iterations
-        per_token_logps = self._get_per_token_logps(model, inputs, [mask_seeds[this_itr_idx]])
-        if beta != 0.0:
-            ref_per_token_logps = inputs["ref_per_token_logps"][this_itr_idx]
-            per_token_kl = (
-                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-            )
+        assert num_iterations > 1, "num_iterations must be greater than 1"
 
+        # `inputs` is a self-contained per-mini-batch dict produced by _prepare_inputs.
+        # `scoring_data_loader` holds only model-input keys; training tensors are top-level.
+        mask_seeds = inputs["mask_seeds"]
+        # Use global_step (optimizer-step counter) to select the GRPO iteration index so
+        # that all N gradient-accumulation micro-steps within one optimizer step use the
+        # same iteration's old logprobs / completion masks.
+        this_itr_idx = self.state.global_step % num_iterations
+
+        current_mask_seed = mask_seeds[this_itr_idx]
+        if torch.is_tensor(current_mask_seed):
+            current_mask_seed = int(current_mask_seed.item())
+
+        # Each call is a single micro-batch forward; no inner DataLoader loop.
+        # _get_per_token_logps sees a dict with "scoring_data_loader" and uses it directly.
+        _t0_curr = time.perf_counter()
+        per_token_logps, per_token_mask = self._get_per_token_logps(model, inputs, [current_mask_seed])
+        per_token_logps = per_token_logps.squeeze(0)
+        per_token_mask = per_token_mask.squeeze(0)
+        if per_token_logps.ndim == 1:
+            per_token_logps = per_token_logps.unsqueeze(0)
+            per_token_mask = per_token_mask.unsqueeze(0)
+
+        old_per_token_logps = inputs["old_per_token_logps"][this_itr_idx]
+        ref_per_token_logps = inputs["ref_per_token_logps"][this_itr_idx] if beta != 0.0 else None
         advantages = inputs["advantages"]
-        if num_iterations > 1:
-            old_per_token_logps = inputs["old_per_token_logps"][this_itr_idx]
-        else:
-            old_per_token_logps = per_token_logps.detach()
+        completion_mask = inputs.get("completion_mask", inputs.get("completion_masks"))
+        if completion_mask.ndim == 3:
+            completion_mask = completion_mask[this_itr_idx]
+        if completion_mask.ndim == 1:
+            completion_mask = completion_mask.unsqueeze(0)
+        completion_mask = completion_mask.float()
+
+        # old_per_token_logps / ref / completion_mask were padded to the global max completion
+        # length across all mini-batches.  per_token_logps is computed for this mini-batch only
+        # and may be shorter.  Trailing positions are zero-padding with completion_mask==0, so
+        # truncating is safe.
+        seq_len = per_token_logps.shape[-1]
+        old_per_token_logps = old_per_token_logps[..., :seq_len]
+        if ref_per_token_logps is not None:
+            ref_per_token_logps = ref_per_token_logps[..., :seq_len]
+        completion_mask = completion_mask[..., :seq_len]
+
+        # Intersect the stored completion_mask (from the old forward) with
+        # per_token_mask (from the current forward) so only positions that are
+        # valid in BOTH forwards contribute to the loss.  Then apply this
+        # canonical mask to ALL logps tensors — including old and ref — so that
+        # no tensor carries stale values at positions the other tensors have as 0.
+        # Without this, e.g. ref=-90 at a position where curr=0 gives
+        # log_ratio=90, exp(90)=inf, and inf*mask(=0)=NaN in IEEE 754.
+        per_token_mask = per_token_mask[..., :seq_len]
+        completion_mask = completion_mask * per_token_mask
+        per_token_logps = per_token_logps * completion_mask
+        old_per_token_logps = old_per_token_logps * completion_mask
+        if ref_per_token_logps is not None:
+            ref_per_token_logps = ref_per_token_logps * completion_mask
 
         coef_1 = torch.exp(per_token_logps - old_per_token_logps)
         coef_2 = torch.clamp(coef_1, 1 - epsilon, 1 + epsilon)
         per_token_loss1 = coef_1 * advantages.unsqueeze(1)
         per_token_loss2 = coef_2 * advantages.unsqueeze(1)
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        
         if beta != 0.0:
+            log_ratio = ref_per_token_logps - per_token_logps
+            per_token_kl = torch.exp(log_ratio) - log_ratio - 1
+
+            # --- KL NaN diagnostics (rank-aware) ---
+            _rank = self.accelerator.process_index
+            _has_bad_kl = per_token_kl.isinf().any() or per_token_kl.isnan().any()
+            _has_bad_loss_inputs = (
+                per_token_logps.isnan().any() or per_token_logps.isinf().any()
+                or ref_per_token_logps.isnan().any() or ref_per_token_logps.isinf().any()
+                or old_per_token_logps.isnan().any() or old_per_token_logps.isinf().any()
+            )
+            _log_kl_diag = (self.state.global_step % 50 == 0) or _has_bad_kl or _has_bad_loss_inputs
+            if _log_kl_diag:
+                _cm = completion_mask.bool()
+                print(
+                    f"[KL-diag rank={_rank} step={self.state.global_step}] "
+                    f"shapes: curr={tuple(per_token_logps.shape)} old={tuple(old_per_token_logps.shape)} "
+                    f"ref={tuple(ref_per_token_logps.shape)} mask={tuple(completion_mask.shape)} | "
+                    f"mask_sum={completion_mask.sum().item():.0f} total_elems={completion_mask.numel()} | "
+                    f"kl_inf={per_token_kl.isinf().sum().item()} kl_nan={per_token_kl.isnan().sum().item()} | "
+                    f"curr_inf={per_token_logps.isinf().sum().item()} ref_inf={ref_per_token_logps.isinf().sum().item()} "
+                    f"old_inf={old_per_token_logps.isinf().sum().item()}"
+                )
+            if _has_bad_kl or _has_bad_loss_inputs:
+                _bad_pos = (per_token_kl.isinf() | per_token_kl.isnan()).nonzero(as_tuple=False)
+                _n_show = min(10, _bad_pos.shape[0])
+                for _i in range(_n_show):
+                    _idx = tuple(_bad_pos[_i].tolist())
+                    print(
+                        f"  [BAD KL rank={_rank} pos={_idx}] "
+                        f"kl={per_token_kl[_idx].item():.6g} "
+                        f"log_ratio={log_ratio[_idx].item():.6g} "
+                        f"curr={per_token_logps[_idx].item():.6g} "
+                        f"ref={ref_per_token_logps[_idx].item():.6g} "
+                        f"old={old_per_token_logps[_idx].item():.6g} "
+                        f"mask={completion_mask[_idx].item():.0f} "
+                        f"per_token_mask={per_token_mask[_idx].item():.0f}"
+                    )
+                _outside_mask = ~_cm
+                print(
+                    f"  [LEAK CHECK rank={_rank}] nonzero outside mask: "
+                    f"curr={( per_token_logps[_outside_mask] != 0).sum().item()} "
+                    f"ref={( ref_per_token_logps[_outside_mask] != 0).sum().item()} "
+                    f"old={( old_per_token_logps[_outside_mask] != 0).sum().item()}"
+                )
+            # --- end KL NaN diagnostics ---
             per_token_loss = per_token_loss + beta * per_token_kl
 
         denom = completion_mask.sum().clamp_min(1.0)
@@ -1203,268 +1444,340 @@ class DiffuGRPOTrainer(GRPOTrainer):
         mode = "eval" if self.control.should_evaluate else "train"
 
         if beta != 0.0:
-            mean_kl = (per_token_kl * completion_mask).sum() / denom
-            self._metrics[mode]["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+            mean_kl = ((per_token_kl * completion_mask).sum() / denom).detach()
+            gathered_kl = self.accelerator.gather_for_metrics(mean_kl)
+            # Check which ranks contributed NaN to the gathered KL
+            if gathered_kl.isnan().any():
+                _nan_ranks = gathered_kl.isnan().nonzero(as_tuple=False).flatten().tolist()
+                print(
+                    f"[KL-NaN GATHERED rank={_rank} step={self.state.global_step}] "
+                    f"mean_kl={mean_kl.item():.6g} gathered={gathered_kl.tolist()} "
+                    f"nan_from_ranks={_nan_ranks} loss={loss.item():.6g}"
+                )
+            self._metrics[mode]["kl"].append(gathered_kl.mean().item())
 
-        is_clipped = (per_token_loss1 < per_token_loss2).float()
-        clip_ratio = (is_clipped * completion_mask).sum() / denom
-        self._metrics[mode]["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
+        # Compute the clipped probability ratios
+        epsilon_low = self.epsilon_low if hasattr(self, "epsilon_low") else epsilon
+        epsilon_high = self.epsilon_high if hasattr(self, "epsilon_high") else epsilon
+        is_low_clipped = (coef_1 < 1 - epsilon_low) & (advantages.unsqueeze(1) < 0)
+        is_high_clipped = (coef_1 > 1 + epsilon_high) & (advantages.unsqueeze(1) > 0)
+        is_region_clipped = is_low_clipped | is_high_clipped
+
+        low_clip = ((is_low_clipped.float() * completion_mask).sum() / denom).detach()
+        high_clip = ((is_high_clipped.float() * completion_mask).sum() / denom).detach()
+        clip_ratio = ((is_region_clipped.float() * completion_mask).sum() / denom).detach()
+
+        gathered_low_clip = self.accelerator.gather_for_metrics(low_clip)
+        self._metrics[mode]["clip_ratio/low_mean"].append(gathered_low_clip.nanmean().item())
+        self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
+        gathered_high_clip = self.accelerator.gather_for_metrics(high_clip)
+        self._metrics[mode]["clip_ratio/high_mean"].append(gathered_high_clip.nanmean().item())
+        self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
+        gathered_clip_ratio = self.accelerator.gather_for_metrics(clip_ratio)
+        self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
+
+        # Log curr_logprobs time (covers the forward pass inside compute_loss)
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        _elapsed_curr = time.perf_counter() - _t0_curr
+        self._metrics[mode]["time_profile/curr_logprobs_and_update"].append(_elapsed_curr)
+
         return loss
 
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         mode = "eval" if self.control.should_evaluate else "train"
         num_iterations = int(getattr(self.args, "num_iterations", 1))
         if mode == "train":
-            grad_accum_steps = int(getattr(self.args, "gradient_accumulation_steps", 1) or 1)
-            if getattr(self, "_buffered_inputs", None) is None:
-                self._buffered_inputs = [None] * grad_accum_steps
-            if self.state.global_step % num_iterations == 0:
-                inputs = self._generate_and_score_completions(inputs)
-                self._buffered_inputs[self._step % grad_accum_steps] = inputs
-            else:
-                inputs = self._buffered_inputs[self._step % grad_accum_steps]
+            generate_every = self.args.steps_per_generation * num_iterations
+            if self._step % generate_every == 0 or self._buffered_inputs is None:
+                # Each element is a self-contained per-mini-batch dict.
+                self._buffered_inputs = self._generate_and_score_completions(inputs)
+            slot = self._step % len(self._buffered_inputs)
+            result = self._buffered_inputs[slot]
             self._step += 1
+            return result
         else:
-            inputs = self._generate_and_score_completions(inputs)
-        return inputs
+            batches = self._generate_and_score_completions(inputs)
+            return batches[0] if batches else inputs
 
     def _generate_and_score_completions(
         self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
+        beta = float(getattr(self.args, "beta", 0.0))
+        num_iterations = int(getattr(self.args, "num_iterations", 1))
         prompts = [x["prompt"] for x in inputs]
         sample_modes = [x.get("task_type", "text") for x in inputs]
-
-        # text_completion_ids = [None] * len(inputs)
         image_contexts = [None] * len(inputs)
         answer_contexts = [None] * len(inputs)
+        mode = "eval" if self.control.should_evaluate else "train"
+        _timings: dict[str, float] = {}
 
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
             image_edit_indices = [idx for idx, mode in enumerate(sample_modes) if mode == "image_edit"]
             image_edit_batch_size = max(1, int(getattr(self.args, "image_edit_batch_size", 1)))
-            for start_idx in trange(0, len(image_edit_indices), image_edit_batch_size, desc="Image Rollout"):
-                batch_indices = image_edit_indices[start_idx : start_idx + image_edit_batch_size]
-                batch_examples = [inputs[idx] for idx in batch_indices]
-                _, batch_contexts = self._rollout_image_edit_latents(unwrapped_model, batch_examples)
-                for batch_offset, sample_idx in enumerate(batch_indices):
-                    # completion_tokens_per_sample[sample_idx] = image_completion_ids[batch_offset].detach()
-                    image_contexts[sample_idx] = batch_contexts[batch_offset]
+            with _timer(_timings, "image_rollout"):
+                for start_idx in trange(0, len(image_edit_indices), image_edit_batch_size, desc="Image Rollout"):
+                    batch_indices = image_edit_indices[start_idx : start_idx + image_edit_batch_size]
+                    batch_examples = [inputs[idx] for idx in batch_indices]
+                    _, batch_contexts = self._rollout_image_edit_latents(unwrapped_model, batch_examples)
+                    for batch_offset, sample_idx in enumerate(batch_indices):
+                        image_contexts[sample_idx] = batch_contexts[batch_offset]
             image_processor = self._get_image_processor(unwrapped_model)
-
-            for idx, example in tqdm(enumerate(inputs), desc=f"Text Rollout"):
-                mode = sample_modes[idx]
-                if mode == "image_edit":
-                    continue
-                else:
-                    prefix_lm = bool(getattr(self.args, "prefix_lm", True))
-                    generation_kwargs = {
-                        "max_new_tokens": int(self.args.max_completion_length),
-                        "block_length": int(min(self.args.block_length, self.args.max_completion_length)),
-                        "step_per_block": self.args.text_rollout_step_per_block
-                        if self.args.text_rollout_step_per_block is not None
-                        else int(min(self.args.block_length, self.args.max_completion_length)),
-                        "temperature": float(self.args.temperature),
-                        "do_sample": bool(self.args.text_rollout_do_sample),
-                        "prefix_lm": prefix_lm,
-                        "use_fast_dlm": False,
-                        "remasking": self.args.remasking,
-                        "cfg_scale": self.args.cfg_scale,
-                    }
-                    generation_kwargs = {k: v for k, v in generation_kwargs.items() if v is not None}
-                    _, text_context = self._rollout_multimodal_text_gen(
+            text_indices = [idx for idx, sample_mode in enumerate(sample_modes) if sample_mode != "image_edit"]
+            text_batch_size = 4
+            prefix_lm = bool(getattr(self.args, "prefix_lm", True))
+            generation_kwargs = {
+                "max_new_tokens": int(self.args.max_completion_length),
+                "block_length": int(min(self.args.block_length, self.args.max_completion_length)),
+                "step_per_block": self.args.text_rollout_step_per_block
+                if self.args.text_rollout_step_per_block is not None
+                else int(min(self.args.block_length, self.args.max_completion_length)),
+                "temperature": float(self.args.temperature),
+                "do_sample": bool(self.args.text_rollout_do_sample),
+                "prefix_lm": prefix_lm,
+                "use_fast_dlm": False,
+                "remasking": self.args.remasking,
+                "cfg_scale": self.args.cfg_scale,
+            }
+            generation_kwargs = {k: v for k, v in generation_kwargs.items() if v is not None}
+            with _timer(_timings, "text_rollout"):
+                for start_idx in trange(0, len(text_indices), text_batch_size, desc="Text Rollout"):
+                    batch_indices = text_indices[start_idx : start_idx + text_batch_size]
+                    batch_examples = [inputs[idx] for idx in batch_indices]
+                    _, batch_contexts = self._rollout_multimodal_text_gen(
                         unwrapped_model,
-                        example,
+                        batch_examples,
                         image_processor,
                         generation_kwargs,
                         device,
                     )
-                
-                # text_completion_ids[idx] = sample_text_completion_ids.squeeze(0).detach()
-                answer_contexts[idx] = text_context
+                    for batch_offset, sample_idx in enumerate(batch_indices):
+                        answer_contexts[sample_idx] = batch_contexts[batch_offset]
 
+            scoring_examples = []
             image_data_list = [
                 image_context["payload"]
                 for image_context in image_contexts
-            ] # len(image_contexts)
+                if image_context is not None
+            ]
             text_data_list = [
-                answer_context["payload"] 
+                answer_context["payload"]
                 for answer_context in answer_contexts
-            ] # len(answer_contexts)
-            image_dataset = LazySupervisedDataset(
-                tokenizer=self.processing_class,
-                data_args=self.args,
-                list_data=image_data_list,
-            )
-            text_dataset = LazySupervisedDataset(
-                tokenizer=self.processing_class,
-                data_args=self.args,
-                list_data=text_data_list,
-            )
-            dataset = ConcatDataset(image_dataset, text_dataset)
+                if answer_context is not None
+            ]
             collate_fn = MaskDataCollator(self.processing_class, self.args)
-            data_loader = DataLoader(
-                dataset,
-                batch_size=self.args.batch_size,
-                shuffle=False,
-                collate_fn=collate_fn,
-            )
-            mask_seeds = torch.randint(0, 2**12, (self.args.num_iterations,), device=device)
+            dataset_args = self._build_lazy_supervised_data_args(unwrapped_model, image_processor)
+            # Build typed item lists separately so we can interleave them.
+            typed_items: list[list[dict]] = []
+            global_idx = 0
+            for data_list in (image_data_list, text_data_list):
+                if not data_list:
+                    typed_items.append([])
+                    continue
+                dataset = LazySupervisedDataset(
+                    tokenizer=self.processing_class,
+                    data_args=dataset_args,
+                    list_data=data_list,
+                )
+                items = []
+                for idx in range(len(dataset)):
+                    items.append({**dataset[idx], "_sample_idx": global_idx})
+                    global_idx += 1
+                typed_items.append(items)
+            # Interleave image-edit and text items round-robin so that every
+            # DataLoader mini-batch (and especially the *last* one used for
+            # gradient accumulation) activates both generation and understanding
+            # parameters.  This prevents DeepSpeed ZeRO-2 reduce-scatter
+            # deadlocks caused by unused-parameter backward hooks.
+            image_items, text_items = typed_items
+            interleaved: list[dict] = []
+            ii, ti = 0, 0
+            while ii < len(image_items) or ti < len(text_items):
+                if ii < len(image_items):
+                    interleaved.append(image_items[ii]); ii += 1
+                if ti < len(text_items):
+                    interleaved.append(text_items[ti]); ti += 1
+            scoring_examples = interleaved
+            if not scoring_examples:
+                raise ValueError("No scored batches were built from generated completions.")
+        mask_seeds = torch.randint(0, 2**12, (num_iterations,), device=device)
 
-        
+        mask_seed_list = mask_seeds.detach().cpu().tolist() if torch.is_tensor(mask_seeds) else list(mask_seeds)
         with torch.no_grad():
-            old_per_token_logps = self._get_per_token_logps(
-                self.model, data_loader, mask_seeds
-            )
+            with _timer(_timings, "old_logprobs"):
+                old_per_token_logps, completion_masks = self._get_per_token_logps(
+                    self.model,
+                    scoring_examples,
+                    mask_seed_list,
+                )
+                # Zero out non-completion positions so all downstream math (ratio, KL,
+                # loss) only ever sees real log-probs at completion positions and exact
+                # zeros elsewhere.  completion_masks is built alongside the logps inside
+                # _get_per_token_logps, so it tracks the same routing and padding.
+                old_per_token_logps = old_per_token_logps * completion_masks
+            ref_per_token_logps = None
             if beta != 0.0:
-                if getattr(self, "ref_model", None) is not None:
-                    all_ref_per_token_logps = self._get_per_token_logps(
-                        self.ref_model, data_loader, mask_seeds
-                    )
-                else:
-                    unwrapped = self.accelerator.unwrap_model(self.model)
-                    if hasattr(unwrapped, "disable_adapter"):
-                        with unwrapped.disable_adapter():
-                            all_ref_per_token_logps = self._get_per_token_logps(
-                                self.model, data_loader, mask_seeds
-                            )
+                with _timer(_timings, "ref_logprobs"):
+                    if getattr(self, "ref_model", None) is not None:
+                        ref_per_token_logps, _ = self._get_per_token_logps(
+                            self.ref_model, scoring_examples, mask_seed_list
+                        )
                     else:
-                        all_ref_per_token_logps = self._get_per_token_logps(
-                            self.model, data_loader, mask_seeds
+                        unwrapped = self.accelerator.unwrap_model(self.model)
+                        if hasattr(unwrapped, "disable_adapter"):
+                            with unwrapped.disable_adapter():
+                                ref_per_token_logps, _ = self._get_per_token_logps(
+                                    self.model, scoring_examples, mask_seed_list
+                                )
+                        else:
+                            ref_per_token_logps, _ = self._get_per_token_logps(
+                                self.model, scoring_examples, mask_seed_list
+                            )
+                    ref_per_token_logps = ref_per_token_logps * completion_masks
+
+        with _timer(_timings, "reward"):
+            reward_specs = [
+                (
+                    [example for example, image_context in zip(inputs, image_contexts) if image_context is not None],
+                    [image_context["prompt"] for image_context in image_contexts if image_context is not None],
+                    [image_context["decoded_image"] for image_context in image_contexts if image_context is not None],
+                    [perceptual_score_reward_func],
+                ),
+                (
+                    [example for example, answer_context in zip(inputs, answer_contexts) if answer_context is not None],
+                    [answer_context["prompt"] for answer_context in answer_contexts if answer_context is not None],
+                    [
+                        [{"role": "assistant", "content": answer_context["decoded_text"]}]
+                        for answer_context in answer_contexts
+                        if answer_context is not None
+                    ],
+                    [strict_format_reward_func, correctness_reward_func],
+                ),
+            ]
+            local_rewards = []
+            for reward_inputs, branch_prompts, branch_completions, reward_fns in reward_specs:
+                # Always create a rewards tensor (possibly empty) so that every
+                # rank calls `gather` the same number of times.  Skipping the
+                # gather when a rank has no samples of a given type causes NCCL
+                # deadlocks because the collectives are FIFO-matched across ranks.
+                n_branch = len(branch_completions) if branch_completions else 0
+                rewards_per_func = torch.zeros(n_branch, len(reward_fns), device=device)
+                if branch_completions:
+                    for i, reward_func in enumerate(reward_fns):
+                        if isinstance(reward_func, nn.Module):
+                            reward_func_name = f"reward {reward_func.config._name_or_path.split('/')[-1]}"
+                        else:
+                            reward_func_name = reward_func.__name__
+                        with profiling_context(self, reward_func_name):
+                            keys = [key for key in reward_inputs[0] if key not in ["prompt", "completion"]]
+                            reward_kwargs = {key: [example.get(key) for example in reward_inputs] for key in keys}
+                            if reward_func_name == "coding_reward_func":
+                                reward_kwargs["cwd_path"] = os.path.join(self.args.output_dir, "execution_files")
+                            try:
+                                output_reward_func = reward_func(
+                                    prompts=branch_prompts,
+                                    completions=branch_completions,
+                                    step=self._step,
+                                    run_name=self.args.output_dir,
+                                    **reward_kwargs,
+                                )
+                            except Exception:
+                                output_reward_func = [torch.nan for _ in branch_completions]
+                            output_reward_func = [
+                                reward if reward is not None else torch.nan for reward in output_reward_func
+                            ]
+                            rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+                    if torch.isnan(rewards_per_func).all(dim=1).any():
+                        nan_row_idx = torch.isnan(rewards_per_func).all(dim=1).nonzero(as_tuple=True)[0][0]
+                        row_reward_kwargs = {key: value[nan_row_idx] for key, value in reward_kwargs.items()}
+                        row_reward_kwargs["prompt"] = branch_prompts[nan_row_idx]
+                        row_reward_kwargs["completion"] = branch_completions[nan_row_idx]
+                        warnings.warn(
+                            f"All reward functions returned None for kwargs: {row_reward_kwargs}. "
+                            "Ensure at least one reward function returns a valid reward."
                         )
 
-        completions = []
-        for idx, (mode, completion) in enumerate(zip(sample_modes, completions_text)):
-            if mode == "image_edit":
-                image_ctx = image_contexts[idx]
-                completions.append(None if image_ctx is None else image_ctx.get("decoded_image"))
-            else:
-                completions.append([{"role": "assistant", "content": completion}])
+                    gathered_rewards_per_func = gather(rewards_per_func)
+                    for i, reward_func in enumerate(reward_fns):
+                        if isinstance(reward_func, nn.Module):
+                            reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+                        else:
+                            reward_func_name = reward_func.__name__
+                        if gathered_rewards_per_func.numel() > 0:
+                            mean_rewards = torch.nanmean(gathered_rewards_per_func[:, i]).item()
+                            std_rewards = nanstd(gathered_rewards_per_func[:, i]).item()
+                        else:
+                            mean_rewards = float("nan")
+                            std_rewards = float("nan")
+                        self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
+                        self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_rewards)
+                    if n_branch > 0:
+                        local_rewards.append(rewards_per_func.nansum(dim=1))
 
-        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
-        for i, (reward_func, reward_processing_class) in enumerate(
-            zip(self.reward_funcs, self.reward_processing_classes)
-        ):
-            if isinstance(reward_func, nn.Module):
-                reward_func_name = f"reward {reward_func.config._name_or_path.split('/')[-1]}"
-            else:
-                reward_func_name = reward_func.__name__
-            with profiling_context(self, reward_func_name):
-                keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
-                reward_kwargs = {key: [example.get(key) for example in inputs] for key in keys}
-                if reward_func_name == "coding_reward_func":
-                    reward_kwargs["cwd_path"] = os.path.join(self.args.output_dir, "execution_files")
-                try:
-                    output_reward_func = reward_func(
-                        prompts=prompts,
-                        completions=completions,
-                        step=self._step,
-                        run_name=self.args.output_dir,
-                        **reward_kwargs,
-                    )
-                except Exception:
-                    output_reward_func = [torch.nan for _ in completions]
-                output_reward_func = [
-                    reward if reward is not None else torch.nan for reward in output_reward_func
-                ]
-                rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+        if not local_rewards:
+            raise ValueError("No rewards were produced for generated completions.")
 
-        if torch.isnan(rewards_per_func).all(dim=1).any():
-            nan_row_idx = torch.isnan(rewards_per_func).all(dim=1).nonzero(as_tuple=True)[0][0]
-            row_reward_kwargs = {key: value[nan_row_idx] for key, value in reward_kwargs.items()}
-            row_reward_kwargs["prompt"] = prompts[nan_row_idx]
-            row_reward_kwargs["completion"] = completions[nan_row_idx]
-            warnings.warn(
-                f"All reward functions returned None for kwargs: {row_reward_kwargs}. "
-                "Ensure at least one reward function returns a valid reward."
-            )
-
-        rewards_per_func = gather(rewards_per_func)
-        reward_weights = self.reward_weights
-        if not torch.is_tensor(reward_weights):
-            reward_weights = torch.tensor(reward_weights, dtype=torch.float32, device=device)
-        else:
-            reward_weights = reward_weights.to(device)
-        rewards = (rewards_per_func * reward_weights.unsqueeze(0)).nansum(dim=1)
+        local_rewards = torch.cat(local_rewards, dim=0)
+        rewards = gather(local_rewards)
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
         std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = rewards - mean_grouped_rewards
-        zero_std_count = (std_grouped_rewards < 1e-6).sum().item()
-        total_prompts = std_grouped_rewards.size(0)
-        zero_std_ratio = zero_std_count / total_prompts if total_prompts > 0 else 0.0
-
+        local_sample_count = local_rewards.size(0)
         process_slice = slice(
-            self.accelerator.process_index * len(prompts),
-            (self.accelerator.process_index + 1) * len(prompts),
+            self.accelerator.process_index * local_sample_count,
+            (self.accelerator.process_index + 1) * local_sample_count,
         )
-        advantages = advantages[process_slice]
-        mode = "eval" if self.control.should_evaluate else "train"
-        completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
+        advantages = local_rewards - mean_grouped_rewards[process_slice]
+        is_std_zero = std_grouped_rewards < 1e-6
+
+        completion_length = self.accelerator.gather_for_metrics(
+            completion_masks.float().sum(dim=-1).mean(dim=0)
+        ).float().mean().item()
         self._metrics[mode]["completion_length"].append(completion_length)
-        self._metrics[mode]["zero_std_ratio"].append(zero_std_ratio)
-        for i, reward_func in enumerate(self.reward_funcs):
-            if isinstance(reward_func, nn.Module):
-                reward_func_name = reward_func.config._name_or_path.split("/")[-1]
-            else:
-                reward_func_name = reward_func.__name__
-            mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
-            self._metrics[mode][f"rewards/{reward_func_name}"].append(mean_rewards)
         self._metrics[mode]["reward"].append(rewards.mean().item())
-        self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
+        self._metrics[mode]["reward_std"].append(rewards.std().item())
+        self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
-        if self.log_completions and self.state.global_step % self.args.logging_steps == 0:
-            prompts_to_log = gather_object(prompts_text)
-            completions_to_log = gather_object(completions_text)
-            rewards_to_log = rewards.tolist()
-            wandb_payloads = []
-            for mode, completion_text, image_ctx in zip(sample_modes, completions_text, image_contexts):
-                payload = {
-                    "completion": completion_text,
-                    "completion_image": None,
-                }
-                if mode == "image_edit" and image_ctx is not None:
-                    payload["completion_image"] = image_ctx.get("decoded_image")
-                wandb_payloads.append(payload)
-            wandb_payloads_to_log = gather_object(wandb_payloads)
-            if self.accelerator.is_main_process:
-                # if is_rich_available():
-                print_prompt_completions_sample(
-                    prompts_to_log,
-                    completions_to_log,
-                    rewards_to_log,
-                    self.state.global_step,
-                )
-                if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
-                    table = wandb.Table(
-                        columns=["step", "prompt", "completion", "completion_image", "reward"]
-                    )
-                    for prompt, reward_value, payload in zip(
-                        prompts_to_log, rewards_to_log, wandb_payloads_to_log
-                    ):
-                        completion_image = payload.get("completion_image")
-                        if completion_image is not None:
-                            completion_image = wandb.Image(completion_image)
-                        table.add_data(
-                            str(self.state.global_step),
-                            prompt,
-                            payload.get("completion"),
-                            completion_image,
-                            reward_value,
-                        )
-                    wandb.log({"completions": table})
+        prompts_text = []
+        completions_text = []
+        for sample_mode, prompt, image_context, answer_context in zip(
+            sample_modes, prompts, image_contexts, answer_contexts
+        ):
+            if sample_mode == "image_edit":
+                prompts_text.append(image_context["prompt"] if image_context is not None else prompt)
+                completions_text.append("")
+            else:
+                prompts_text.append(answer_context["prompt"] if answer_context is not None else prompt)
+                completions_text.append("" if answer_context is None else answer_context["decoded_text"])
 
-        return {
-            "sample_modes": sample_modes,
-            "text_prompt_ids": text_prompt_ids,
-            "text_completion_ids": text_completion_ids,
-            "image_contexts": image_contexts,
-            "score_payloads": score_payloads,
-            "score_mask_seeds": mask_seed_list,
-            "completion_ids": completion_ids.detach(),
-            "completion_mask": completion_mask.float().detach(),
-            "old_per_token_logps": None if all_old_per_token_logps is None else all_old_per_token_logps.detach(),
-            "ref_per_token_logps": None if all_ref_per_token_logps is None else all_ref_per_token_logps.detach(),
-            "advantages": advantages.detach(),
-            "mask_seeds": mask_seeds.detach() if torch.is_tensor(mask_seeds) else mask_seeds,
-        }
+        prepared_batches = DataLoader(
+            scoring_examples,
+            batch_size=2,
+            shuffle=False,
+            collate_fn=self._build_scored_batch_collator(
+                collate_fn,
+                advantages,
+                completion_masks,
+                old_per_token_logps,
+                ref_per_token_logps,
+                num_iterations,
+            ),
+        )
+
+        # Log time profile through self._metrics so it goes through the HF callback system
+        for k, v in _timings.items():
+            self._metrics[mode][f"time_profile/{k}"].append(v)
+
+        _TRAINING_KEYS = frozenset({"advantages", "completion_mask", "completion_masks",
+                                    "old_per_token_logps", "ref_per_token_logps"})
+        mask_seeds_val = mask_seeds.detach() if torch.is_tensor(mask_seeds) else mask_seeds
+        return [
+            {
+                "scoring_data_loader": batch["scoring_instances"],
+                **{k: v for k, v in batch.items() if k in _TRAINING_KEYS},
+                "mask_seeds": mask_seeds_val,
+            }
+            for batch in prepared_batches  # DataLoader is iterable; no need to materialise separately
+        ]

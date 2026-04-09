@@ -883,7 +883,7 @@ class LlavaMetaForCausalLM(ABC):
         # import pdb; pdb.set_trace()
         # rank0_print("Finish preparing")
         if return_inputs:
-            return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels,new_input_ids_padded
+            return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, new_input_ids_padded
         else:
             return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
 
