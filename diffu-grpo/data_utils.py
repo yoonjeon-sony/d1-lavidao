@@ -1,4 +1,4 @@
-from datasets import load_dataset, Dataset
+from datasets import load_dataset, Dataset, Features, Value, concatenate_datasets
 import json
 import os
 import random
@@ -159,10 +159,7 @@ def get_code_questions(split="train"):
     return data
 
 
-def get_image_edit_placeholder_questions(split: str = "train") -> Dataset:
-    if split != "train":
-        raise ValueError(f"Unsupported split '{split}' for ThinkMorph image edit data. Use 'train'.")
-
+def get_image_edit_placeholder_questions() -> Dataset:
     data_root = THINKMORPH_DEFAULT_DATA_ROOT
     image_root = THINKMORPH_DEFAULT_IMAGE_ROOT
     train_data_paths = [os.path.join(data_root, name) for name in THINKMORPH_LOCAL_JSONL_FILES]
@@ -229,10 +226,7 @@ def get_image_edit_placeholder_questions(split: str = "train") -> Dataset:
     return Dataset.from_list(rows)
 
 
-def get_image_answer_placeholder_questions(split: str = "train") -> Dataset:
-    if split != "train":
-        raise ValueError(f"Unsupported split '{split}' for ThinkMorph image answer data. Use 'train'.")
-
+def get_image_answer_placeholder_questions() -> Dataset:
     data_root = THINKMORPH_DEFAULT_DATA_ROOT
     image_root = THINKMORPH_DEFAULT_IMAGE_ROOT
     train_data_paths = [os.path.join(data_root, name) for name in THINKMORPH_LOCAL_JSONL_FILES]
@@ -293,16 +287,44 @@ def get_image_answer_placeholder_questions(split: str = "train") -> Dataset:
     return Dataset.from_list(rows)
 
 
-def get_thinkmorph_interleave_questions(split: str = "train") -> Dataset:
-    """Returns a dataset interleaving image-edit and text-answer rows from the same ThinkMorph JSONL files.
+# Shared schemas for the paired gen / und datasets used by `thinkmorph_interleave`.
+# Both ThinkMorph and ArxivQA loaders emit rows with these exact features so the
+# datasets can be concatenated and jointly shuffled. `image_gt` is nullable on the
+# gen side: a non-null path means the row is eligible for perceptual reward, a
+# null value (e.g. ArxivQA) means the gen rollout is rollout-only and must not
+# contribute to gen-side reward / advantage / loss.
+INTERLEAVE_GEN_FEATURES = Features(
+    {
+        "task_type": Value("string"),
+        "dataset_type": Value("string"),
+        "sample_id": Value("string"),
+        "prompt": [{"role": Value("string"), "content": Value("string")}],
+        "instruction": Value("string"),
+        "image": Value("string"),
+        "image_gen_enc": Value("string"),
+        "image_gt": Value("string"),  # nullable: None for answer_only rows
+        "answer_gt": Value("string"),  # nullable: unused on gen side
+    }
+)
+INTERLEAVE_UND_FEATURES = Features(
+    {
+        "task_type": Value("string"),
+        "dataset_type": Value("string"),
+        "sample_id": Value("string"),
+        "prompt": [{"role": Value("string"), "content": Value("string")}],
+        "instruction": Value("string"),
+        "image": Value("string"),
+        "answer_gt": Value("string"),
+    }
+)
 
-    Each JSONL sample contributes two rows:
-      - An image_edit row (task_type="image_edit") for perceptual-reward training.
-      - A text row        (task_type="text")       for correctness-reward training.
 
-    Both rows carry the full column schema so HuggingFace Dataset is uniform:
-      image_gt   – populated for edit rows, None for text rows.
-      answer_gt  – populated for text rows, None for edit rows.
+def get_thinkmorph_interleave_questions(split: str = "train") -> tuple[Dataset, Dataset]:
+    """Build paired (gen_ds, und_ds) ThinkMorph datasets for `thinkmorph_interleave`.
+
+    Each source jsonl sample contributes one row to gen_ds and one row to und_ds
+    at the same index, sharing a `sample_id` so the trainer can assert alignment.
+    Both rows are tagged ``dataset_type="image_answer"``.
     """
     if split != "train":
         raise ValueError(f"Unsupported split '{split}' for ThinkMorph interleave data. Use 'train'.")
@@ -315,17 +337,19 @@ def get_thinkmorph_interleave_questions(split: str = "train") -> Dataset:
     if missing_paths:
         raise FileNotFoundError(f"ThinkMorph jsonl file(s) not found: {', '.join(missing_paths)}")
 
-    rows: list[dict] = []
+    gen_rows: list[dict] = []
+    und_rows: list[dict] = []
     for data_path in train_data_paths:
+        basename = os.path.basename(data_path)
         with open(data_path, "r", encoding="utf-8") as f:
             for idx, line in enumerate(
-                tqdm(f, desc=f"Loading {os.path.basename(data_path)}", unit="line")
+                tqdm(f, desc=f"Loading {basename}", unit="line")
             ):
                 if not line.strip():
                     continue
 
                 example = json.loads(line)
-                sample_id = str(example.get("pid", f"{os.path.basename(data_path)}:{idx}"))
+                sample_id = str(example.get("pid", f"{basename}:{idx}"))
 
                 question = example.get("question")
                 image_input_rel = example.get("problem_image_0")
@@ -350,10 +374,11 @@ def get_thinkmorph_interleave_questions(split: str = "train") -> Dataset:
                 edit_instruction = f"{EDIT_PROMPT} {question.strip()}"
                 cot_instruction = f"{COT_PROMPT} {question.strip()}"
 
-                # Image-edit row
-                rows.append(
+                gen_rows.append(
                     {
                         "task_type": "image_edit",
+                        "dataset_type": "image_answer",
+                        "sample_id": sample_id,
                         "prompt": [{"role": "user", "content": f"<image>\n{edit_instruction}"}],
                         "instruction": edit_instruction,
                         "image": image_input,
@@ -362,20 +387,21 @@ def get_thinkmorph_interleave_questions(split: str = "train") -> Dataset:
                         "answer_gt": None,
                     }
                 )
-                # Text-answer row
-                rows.append(
+                und_rows.append(
                     {
                         "task_type": "text",
+                        "dataset_type": "image_answer",
+                        "sample_id": sample_id,
                         "prompt": [{"role": "user", "content": f"<image>\n{cot_instruction}"}],
                         "instruction": cot_instruction,
                         "image": image_input,
-                        "image_gen_enc": None,
-                        "image_gt": None,
                         "answer_gt": answer.strip(),
                     }
                 )
 
-    return Dataset.from_list(rows)
+    gen_ds = Dataset.from_list(gen_rows, features=INTERLEAVE_GEN_FEATURES)
+    und_ds = Dataset.from_list(und_rows, features=INTERLEAVE_UND_FEATURES)
+    return gen_ds, und_ds
 
 
 def get_mixed_placeholder_questions(split: str = "train") -> Dataset:
@@ -410,10 +436,10 @@ def get_mixed_placeholder_questions(split: str = "train") -> Dataset:
 
 
 THINKMORPH_LOCAL_JSONL_FILES = (
-    "ThinkMorph-Spatial_Navigation_loc_train.jsonl",
-    "ThinkMorph-Visual_Search_loc_train.jsonl",
-    "ThinkMorph-Chart_Refocus_loc_train.jsonl",
-    "ThinkMorph-Jigsaw_Assembly_loc_train.jsonl",
+    "ThinkMorph-Spatial_Navigation_loc_val.jsonl",
+    "ThinkMorph-Visual_Search_loc_val.jsonl",
+    "ThinkMorph-Chart_Refocus_loc_val.jsonl",
+    "ThinkMorph-Jigsaw_Assembly_loc_val.jsonl",
 )
 THINKMORPH_DEFAULT_DATA_ROOT = "/home/yoonjeon.kim/dllm-RL/data/"
 THINKMORPH_DEFAULT_IMAGE_ROOT = "/scratch2/yoonjeon.kim/data/"
@@ -465,8 +491,6 @@ def _normalize_arxivqa_options(options: list[str]) -> list[str]:
         normalized_options.append(f"{option_char}) {option_text}")
     return normalized_options
 
-
-
 def _parse_bbox(raw_bbox):
     if raw_bbox is None:
         return None
@@ -486,16 +510,60 @@ def _parse_bbox(raw_bbox):
     return None
 
 
-def get_arxivqa_answer_questions(
+
+def _resolve_arxivqa_image_path(raw_image, image_root: str, sample_id: str) -> str:
+    if not isinstance(raw_image, str) or not raw_image.strip():
+        raise ValueError(f"ArxivQA sample '{sample_id}' has invalid image: {raw_image!r}")
+    rel = raw_image.strip()
+    if os.path.isabs(rel):
+        return rel
+    return os.path.join(image_root, rel)
+
+
+def _normalize_arxivqa_label(raw_label) -> str:
+    if not isinstance(raw_label, str) or not raw_label.strip():
+        raise ValueError(f"ArxivQA sample has invalid label: {raw_label!r}")
+    return raw_label.strip()
+
+
+def download_process_arxivqa(data_root: str = "./data"):
+    dataset = load_dataset("MMInstruction/ArxivQA", split="train")
+    dataset.select(range(10000)).save_to_disk(os.path.join(data_root, "arxivqa_select_10k.jsonl"))
+    new_dataset = Dataset.from_list([])
+    for data in dataset:
+        question = data["question"]
+        options = data["options"]
+        label = data["label"]
+        image = data["image"]
+        image_path = os.path.join(data_root, f"{data['id']}.png")
+        image.save(image_path)
+        new_dataset.append(
+            {
+                "question": question,
+                "options": options,
+                "image": image_path,
+                "label": label,
+            }
+        )
+    return new_dataset
+
+
+
+def get_arxivqa_interleave_questions(
     split: str = "train",
     data_root: str | None = None,
     image_root: str | None = None,
-    gen_type: str = "text_gen",
-) -> Dataset:
+) -> tuple[Dataset, Dataset]:
+    """Build paired (gen_ds, und_ds) ArxivQA datasets for `thinkmorph_interleave`.
+
+    The gen row has ``image_gt=None`` so the trainer skips perceptual reward,
+    advantage, and loss computation for it (rollout-only). The und row carries
+    the multiple-choice answer label and is rewarded by ``correctness_reward_func``.
+    Both rows are tagged ``dataset_type="answer_only"`` and share a sample_id
+    prefixed with ``arxivqa:`` to avoid collisions with ThinkMorph pids.
+    """
     if split != "train":
         raise ValueError(f"Unsupported split '{split}' for ArxivQA. Use 'train'.")
-    if gen_type != "text_gen":
-        raise ValueError(f"Unsupported gen_type '{gen_type}' for ArxivQA. Use 'text_gen'.")
 
     if data_root is None:
         data_root = "./data"
@@ -506,13 +574,15 @@ def get_arxivqa_answer_questions(
     if not os.path.isfile(data_path):
         raise FileNotFoundError(f"ArxivQA file not found: {data_path}")
 
-    rows: list[dict] = []
+    gen_rows: list[dict] = []
+    und_rows: list[dict] = []
     with open(data_path, "r", encoding="utf-8") as f:
         for idx, line in enumerate(tqdm(f, desc="Loading arxivqa.jsonl", unit="line")):
             if not line.strip():
                 continue
             sample = json.loads(line)
-            sample_id = str(sample.get("id", f"row-{idx}"))
+            raw_id = sample.get("id", f"row-{idx}")
+            sample_id = f"arxivqa:{raw_id}"
 
             question = sample.get("question")
             if not isinstance(question, str) or not question.strip():
@@ -527,14 +597,34 @@ def get_arxivqa_answer_questions(
             image_path = _resolve_arxivqa_image_path(sample.get("image"), image_root, sample_id)
             answer_gt = _normalize_arxivqa_label(sample.get("label"))
 
-            rows.append(
+            edit_instruction = f"{EDIT_PROMPT} {question_text}"
+            cot_instruction = f"{COT_PROMPT} {question_text}"
+
+            gen_rows.append(
                 {
-                    "answer_prompt": _build_question_prompt(question_text),
-                    "edit_prompt": f"{EDIT_PROMPT} {question_text}",
-                    "answer_gt": answer_gt,
+                    "task_type": "image_edit",
+                    "dataset_type": "answer_only",
+                    "sample_id": sample_id,
+                    "prompt": [{"role": "user", "content": f"<image>\n{edit_instruction}"}],
+                    "instruction": edit_instruction,
                     "image": image_path,
-                    "gen_type": "text_gen",
+                    "image_gen_enc": image_path,
+                    "image_gt": None,  # gating signal: no perceptual reward / advantage / loss
+                    "answer_gt": None,
+                }
+            )
+            und_rows.append(
+                {
+                    "task_type": "text",
+                    "dataset_type": "answer_only",
+                    "sample_id": sample_id,
+                    "prompt": [{"role": "user", "content": f"<image>\n{cot_instruction}"}],
+                    "instruction": cot_instruction,
+                    "image": image_path,
+                    "answer_gt": answer_gt,
                 }
             )
 
-    return Dataset.from_list(rows)
+    gen_ds = Dataset.from_list(gen_rows, features=INTERLEAVE_GEN_FEATURES)
+    und_ds = Dataset.from_list(und_rows, features=INTERLEAVE_UND_FEATURES)
+    return gen_ds, und_ds

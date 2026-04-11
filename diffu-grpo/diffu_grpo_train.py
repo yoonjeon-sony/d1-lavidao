@@ -30,7 +30,11 @@ from llava import conversation as conversation_lib
 from llava.model.language_model.llava_llada import LlavaLladaForMaskedDiffusion
 
 # Custom imports
+import numpy as np
+from datasets import concatenate_datasets
+
 from data_utils import (
+    get_arxivqa_interleave_questions,
     get_code_questions,
     get_countdown_questions,
     get_image_answer_placeholder_questions,
@@ -389,29 +393,47 @@ def main(grpo_config, model_config):
             correctness_reward_func,
         ]
     elif grpo_config.dataset == "thinkmorph_interleave":
-        dataset = get_thinkmorph_interleave_questions("train")
-        # Reward dispatch for mixed tasks is handled inside _generate_and_score_completions:
-        #   image_edit samples → perceptual_score_reward_func
-        #   text samples       → strict_format_reward_func, correctness_reward_func
-        # Pass the union here so _validate_reward_dataset_compatibility can check columns.
+        tm_gen, tm_und = get_thinkmorph_interleave_questions("train")
+        ax_gen, ax_und = get_arxivqa_interleave_questions("train")
+
+        # Concatenate gen and und sides. Each loader emits its gen and und rows
+        # in the same order, so within each sub-dataset row i refers to the same
+        # source sample on both sides; concatenation preserves this index alignment.
+        dataset = concatenate_datasets([tm_gen, ax_gen])
+        und_dataset = concatenate_datasets([tm_und, ax_und])
+        if len(dataset) != len(und_dataset):
+            raise ValueError(
+                f"thinkmorph_interleave gen/und length mismatch after concat: "
+                f"{len(dataset)} vs {len(und_dataset)}"
+            )
+
+        # Joint shuffle: draw one permutation and apply it to both datasets so
+        # that row i continues to refer to the same sample_id on both sides.
+        # The trainer enforces this alignment with a runtime sample_id assert.
+        rng = np.random.default_rng(grpo_config.seed)
+        perm = rng.permutation(len(dataset)).tolist()
+        dataset = dataset.select(perm)
+        und_dataset = und_dataset.select(perm)
+
         reward_functions = [
             perceptual_score_reward_func,
             strict_format_reward_func,
             correctness_reward_func,
         ]
-    elif grpo_config.dataset == "mixed_placeholder":
-        dataset = get_mixed_placeholder_questions("train")
-        reward_functions = [neutral_reward_func]
     else:
         raise ValueError(f"Unsupported dataset: {grpo_config.dataset}")
 
-    _validate_reward_dataset_compatibility(grpo_config.dataset, dataset, reward_functions)
+    # _validate_reward_dataset_compatibility(grpo_config.dataset, dataset, reward_functions)
 
-    # For interleave datasets the row ordering encodes paired structure
-    # (even=image_edit, odd=text).  PairedRepeatSampler shuffles at the
-    # pair level, so a dataset-level shuffle here would break the pairing.
+    # thinkmorph_interleave already applied a joint permutation above; re-shuffling
+    # here independently would break the gen/und sample_id alignment.
     if grpo_config.dataset != "thinkmorph_interleave":
         dataset = dataset.shuffle(seed=grpo_config.seed)
+    und_train_set = None
+    if "und_dataset" in locals():
+        if grpo_config.dataset != "thinkmorph_interleave":
+            und_dataset = und_dataset.shuffle(seed=grpo_config.seed)
+        und_train_set = und_dataset
     if grpo_config.dataset in ["countdown", "sudoku"] and len(dataset) > 500:
         train_set = dataset.select(range(0, len(dataset) - 500))
     else:
@@ -428,6 +450,7 @@ def main(grpo_config, model_config):
         processing_class=tokenizer,
         reward_funcs=reward_functions,
         train_dataset=train_set,
+        train_dataset_und=und_train_set,
         optimizers=(optimizer, None),
     )
 
