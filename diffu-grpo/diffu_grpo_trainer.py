@@ -17,11 +17,12 @@ import transformers
 from accelerate.utils import DistributedType, gather, gather_object
 from datasets import Dataset, IterableDataset
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset, ConcatDataset
 import math
 
 import wandb
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, Trainer, TrainerCallback
+from transformers.integrations import WandbCallback
 from transformers.utils import is_peft_available
 from trl.extras.profiling import profiling_context, profiling_decorator
 # from trl.import_utils import is_rich_available
@@ -235,16 +236,23 @@ class MaskDataCollator:
 
         images_gen = list([instance["image_gen"] for instance in instances if instance["image_gen"] is not None])
         image_gen_enc = list([instance["image_gen_enc"] for instance in instances if instance["image_gen_enc"] is not None])
-        
+        image_gen_weight = list([instance["image_gen_weight"] for instance in instances if instance["image_gen_weight"] is not None])
+
         if len(images_gen) > 0:
             batch['images_gen'] = images_gen
         else:
             batch['images_gen']  = None
-        if len(image_gen_enc)>0:
+        if len(image_gen_enc) > 0:
             batch['images_gen_enc'] = image_gen_enc
         else:
             batch['images_gen_enc']  = None
-        batch['image_gen_weight'] = None
+        if len(image_gen_weight) > 0:
+            batch['image_gen_weight'] = image_gen_weight
+        else:
+            batch['image_gen_weight'] = None
+
+        if 'name' in instances[0]:
+            batch['dataset_name'] = instances[0]['name']
 
         # Per-sample flag: True if the sample has image generation targets (image_edit),
         # False otherwise (text/multimodal-understanding).  Used in _get_per_token_logps
@@ -282,7 +290,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
         ),
         peft_config: Optional["PeftConfig"] = None,
     ):
-        self.und_dataset = train_dataset_und
         _register_lavida_architectures()
         super().__init__(
             model=model,
@@ -298,8 +305,29 @@ class DiffuGRPOTrainer(GRPOTrainer):
         )
         args.use_fast_dlm = False
 
+        # Hard-disable every source of dropout in the policy model (and ref
+        # model if present).  GRPO requires that the old-policy forward and
+        # the current-policy forward produce bitwise-identical logps for the
+        # same (sample, mask_seed) — otherwise
+        #     coef_1 = exp(per_token_logps - old_ptl)
+        # blows up at masked positions and the loss becomes enormous.  We
+        # cannot use model.eval() on the current-policy pass because it must
+        # build a grad graph for backward, so we instead hard-zero every
+        # dropout source so train-mode forwards become deterministic too.
+        # This is safe because GRPO derives its training signal from the
+        # clipped-ratio loss, not from the underlying masked-LM dropout
+        # regularization.
+        self._hard_disable_dropout(self.model)
+        if getattr(self, "ref_model", None) is not None:
+            self._hard_disable_dropout(self.ref_model)
+
+        # Remove the default WandbCallback — we call wandb.log explicitly
+        # in _wandb_log_metrics so the default callback would double-log /
+        # conflict with our custom metric keys.
+        self.remove_callback(WandbCallback)
+
         # Initialize wandb on the main process only.
-        if self.accelerator.is_main_process:
+        if self.accelerator.is_main_process and wandb.run is None:
             wandb.init(
                 project=os.environ.get("WANDB_PROJECT", "huggingface"),
                 entity=os.environ.get("WANDB_ENTITY", None),
@@ -310,71 +338,68 @@ class DiffuGRPOTrainer(GRPOTrainer):
         grad_accum_steps = int(getattr(self.args, "gradient_accumulation_steps", 1) or 1)
         if getattr(self, "_buffered_inputs", None) is None:
             self._buffered_inputs = [None] * grad_accum_steps
-        # Dual-modality buffers for interleave training (gen + und).
-        self._gen_buffered_inputs = [None] * grad_accum_steps
-        self._und_buffered_inputs = [None] * grad_accum_steps
-        # Set up a separate DataLoader for the understanding dataset.
-        self._und_dataloader = None
+        # Buffered micro-batches for gradient accumulation.
+        # Filled by _prepare_inputs on generation steps, consumed on subsequent steps.
+        self._buffered_inputs = None
+        
         self._und_iter = None
-        if self.und_dataset is not None:
-            self._init_und_dataloader()
-
-    def _init_und_dataloader(self):
-        """Build a DataLoader for the understanding dataset using the same
-        RepeatSampler logic as the primary (gen) DataLoader."""
-        from trl.trainer.grpo_trainer import RepeatSampler
-        from torch.utils.data import DistributedSampler, SequentialSampler
-
-        und_sampler = RepeatSampler(
-            data_source=self.und_dataset,
-            mini_repeat_count=self.num_generations,
-            batch_size=self.args.generation_batch_size // self.num_generations,
-            repeat_count=self.num_iterations * self.args.steps_per_generation,
-            shuffle=self.shuffle_dataset,
-            seed=self.args.seed,
-        )
-        # Wrap with DistributedSampler when running multi-GPU, matching HF Trainer behaviour.
-        if self.accelerator.num_processes > 1:
-            dist_sampler = DistributedSampler(
-                list(range(len(und_sampler))),
-                num_replicas=self.accelerator.num_processes,
-                rank=self.accelerator.process_index,
-                shuffle=False,  # RepeatSampler already handles shuffling
+        if train_dataset_und is not None:
+            und_dataloader =self._get_dataloader(
+                dataset=train_dataset_und,
+                description="Training",
+                batch_size=self._train_batch_size * self.args.steps_per_generation,  # < this is the change
+                sampler_fn=self._get_train_sampler,
+                is_training=True,
             )
-            # Use dist_sampler to stride into und_sampler's output
-            sampler_indices = list(und_sampler)
-            class _IndexedSampler(torch.utils.data.Sampler):
-                """Applies DistributedSampler striding over a pre-built index list."""
-                def __init__(self, indices, dist_sampler):
-                    self._indices = indices
-                    self._dist = dist_sampler
-                def __iter__(self):
-                    for i in self._dist:
-                        yield self._indices[i]
-                def __len__(self):
-                    return len(self._dist)
-            final_sampler = _IndexedSampler(sampler_indices, dist_sampler)
-        else:
-            final_sampler = und_sampler
+            self._und_dataloader = und_dataloader
+            self._und_iter = iter(und_dataloader)
 
-        self._und_dataloader = DataLoader(
-            self.und_dataset,
-            batch_size=self.args.per_device_train_batch_size,
-            sampler=final_sampler,
-            collate_fn=lambda batch: batch,  # keep as list of dicts
-        )
-        self._und_iter = iter(self._und_dataloader)
-
-    def _get_train_sampler(self, dataset=None):
-        """Always use RepeatSampler (parent default). PairedRepeatSampler is no longer needed
-        because interleave training uses two separate datasets with independent samplers."""
-        return super()._get_train_sampler(dataset)
 
     @staticmethod
     def _make_generator(device: torch.device, seed: int) -> torch.Generator:
         gen = torch.Generator(device=device)
         gen.manual_seed(int(seed))
         return gen
+
+    @staticmethod
+    def _hard_disable_dropout(module: nn.Module) -> None:
+        """Walk ``module`` and set every dropout source to 0 in-place.
+
+        LLaDA has three dropout paths that all need to be killed for GRPO
+        forwards to be deterministic between the old-policy and
+        current-policy passes:
+
+          1. ``nn.Dropout`` submodules — ``residual_dropout`` and
+             ``embedding_dropout`` are instantiated as ``nn.Dropout``
+             modules (see ``modeling_llada.py`` ``self.dropout`` and
+             ``emb_drop``).  Setting ``.p = 0.0`` makes their forward the
+             identity even when ``self.training`` is True.
+          2. ``attention_dropout`` — LLaDABlock reads this dynamically on
+             every forward via ``dropout_p=0.0 if not self.training else
+             self.config.attention_dropout`` (see modeling_llada.py lines
+             ~822 and ~838).  To defeat it we have to walk every nested
+             ``config`` object and zero the attribute.
+          3. Defensive catch-all: any ``*_dropout`` on any nested config,
+             in case a future LLaDA variant adds more.
+
+        This runs once at trainer ``__init__`` time — the model hasn't been
+        wrapped by DeepSpeed yet, but even after wrapping ``module.modules()``
+        still yields the same underlying submodules because the wrappers
+        just hold references.
+        """
+        for m in module.modules():
+            if isinstance(m, nn.Dropout):
+                m.p = 0.0
+            cfg = getattr(m, "config", None)
+            if cfg is None:
+                continue
+            for attr in ("attention_dropout", "residual_dropout", "embedding_dropout"):
+                if hasattr(cfg, attr):
+                    try:
+                        setattr(cfg, attr, 0.0)
+                    except Exception:
+                        # Some HF configs are frozen / use @property — ignore.
+                        pass
 
     def _get_image_edit_gen_dict(self) -> dict[str, Any]:
         latent_token_map = {256: 256, 512: 1024, 1024: 4096}
@@ -1184,274 +1209,556 @@ class DiffuGRPOTrainer(GRPOTrainer):
     def _get_per_token_logps(
         self,
         model,
-        data_loader: Union[DataLoader, dict[str, Any]],
-        mask_seeds: list[int],
-    ) -> torch.Tensor:
-        single_batch_call = isinstance(data_loader, dict) and "scoring_data_loader" in data_loader
-        if isinstance(data_loader, dict):
-            if "scoring_data_loader" in data_loader:
-                data_loader = data_loader["scoring_data_loader"]
-            else:
-                data_loader = [data_loader]
+        gen_scoring=None,
+        und_scoring=None,
+        mask_seeds: list[int] = None,
+        cached_gen_samples: list[dict] = None,
+        cached_und_samples: list[dict] = None,
+        force_gen_masks: list[list[dict]] = None,
+        force_und_masks: list[list[dict]] = None,
+        gen_slice: tuple = None,
+        und_slice: tuple = None,
+    ) -> tuple:
+        """Compute per-token log-probs for gen and und scoring datasets.
 
-        llada_model = self._resolve_llada_forward_model(model)
+        Gen (image-edit) and und (text) samples are processed in **separate**
+        model.forward passes rather than a single concatenated batch.  This
+        avoids cross-modality padding in MaskDataCollator (gen latent lengths
+        and und text lengths differ substantially) and keeps activation memory
+        proportional to the longest sample within a single modality instead of
+        the global max.  It also avoids a subtle MaskDataCollator bug where
+        ``batch['dataset_name']`` was taken from ``instances[0]`` only —
+        homogeneous per-modality batches make that assignment always correct.
+
+        The two modalities' cached raw samples are kept in **separate** lists
+        (``cached_gen_samples`` and ``cached_und_samples``) so that gen_slice
+        and und_slice index directly into their respective cache without any
+        offset arithmetic.
+
+        Force-mask plumbing:
+          On the first (old-policy) call, ``force_gen_masks`` /
+          ``force_und_masks`` are None.  The function captures
+          ``final_masked_indices`` / ``masked_indices_gen`` returned by
+          ``model.forward`` for each (seed, sample) pair, and returns them
+          alongside the logps.  The caller persists these across ranks /
+          grad-accum steps.
+          On subsequent calls (ref-policy pass and the current-policy pass
+          inside ``_compute_loss``), the caller passes the previously captured
+          masks back via ``force_gen_masks`` / ``force_und_masks``.  They are
+          forwarded into ``LlavaLladaForMaskedDiffusion.forward`` as
+          ``force_text_mask`` / ``force_gen_mask``, which bypass the
+          random-draw-based masking entirely.  This guarantees that every
+          forward at the same (sample, mask_seed) sees bitwise-identical
+          masks, so ``coef_1 = exp(curr - old)`` can never blow up.
+
+        Index alignment (critical — this is what the advantages / old_logps /
+        ref_logps buffers rely on):
+          - Row ``i`` of the returned ``per_gen_logps`` corresponds to
+            ``gen_scoring[gs + i]``, where ``(gs, ge) = gen_slice``.  This
+            pairs with ``gen_advantages[gs + i]``, ``old_gen_logps[:, gs + i]``,
+            ``ref_gen_logps[:, gs + i]`` — all indexed off ``gen_scoring``.
+          - Row ``i`` of the returned ``per_und_logps`` corresponds to
+            ``und_scoring[us + i]``, where ``(us, ue) = und_slice``.  Same
+            pairing with ``und_advantages`` / ``old_und_logps`` / ``ref_und_logps``.
+
+        Args:
+            cached_gen_samples: If provided, reuse these pre-fetched per-sample
+                dicts for the gen modality instead of calling ``gen_scoring[i]``
+                again.  Avoids non-determinism from LazySupervisedDataset
+                (random crops, retry logic) that would otherwise produce
+                different sequence lengths across calls.  Length = len(gen_scoring).
+            cached_und_samples: Same idea for und modality. Length = len(und_scoring).
+            force_gen_masks: Optional list[list[dict]] indexed by
+                [seed_index][sample_local_idx_within_slice].  Each entry is
+                ``{"text_mask": Tensor, "gen_mask": Tensor}`` or None.  When
+                provided, bypasses the random-draw mask inside model.forward.
+                Shape of the outer list must match ``len(mask_seeds)``; shape
+                of each inner list must match ``ge - gs`` samples covered.
+            force_und_masks: Same, but for und modality (gen_mask is unused /
+                always None for und samples).
+            gen_slice: (start, end) — if provided, only forward gen samples in
+                this index range of ``gen_scoring`` / ``cached_gen_samples``.
+            und_slice: (start, end) — same, but for und.
+
+        Returns:
+            per_gen_logps: (len(mask_seeds), N_gen, latent_total) or None
+            per_und_logps: (len(mask_seeds), N_und, L_text) or None
+            cached_gen_samples: list[dict] — gen per-sample dicts (for caching)
+            cached_und_samples: list[dict] — und per-sample dicts (for caching)
+            captured_gen_masks: list[list[dict]] — [seed_index][sample_local_idx]
+                of {"text_mask": CPU Tensor, "gen_mask": CPU Tensor}.  Either
+                reflects the masks drawn on this call (if force_gen_masks was
+                None) or is a straight passthrough of force_gen_masks (so
+                callers always have a single handle to the masks in play).
+            captured_und_masks: same for und.
+        """
+        N_gen_full = len(gen_scoring) if gen_scoring is not None else 0
+        N_und_full = len(und_scoring) if und_scoring is not None else 0
+
+        # --- Fetch raw samples (once) or reuse cache, independently per modality ---
+        if gen_scoring is not None and cached_gen_samples is None:
+            cached_gen_samples = [gen_scoring[i] for i in range(N_gen_full)]
+        if und_scoring is not None and cached_und_samples is None:
+            cached_und_samples = [und_scoring[i] for i in range(N_und_full)]
+        assert (gen_scoring is not None) or (und_scoring is not None), (
+            "At least one of gen_scoring or und_scoring must be provided."
+        )
+
+        # --- Per-modality slices (no offsetting — each cache is self-indexed) ---
+        gs, ge = gen_slice if gen_slice is not None else (0, N_gen_full)
+        us, ue = und_slice if und_slice is not None else (0, N_und_full)
+        gen_selected = cached_gen_samples[gs:ge] if cached_gen_samples is not None else []
+        und_selected = cached_und_samples[us:ue] if cached_und_samples is not None else []
+
         collate_fn = MaskDataCollator(self.processing_class, self.args)
-        if isinstance(data_loader, DataLoader):
-            scoring_loader = data_loader
-        elif data_loader and torch.is_tensor(data_loader[0].get("input_ids")) and data_loader[0]["input_ids"].ndim == 1:
-            batch_size = len(data_loader) if single_batch_call else min(4, len(data_loader))
-            scoring_loader = DataLoader(
-                data_loader,
-                batch_size=batch_size,
-                shuffle=False,
-                collate_fn=collate_fn,
-            )
-        else:
-            scoring_loader = data_loader
-
-        all_logps: list[torch.Tensor] = []
-        all_masks: list[torch.Tensor] = []
-
+        # Hard-coded to 1 regardless of self._train_batch_size: the force-mask
+        # capture/replay path stores one mask per sample with sample-specific
+        # seq_len (different samples have different multimodal token counts),
+        # so it can't be trivially batch-stacked.  Forcing batch=1 here keeps
+        # _run_modality's per-sample lookup correct on every call site
+        # (old-pass, ref-pass, and current-policy pass inside _compute_loss),
+        # regardless of whether HF Trainer / TRL set ``self._train_batch_size``
+        # to something larger for their own reasons.  The throughput cost is
+        # small: LLaDA's forward is bottlenecked by activation memory, not
+        # launch overhead, and chunking is already per-sample on the call
+        # sites that matter.
+        scoring_batch_size = 1
         p_mask_prompt = float(getattr(self.args, "p_mask_prompt", 0.15))
-        for seed in mask_seeds:
-            seed_logps: list[torch.Tensor] = []
-            seed_masks: list[torch.Tensor] = []
-            for inputs in scoring_loader:
-                inputs = self._prepare_input(inputs)
-                labels = inputs["labels"]
+        device = self.accelerator.device
+        mdtype = model.dtype if hasattr(model, "dtype") else next(model.parameters()).dtype
 
-                forward_inputs = self._select_model_forward_kwargs(llada_model, inputs)
-                output = model.forward(
-                    **forward_inputs,
-                    mask_seeds=[int(seed)],
-                    p_mask_prompt=p_mask_prompt,
-                    temperature=self.temperature,
-                )
-
-                # Shape reference (SKIP_COMPLEMENTARY_MASKING=1, so no batch doubling):
-                #   gen_loss_none_reduction: (N_edit, latent_total)
-                #     N_edit = number of image-edit samples in this batch, in batch order.
-                #   und_loss_none_reduction: (B, L_text)
-                #     B = full batch size (edit + text samples).
-                #
-                # Edit-sample rows in und_loss_none are NOT all-zero: the
-                # <|reserved_token_126095|>/<|reserved_token_126096|> sentinels keep
-                # their token IDs as labels.  Use sample_is_image_edit for explicit routing.
-                gen_loss_none = output.get("gen_loss_none_reduction")  # (N_edit, latent_total) or None
-                und_loss_none = output.get("und_loss_none_reduction")  # (B, L_text)
-                is_edit: torch.Tensor = inputs.get("sample_is_image_edit")  # (B,) bool
-
-                batch_logps = None
-                batch_mask = None
-                if und_loss_none is None:
-                    pass  # no labels passed; skip
-                elif gen_loss_none is None or is_edit is None or not is_edit.any():
-                    # Text-only batch
-                    batch_logps = -und_loss_none  # (B, L_text)
-                    # The model's forward_process masked random completion positions;
-                    # F.cross_entropy returns >0 only at those positions (ignore_index=-100
-                    # yields exactly 0).  Track them explicitly so the mask survives
-                    # _pad_and_concat_logps zero-padding.
-                    batch_mask = (und_loss_none != 0).float()  # (B, L_text)
-                elif is_edit.all():
-                    # Image-edit-only batch
-                    batch_logps = -gen_loss_none  # (N_edit=B, latent_total)
-                    batch_mask = (gen_loss_none != 0).float()  # (N_edit, latent_total)
+        def _prepare_batch(batch: dict) -> dict:
+            """Move tensors to device, cast floats to model dtype, drop non-forward keys."""
+            prepared: dict = {}
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    v = v.to(device)
+                    if v.is_floating_point():
+                        v = v.to(dtype=mdtype)
+                    prepared[k] = v
+                elif isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
+                    prepared[k] = [
+                        t.to(device=device, dtype=mdtype) if t.is_floating_point() else t.to(device)
+                        for t in v
+                    ]
                 else:
-                    # Mixed batch: route each sample to its own loss source.
-                    # Zero-pad to a common length so the output is a rectangular tensor.
-                    B = und_loss_none.shape[0]
-                    L_text = und_loss_none.shape[-1]
-                    latent_total = gen_loss_none.shape[-1]
-                    max_len = max(L_text, latent_total)
-                    batch_logps = torch.zeros(
-                        B, max_len, dtype=und_loss_none.dtype, device=und_loss_none.device
+                    prepared[k] = v
+            # Pop keys that are not model.forward parameters. In the split
+            # scheme sample_is_image_edit is homogeneous within a batch
+            # (all-True for gen, all-False for und) and no longer needed for
+            # row filtering — each modality's forward directly returns the
+            # loss tensor covering every row of that batch.
+            prepared.pop("sample_is_image_edit", None)
+            prepared.pop("prompts", None)
+            # Force do_not_mask_text to always be absent (= None) during GRPO
+            # scoring forwards.  LlavaLladaForMaskedDiffusion.forward has a
+            # non-deterministic branch at llava_llada.py:353 that applies a
+            # 80% ``torch.rand_like`` gate to the per-sample do_not_mask_text
+            # flags using the global default RNG, not the seeded generator.
+            # Across the old-policy and current-policy passes this produces
+            # different final_masked_indices for the same (sample, mask_seed),
+            # which makes coef_1 = exp(curr - old) explode at masked positions.
+            # Popping the key here means the model's forward receives None,
+            # short-circuiting that branch and yielding deterministic masks.
+            prepared.pop("do_not_mask_text", None)
+            return prepared
+
+        def _run_modality(selected: list, modality: str, force_masks: list = None):
+            """Run model.forward over ``selected`` (all one modality, in order).
+
+            Row i of ``selected`` → row i of the concatenated per-seed output,
+            so index alignment with ``gen_scoring[gs:ge]`` / ``und_scoring[us:ue]``
+            is preserved by construction.
+
+            modality: "gen" (reads gen_loss_none_reduction) or
+                      "und" (reads und_loss_none_reduction).
+
+            force_masks: Optional[list[list[dict]]] indexed by
+                [seed_index_in_mask_seeds][sample_local_idx].  When provided,
+                the corresponding (text_mask, gen_mask) pair is forwarded to
+                ``model.forward`` as ``force_text_mask`` / ``force_gen_mask``
+                and bypasses the random-draw masking.
+
+            Returns:
+                per_seed_outputs: list[Tensor] — one tensor of shape
+                    (len(selected), D) per seed, or None if ``selected`` is
+                    empty.
+                captured_masks: list[list[dict]] — [seed_idx][sample_local_idx]
+                    of {"text_mask": CPU Tensor, "gen_mask": CPU Tensor | None},
+                    or None if ``selected`` is empty.
+
+            Assumption: ``scoring_batch_size == 1``.  The force-mask path
+            looks up one sample at a time, so a batch must contain exactly
+            one sample for per-sample force masks to be addressable.  This
+            assumption matches every call site in the trainer (old/ref pass
+            under no_grad, current pass under ``_compute_loss``).
+            """
+            if not selected:
+                return None, None
+
+            assert scoring_batch_size == 1, (
+                f"Force-mask capture/replay requires scoring_batch_size=1, "
+                f"got {scoring_batch_size}. Increase per-sample indexing to "
+                f"support batched masks if this changes."
+            )
+
+            # Micro-batch in order; with scoring_batch_size=1, batch_idx maps
+            # one-to-one to sample_local_idx inside ``selected``.
+            batches = []
+            for start in range(0, len(selected), scoring_batch_size):
+                batches.append(collate_fn(selected[start : start + scoring_batch_size]))
+
+            per_seed_outputs: list[torch.Tensor] = []
+            captured_masks_per_seed: list[list[dict]] = []
+            for seed_idx, seed in enumerate(mask_seeds):
+                per_batch_logps: list[torch.Tensor] = []
+                captured_masks: list[dict] = []
+                seed_force = force_masks[seed_idx] if force_masks is not None else None
+                for sample_local_idx, batch in enumerate(batches):
+                    prepared = _prepare_batch(batch)
+
+                    # Look up force masks for this (seed, sample).
+                    force_text_mask = None
+                    force_gen_mask = None
+                    if seed_force is not None:
+                        slot = seed_force[sample_local_idx]
+                        if slot is not None:
+                            t = slot.get("text_mask")
+                            g = slot.get("gen_mask")
+                            if t is not None:
+                                force_text_mask = t.to(device, non_blocking=True)
+                            if g is not None:
+                                force_gen_mask = g.to(device, non_blocking=True)
+
+                    output = model.forward(
+                        **prepared,
+                        mask_seeds=[int(seed)],
+                        p_mask_prompt=p_mask_prompt,
+                        temperature=self.temperature,
+                        force_text_mask=force_text_mask,
+                        force_gen_mask=force_gen_mask,
                     )
-                    batch_mask = torch.zeros(
-                        B, max_len, dtype=und_loss_none.dtype, device=und_loss_none.device
-                    )
-                    # Text samples
-                    batch_logps[~is_edit, :L_text] = -und_loss_none[~is_edit]
-                    batch_mask[~is_edit, :L_text] = (und_loss_none[~is_edit] != 0).float()
-                    # Edit samples
-                    batch_logps[is_edit, :latent_total] = -gen_loss_none
-                    batch_mask[is_edit, :latent_total] = (gen_loss_none != 0).float()
+                    if modality == "gen":
+                        # (batch_size, latent_total) — covers every (all-gen) row.
+                        loss_none = output.get("gen_loss_none_reduction")
+                        assert loss_none is not None, (
+                            "gen-only forward did not return gen_loss_none_reduction"
+                        )
+                    else:
+                        # (batch_size, L) — covers every (all-und) row.
+                        loss_none = output.get("und_loss_none_reduction")
+                        assert loss_none is not None, (
+                            "und-only forward did not return und_loss_none_reduction"
+                        )
+                    per_batch_logps.append(-loss_none)
 
-                if batch_logps is not None:
-                    seed_logps.append(batch_logps)
-                    seed_masks.append(batch_mask)
+                    # Capture the mask actually used in this forward so the
+                    # caller can replay it.  If force_masks was provided, the
+                    # model round-trips it unchanged, so the capture is still
+                    # a safe single source of truth for downstream calls.
+                    captured_text = output.get("final_masked_indices")
+                    captured_gen = output.get("masked_indices_gen") if modality == "gen" else None
+                    captured_masks.append({
+                        "text_mask": (
+                            captured_text.detach().to("cpu")
+                            if captured_text is not None else None
+                        ),
+                        "gen_mask": (
+                            captured_gen.detach().to("cpu")
+                            if captured_gen is not None else None
+                        ),
+                    })
+                # Concatenate batches along the sample dim, padding D to the
+                # per-seed max. Ordering within per_batch_logps matches
+                # ``selected`` → so is the row order after concatenation.
+                per_seed_outputs.append(self._pad_and_concat_logps(per_batch_logps))
+                captured_masks_per_seed.append(captured_masks)
+            return per_seed_outputs, captured_masks_per_seed
 
-            # _pad_and_concat_logps zero-pads all tensors to the same last dim before
-            # concatenating, so edit batches (latent_total) and text batches (L_text)
-            # can be combined when both types appear across DataLoader iterations.
-            # The mask is padded identically — padded positions stay 0 (non-completion).
-            all_logps.append(self._pad_and_concat_logps(seed_logps))  # (total_samples, max_seq_len)
-            all_masks.append(self._pad_and_concat_logps(seed_masks))
+        # Gen fully first, then und — each in its own forward loop.
+        all_gen_logps, captured_gen_masks = _run_modality(
+            gen_selected, "gen", force_masks=force_gen_masks,
+        )
+        all_und_logps, captured_und_masks = _run_modality(
+            und_selected, "und", force_masks=force_und_masks,
+        )
 
-        num_iterations = len(mask_seeds)
-        # Stack across seeds; pad seeds to the same last dim in case different seeds
-        # happen to produce different max-sequence-length batches.
-        completion_log_probs = self._pad_and_stack_logps(all_logps)  # (num_iterations, total_samples, max_seq_len)
-        completion_masks = self._pad_and_stack_logps(all_masks)
-        batch_size = completion_log_probs.shape[1]
-        return completion_log_probs, completion_masks  # both (num_iterations, batch_size, seq_len)
+        per_gen_logps = self._pad_and_stack_logps(all_gen_logps) if all_gen_logps else None
+        per_und_logps = self._pad_and_stack_logps(all_und_logps) if all_und_logps else None
+        # per_gen_logps: (len(mask_seeds), N_gen, latent_total)
+        # per_und_logps: (len(mask_seeds), N_und, L_text)
+        return (
+            per_gen_logps,
+            per_und_logps,
+            cached_gen_samples,
+            cached_und_samples,
+            captured_gen_masks,
+            captured_und_masks,
+        )
 
     @profiling_decorator
-    def _compute_modality_loss(
-        self, model, inputs: dict[str, Any], modality: str = "",
+    def _compute_loss(
+        self, model, inputs: dict[str, Any],
     ) -> torch.Tensor:
-        """Compute GRPO clipped loss for a single-modality mini-batch.
+        """Compute GRPO clipped loss for gen and/or und modalities.
 
         Args:
             model: the (possibly wrapped) model.
-            inputs: a single mini-batch dict with scoring_data_loader, advantages,
-                    completion_mask, old_per_token_logps, ref_per_token_logps, mask_seeds.
-            modality: prefix for metric keys (e.g. "gen", "und", or "" for single-modality).
+            inputs: dict with keys ``gen_batch``, ``und_batch``, ``mask_seeds``.
+                Each batch is ``[scoring, advantages, old_logps, ref_logps]`` or None.
+
+        Returns:
+            Scalar loss (gen_loss + und_loss).  Either component is 0 when its
+            batch is None.
         """
         beta = float(getattr(self.args, "beta", 0.0))
         epsilon = float(getattr(self.args, "epsilon", 0.0))
         num_iterations = int(getattr(self.args, "num_iterations", 1))
-        assert num_iterations > 1, "num_iterations must be greater than 1"
-        prefix = f"{modality}/" if modality else ""
 
-        mask_seeds = inputs["mask_seeds"]
-        this_itr_idx = self.state.global_step % num_iterations
+        gen_batch = inputs.get("gen_batch")  # [scoring, adv_sub, old_sub, ref_sub, (s,e)] or None
+        und_batch = inputs.get("und_batch")  # [scoring, adv_sub, old_sub, ref_sub, (s,e)] or None
+        mask_seeds = inputs["mask_seeds"]    # list[int], length = num_iterations
+        # Per-modality raw-sample caches (no longer a unified list — gen_slice /
+        # und_slice index directly into each).
+        cached_gen_samples = inputs.get("cached_gen_samples")
+        cached_und_samples = inputs.get("cached_und_samples")
+        # Per-modality per-(seed, sample) mask caches captured during the
+        # old-policy forward.  Shape: [num_iterations][N_full] of dicts with
+        # "text_mask" / "gen_mask" CPU tensors.
+        cached_gen_masks_full = inputs.get("cached_gen_masks")
+        cached_und_masks_full = inputs.get("cached_und_masks")
+        this_itr_idx = self._step % num_iterations
 
         current_mask_seed = mask_seeds[this_itr_idx]
         if torch.is_tensor(current_mask_seed):
             current_mask_seed = int(current_mask_seed.item())
 
         _t0_curr = time.perf_counter()
-        per_token_logps, per_token_mask = self._get_per_token_logps(model, inputs, [current_mask_seed])
-        per_token_logps = per_token_logps.squeeze(0)
-        per_token_mask = per_token_mask.squeeze(0)
-        if per_token_logps.ndim == 1:
-            per_token_logps = per_token_logps.unsqueeze(0)
-            per_token_mask = per_token_mask.unsqueeze(0)
 
-        old_per_token_logps = inputs["old_per_token_logps"][this_itr_idx]
-        ref_per_token_logps = inputs["ref_per_token_logps"][this_itr_idx] if beta != 0.0 else None
-        advantages = inputs["advantages"]
-        completion_mask = inputs.get("completion_mask", inputs.get("completion_masks"))
-        if completion_mask.ndim == 3:
-            completion_mask = completion_mask[this_itr_idx]
-        if completion_mask.ndim == 1:
-            completion_mask = completion_mask.unsqueeze(0)
-        completion_mask = completion_mask.float()
+        # ---- Unpack gen / und buffers ----
+        # Each batch is [full_scoring, adv_sub, old_sub, ref_sub, (chunk_start, chunk_end)].
+        # full_scoring is the complete (unsplit) dataset; (s, e) marks this chunk's slice.
+        if gen_batch is not None:
+            gen_scoring, gen_advantages, old_gen_logps, ref_gen_logps, gen_chunk_range = gen_batch
+        else:
+            gen_scoring, gen_advantages, old_gen_logps, ref_gen_logps, gen_chunk_range = None, None, None, None, None
+        if und_batch is not None:
+            und_scoring, und_advantages, old_und_logps, ref_und_logps, und_chunk_range = und_batch
+        else:
+            und_scoring, und_advantages, old_und_logps, ref_und_logps, und_chunk_range = None, None, None, None, None
 
-        seq_len = per_token_logps.shape[-1]
-        old_per_token_logps = old_per_token_logps[..., :seq_len]
-        if ref_per_token_logps is not None:
-            ref_per_token_logps = ref_per_token_logps[..., :seq_len]
-        completion_mask = completion_mask[..., :seq_len]
+        # ---- Current log-probs via model forward ----
+        # Reuse cached per-sample dicts AND the per-sample masks captured
+        # during the old-policy pass.  This gives us two guarantees:
+        #   (1) the cached samples ensure identical tokenization / padding
+        #       (the non-determinism of LazySupervisedDataset's random crops
+        #       and retries is sidestepped);
+        #   (2) the cached masks, passed back as force_*_masks, make the
+        #       model bypass its random-draw masking entirely so the current
+        #       forward sees bitwise-identical final_masked_indices and
+        #       masked_indices_gen to what the old forward used.
+        # Together these guarantee that on step 0 (identical weights) the
+        # current per_token_logps equals old_ptl exactly → coef_1 = 1.
+        #
+        # scoring_batch_size MUST be 1 in this path: the captured masks are
+        # stored per sample with sample-specific seq_len, so they can't be
+        # trivially batch-stacked (different samples would need different
+        # padding).  The force-mask path in _run_modality asserts this.
+        #
+        # Slice the full [num_iterations][N_full] mask caches down to just
+        # the current iteration and the current chunk.  We call
+        # _get_per_token_logps with mask_seeds=[current_mask_seed] (length 1),
+        # so the outer list of force_*_masks has length 1.
+        def _slice_masks(masks_full, chunk_range):
+            if masks_full is None or chunk_range is None:
+                return None
+            s, e = chunk_range
+            return [masks_full[this_itr_idx][s:e]]
 
-        per_token_mask = per_token_mask[..., :seq_len]
-        completion_mask = completion_mask * per_token_mask
-        per_token_logps = per_token_logps * completion_mask
-        old_per_token_logps = old_per_token_logps * completion_mask
-        if ref_per_token_logps is not None:
-            ref_per_token_logps = ref_per_token_logps * completion_mask
+        force_gen_masks = _slice_masks(cached_gen_masks_full, gen_chunk_range)
+        force_und_masks = _slice_masks(cached_und_masks_full, und_chunk_range)
 
-        coef_1 = torch.exp(per_token_logps - old_per_token_logps)
-        coef_2 = torch.clamp(coef_1, 1 - epsilon, 1 + epsilon)
-        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
-        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        # _get_per_token_logps now hard-codes scoring_batch_size=1 internally
+        # (required by the force-mask plumbing), so no need to override
+        # self._train_batch_size here.
+        gen_logps, und_logps, _, _, _, _ = self._get_per_token_logps(
+            model, gen_scoring=gen_scoring, und_scoring=und_scoring,
+            mask_seeds=[current_mask_seed],
+            cached_gen_samples=cached_gen_samples,
+            cached_und_samples=cached_und_samples,
+            force_gen_masks=force_gen_masks,
+            force_und_masks=force_und_masks,
+            gen_slice=gen_chunk_range,
+            und_slice=und_chunk_range,
+        )
+        # Squeeze the seed dimension (we only have one seed here).
+        if gen_logps is not None:
+            gen_logps = gen_logps[0]   # (chunk_size, latent_total)
+        if und_logps is not None:
+            und_logps = und_logps[0]   # (chunk_size, L_text)
 
-        if beta != 0.0:
-            log_ratio = ref_per_token_logps - per_token_logps
-            per_token_kl = torch.exp(log_ratio) - log_ratio - 1
-
-            _rank = self.accelerator.process_index
-            _has_bad_kl = per_token_kl.isinf().any() or per_token_kl.isnan().any()
-            _has_bad_loss_inputs = (
-                per_token_logps.isnan().any() or per_token_logps.isinf().any()
-                or ref_per_token_logps.isnan().any() or ref_per_token_logps.isinf().any()
-                or old_per_token_logps.isnan().any() or old_per_token_logps.isinf().any()
-            )
-            _log_kl_diag = (self.state.global_step % 50 == 0) or _has_bad_kl or _has_bad_loss_inputs
-            if _log_kl_diag:
-                _cm = completion_mask.bool()
-                print(
-                    f"[KL-diag {modality} rank={_rank} step={self.state.global_step}] "
-                    f"shapes: curr={tuple(per_token_logps.shape)} old={tuple(old_per_token_logps.shape)} "
-                    f"ref={tuple(ref_per_token_logps.shape)} mask={tuple(completion_mask.shape)} | "
-                    f"mask_sum={completion_mask.sum().item():.0f} total_elems={completion_mask.numel()} | "
-                    f"kl_inf={per_token_kl.isinf().sum().item()} kl_nan={per_token_kl.isnan().sum().item()} | "
-                    f"curr_inf={per_token_logps.isinf().sum().item()} ref_inf={ref_per_token_logps.isinf().sum().item()} "
-                    f"old_inf={old_per_token_logps.isinf().sum().item()}"
-                )
-            if _has_bad_kl or _has_bad_loss_inputs:
-                _bad_pos = (per_token_kl.isinf() | per_token_kl.isnan()).nonzero(as_tuple=False)
-                _n_show = min(10, _bad_pos.shape[0])
-                for _i in range(_n_show):
-                    _idx = tuple(_bad_pos[_i].tolist())
-                    print(
-                        f"  [BAD KL {modality} rank={_rank} pos={_idx}] "
-                        f"kl={per_token_kl[_idx].item():.6g} "
-                        f"log_ratio={log_ratio[_idx].item():.6g} "
-                        f"curr={per_token_logps[_idx].item():.6g} "
-                        f"ref={ref_per_token_logps[_idx].item():.6g} "
-                        f"old={old_per_token_logps[_idx].item():.6g} "
-                        f"mask={completion_mask[_idx].item():.0f} "
-                        f"per_token_mask={per_token_mask[_idx].item():.0f}"
-                    )
-                _outside_mask = ~_cm
-                print(
-                    f"  [LEAK CHECK {modality} rank={_rank}] nonzero outside mask: "
-                    f"curr={( per_token_logps[_outside_mask] != 0).sum().item()} "
-                    f"ref={( ref_per_token_logps[_outside_mask] != 0).sum().item()} "
-                    f"old={( old_per_token_logps[_outside_mask] != 0).sum().item()}"
-                )
-            per_token_loss = per_token_loss + beta * per_token_kl
-
-        denom = completion_mask.sum().clamp_min(1.0)
-        loss = (per_token_loss * completion_mask).sum() / denom
         mode = "train" if self.model.training else "eval"
-
-        if beta != 0.0:
-            mean_kl = ((per_token_kl * completion_mask).sum() / denom).detach()
-            gathered_kl = self.accelerator.gather_for_metrics(mean_kl)
-            if gathered_kl.isnan().any():
-                _nan_ranks = gathered_kl.isnan().nonzero(as_tuple=False).flatten().tolist()
-                print(
-                    f"[KL-NaN GATHERED {modality} rank={self.accelerator.process_index} "
-                    f"step={self.state.global_step}] "
-                    f"mean_kl={mean_kl.item():.6g} gathered={gathered_kl.tolist()} "
-                    f"nan_from_ranks={_nan_ranks} loss={loss.item():.6g}"
-                )
-            self._metrics[mode][f"{prefix}kl"].append(gathered_kl.mean().item())
-
         epsilon_low = self.epsilon_low if hasattr(self, "epsilon_low") else epsilon
         epsilon_high = self.epsilon_high if hasattr(self, "epsilon_high") else epsilon
-        is_low_clipped = (coef_1 < 1 - epsilon_low) & (advantages.unsqueeze(1) < 0)
-        is_high_clipped = (coef_1 > 1 + epsilon_high) & (advantages.unsqueeze(1) > 0)
-        is_region_clipped = is_low_clipped | is_high_clipped
 
-        low_clip = ((is_low_clipped.float() * completion_mask).sum() / denom).detach()
-        high_clip = ((is_high_clipped.float() * completion_mask).sum() / denom).detach()
-        clip_ratio = ((is_region_clipped.float() * completion_mask).sum() / denom).detach()
+        # ---- Helper: GRPO clipped loss for one modality ----
+        def _grpo_loss(per_token_logps, old_logps_all, ref_logps_all, advantages, prefix):
+            """Returns scalar loss for a single modality, or None."""
+            if per_token_logps is None:
+                return None
 
-        gathered_low_clip = self.accelerator.gather_for_metrics(low_clip)
-        self._metrics[mode][f"{prefix}clip_ratio/low_mean"].append(gathered_low_clip.nanmean().item())
-        self._metrics[mode][f"{prefix}clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
-        gathered_high_clip = self.accelerator.gather_for_metrics(high_clip)
-        self._metrics[mode][f"{prefix}clip_ratio/high_mean"].append(gathered_high_clip.nanmean().item())
-        self._metrics[mode][f"{prefix}clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
-        gathered_clip_ratio = self.accelerator.gather_for_metrics(clip_ratio)
-        self._metrics[mode][f"{prefix}clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
+            old_ptl = old_logps_all[this_itr_idx]  # (N, D_old)
+            ref_ptl = ref_logps_all[this_itr_idx] if (beta != 0.0 and ref_logps_all is not None) else None
+
+            # old/ref logps may live on CPU (offloaded in _generate_and_score_completions
+            # to free GPU memory during backward across gradient accumulation steps).
+            # Bring only the current iteration's slice back to the device, non-blocking
+            # so the copy overlaps with the current-policy forward.
+            target_device = per_token_logps.device
+            if old_ptl.device != target_device:
+                old_ptl = old_ptl.to(target_device, non_blocking=True)
+            if ref_ptl is not None and ref_ptl.device != target_device:
+                ref_ptl = ref_ptl.to(target_device, non_blocking=True)
+
+            # Align all log-prob tensors to a common sequence length.
+            # Old/ref logps were collated from the full dataset (longer max seq);
+            # current logps from just this chunk (shorter max seq).  The
+            # underlying samples are identical (cached), so zero-padding is
+            # safe — completion_mask zeroes out all padded positions.
+            target_D = max(
+                per_token_logps.shape[-1],
+                old_ptl.shape[-1],
+                ref_ptl.shape[-1] if ref_ptl is not None else 0,
+            )
+            def _pad_to(t, D):
+                d = D - t.shape[-1]
+                return torch.nn.functional.pad(t, (0, d)) if d > 0 else t
+
+            per_token_logps = _pad_to(per_token_logps, target_D)
+            old_ptl = _pad_to(old_ptl, target_D)
+            if ref_ptl is not None:
+                ref_ptl = _pad_to(ref_ptl, target_D)
+
+            # ---- Fix E: Step-0 determinism assertion ----
+            # On step 0, model weights are identical between the old-policy
+            # pass and the current-policy pass, so per_token_logps and old_ptl
+            # MUST be bitwise-identical at every position where old masked
+            # (i.e. wherever old_ptl != 0).  Any divergence means one of the
+            # non-determinism sources we tried to kill is still leaking
+            # through: dropout, do_not_mask_text RNG, scoring_batch_size
+            # mismatch between old and current, or force-mask plumbing bug.
+            #
+            # We run this only on step 0 (cheap, one-shot) so the assertion
+            # has no steady-state cost.  Gated by an env var so it can be
+            # turned off in production if it ever becomes a nuisance.
+            if (
+                os.environ.get("DIFFU_GRPO_STEP0_ASSERT", "1") == "1"
+                and int(getattr(self.state, "global_step", 0)) == 0
+                and self._step % num_iterations == this_itr_idx  # first iter of step 0
+            ):
+                with torch.no_grad():
+                    masked = (old_ptl != 0)
+                    if masked.any():
+                        diff_at_masked = (
+                            per_token_logps.detach() - old_ptl.detach()
+                        )[masked].abs()
+                        max_diff = float(diff_at_masked.max().item())
+                        mean_diff = float(diff_at_masked.mean().item())
+                        # bf16 has ~8 bits of mantissa → eps ~3e-3. Allow a
+                        # generous tolerance so we only fire on real drift.
+                        tol = 5e-2
+                        if max_diff > tol:
+                            msg = (
+                                f"[{prefix}step-0 determinism check] "
+                                f"|current - old|@masked: max={max_diff:.4e}, "
+                                f"mean={mean_diff:.4e} (tol={tol:.0e}). "
+                                f"Non-determinism is leaking through: check "
+                                f"dropout, do_not_mask_text, force-mask "
+                                f"plumbing, or scoring_batch_size."
+                            )
+                            if os.environ.get("DIFFU_GRPO_STEP0_STRICT", "0") == "1":
+                                raise AssertionError(msg)
+                            else:
+                                print("[WARN]", msg, flush=True)
+
+            coef_1 = torch.exp(per_token_logps - old_ptl)
+            coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
+            per_token_loss1 = coef_1 * advantages.unsqueeze(1)
+            per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+            per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+
+            if ref_ptl is not None:
+                log_ratio = ref_ptl - per_token_logps
+                per_token_kl = torch.exp(log_ratio) - log_ratio - 1
+                per_token_loss = per_token_loss + beta * per_token_kl
+            else:
+                per_token_kl = None
+
+            # Use non-zero (non-padding) positions as the completion mask.
+            # For gen: masked latent positions have non-zero loss from gen_loss_none_reduction.
+            # For und: masked text positions have non-zero loss from und_loss_none_reduction.
+            # Positions that were not masked during the forward pass have zero log-prob,
+            # so they contribute nothing and can be safely included in the denominator.
+            completion_mask = (old_ptl != 0).float()
+            denom = completion_mask.sum().clamp(min=1.0)
+            loss = (per_token_loss * completion_mask).sum() / denom
+
+            # ---- Metrics ----
+            if per_token_kl is not None:
+                mean_kl = ((per_token_kl * completion_mask).sum() / denom)
+                self._metrics[mode][f"{prefix}kl"].append(
+                    self.accelerator.gather_for_metrics(mean_kl).nanmean().item()
+                )
+
+            is_low_clipped = (coef_1 < 1 - epsilon_low) & (advantages.unsqueeze(1) < 0)
+            is_high_clipped = (coef_1 > 1 + epsilon_high) & (advantages.unsqueeze(1) > 0)
+            is_region_clipped = is_low_clipped | is_high_clipped
+
+            low_clip = ((is_low_clipped.float() * completion_mask).sum() / denom).detach()
+            high_clip = ((is_high_clipped.float() * completion_mask).sum() / denom).detach()
+            clip_ratio = ((is_region_clipped.float() * completion_mask).sum() / denom).detach()
+
+            self._metrics[mode][f"{prefix}clip_ratio/low_mean"].append(
+                self.accelerator.gather_for_metrics(low_clip).nanmean().item()
+            )
+            self._metrics[mode][f"{prefix}clip_ratio/high_mean"].append(
+                self.accelerator.gather_for_metrics(high_clip).nanmean().item()
+            )
+            self._metrics[mode][f"{prefix}clip_ratio/region_mean"].append(
+                self.accelerator.gather_for_metrics(clip_ratio).nanmean().item()
+            )
+            return loss
+
+        # ---- Compute gen / und losses independently ----
+        gen_loss = _grpo_loss(gen_logps, old_gen_logps, ref_gen_logps, gen_advantages, "gen/")
+        und_loss = _grpo_loss(und_logps, old_und_logps, ref_und_logps, und_advantages, "und/")
+
+        # ---- Combine ----
+        if gen_loss is not None and und_loss is not None:
+            loss = gen_loss + und_loss
+        elif gen_loss is not None:
+            loss = gen_loss
+        elif und_loss is not None:
+            loss = und_loss
+        else:
+            raise ValueError("Both gen_batch and und_batch are None — nothing to train on.")
+
+        if gen_loss is not None:
+            self._metrics[mode]["gen/loss"].append(gen_loss.detach().item())
+        if und_loss is not None:
+            self._metrics[mode]["und/loss"].append(und_loss.detach().item())
 
         torch.cuda.synchronize() if torch.cuda.is_available() else None
         _elapsed_curr = time.perf_counter() - _t0_curr
-        self._metrics[mode][f"{prefix}time_profile/curr_logprobs_and_update"].append(_elapsed_curr)
-
+        self._metrics[mode]["time_profile/curr_logprobs_and_update"].append(_elapsed_curr)
+        self._wandb_log_metrics()
         return loss
 
     def _wandb_log_metrics(self):
         """Average self._metrics and log to wandb every ``logging_steps``."""
         if not self.accelerator.is_main_process:
             return
-        if self.state.global_step % self.args.logging_steps != 0:
+        if wandb.run is None:
             return
 
         mode = "train" if self.model.training else "eval"
@@ -1466,416 +1773,120 @@ class DiffuGRPOTrainer(GRPOTrainer):
 
         if mode == "eval":
             averaged = {f"eval_{k}": v for k, v in averaged.items()}
-
         logs = {k: v for k, v in averaged.items() if v is not None}
+        
+        
         if logs:
-            wandb.log({**logs, "train/global_step": self.state.global_step})
+            wandb.log({**logs, "train/gen_step": self._step, "train/global_step": self.state.global_step})
 
         raw.clear()
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """Single-modality compute_loss (used when no und_dataset is configured)."""
-        if return_outputs:
-            raise ValueError("The GRPOTrainer does not support returning outputs")
-        loss = self._compute_modality_loss(model, inputs)
-        return loss
+    @staticmethod
+    def _split_modality_batch(batch, num_chunks):
+        """Split [scoring, advantages, old_logps, ref_logps] into ``num_chunks`` micro-batches.
 
-    def training_step(
-        self,
-        model: nn.Module,
-        inputs: dict[str, Union[torch.Tensor, Any]],
-        num_items_in_batch: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Override HF Trainer's training_step to support dual-modality backward passes.
+        scoring is a LazySupervisedDataset — NOT split (kept as-is in every chunk)
+        so that _compute_loss always re-collates from the full dataset using the
+        same cached batches, ensuring identical padding/sequence lengths.
+        advantages is (N,) → chunk along dim 0.
+        old_logps is (num_iterations, N, D) → chunk along dim 1.
+        ref_logps is (num_iterations, N, D) or None → same.
 
-        For single-modality (no und_dataset), falls back to the default Trainer behaviour.
-        For dual-modality (interleave), performs two separate forward+backward passes
-        (gen then und) so that each rank activates the same parameter subsets in the
-        same order — preventing DeepSpeed ZeRO-2 NCCL deadlocks.
+        Returns a list of ``num_chunks`` lists, each
+        [scoring, adv_sub, old_sub, ref_sub, (chunk_start, chunk_end)].
         """
-        time_before = time.perf_counter()
-        model.train()
-        if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
-            self.optimizer.train()
-
-        inputs = self._prepare_inputs(inputs)
-
-        # --- Single-modality path: delegate to default Trainer ---
-        if "gen_batch" not in inputs:
-            with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
-            del inputs
-
-            kwargs = {}
-            if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
-                kwargs["scale_wrt_gas"] = False
-            self.accelerator.backward(loss, **kwargs)
-            self._wandb_log_metrics()
-            return loss.detach()
-
-        # --- Dual-modality path: separate gen + und backward ---
-        gen_batch = inputs["gen_batch"]
-        und_batch = inputs["und_batch"]
-        del inputs
-
-        kwargs = {}
-        from accelerate.utils import DistributedType
-        if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
-            kwargs["scale_wrt_gas"] = False
-
-        # Generation branch forward + backward
-        with self.compute_loss_context_manager():
-            gen_loss = self._compute_modality_loss(model, gen_batch, modality="gen")
-        self.accelerator.backward(gen_loss, **kwargs)
-
-        # Understanding branch forward + backward
-        with self.compute_loss_context_manager():
-            und_loss = self._compute_modality_loss(model, und_batch, modality="und")
-        self.accelerator.backward(und_loss, **kwargs)
-
-        self._step += 1
-        time_after = time.perf_counter()
-        self._current_train_step_time += time_after - time_before
-        if self._step % self.current_gradient_accumulation_steps == 0:
-            self._metrics["train"]["step_time"].append(self._current_train_step_time)
-            self._current_train_step_time = 0.0
-
-        self._wandb_log_metrics()
-
-        return (gen_loss + und_loss).detach()
+        if batch is None:
+            return [None] * num_chunks
+        scoring, advantages, old_logps, ref_logps = batch
+        N = len(scoring)
+        chunk_size = N // num_chunks
+        assert chunk_size * num_chunks == N, (
+            f"Cannot evenly split {N} samples into {num_chunks} micro-batches"
+        )
+        chunks = []
+        for i in range(num_chunks):
+            s, e = i * chunk_size, (i + 1) * chunk_size
+            adv_sub = advantages[s:e]
+            old_sub = old_logps[:, s:e] if old_logps is not None else None
+            ref_sub = ref_logps[:, s:e] if ref_logps is not None else None
+            chunks.append([scoring, adv_sub, old_sub, ref_sub, (s, e)])
+        return chunks
 
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         mode = "eval" if self.control.should_evaluate else "train"
-        num_iterations = int(getattr(self.args, "num_iterations", 1))
 
-        # --- Single-modality path (no und dataset) ---
-        if self._und_dataloader is None:
-            if mode == "train":
-                generate_every = self.args.steps_per_generation * num_iterations
-                if self._step % generate_every == 0 or self._buffered_inputs is None:
-                    self._buffered_inputs = self._generate_and_score_completions(inputs)
-                slot = self._step % len(self._buffered_inputs)
-                result = self._buffered_inputs[slot]
-                self._step += 1
-                return result
-            else:
-                batches = self._generate_and_score_completions(inputs)
-                return batches[0] if batches else inputs
-
-        # --- Dual-modality path (gen + und) ---
         if mode == "train":
-            generate_every = self.args.steps_per_generation * num_iterations
-            if self._step % generate_every == 0 or self._gen_buffered_inputs[0] is None:
-                # Draw und batch from separate DataLoader.
-                try:
-                    und_inputs = next(self._und_iter)
-                except StopIteration:
-                    self._und_iter = iter(self._und_dataloader)
-                    und_inputs = next(self._und_iter)
-                self._gen_buffered_inputs, self._und_buffered_inputs = \
-                    self._generate_and_score_completions_dual(inputs, und_inputs)
-            slot = self._step % len(self._gen_buffered_inputs)
-            result = {
-                "gen_batch": self._gen_buffered_inputs[slot],
-                "und_batch": self._und_buffered_inputs[slot],
-            }
+            generate_every = self.args.steps_per_generation * self.num_iterations
+            if self._step % generate_every == 0 or self._buffered_inputs is None:
+                # `inputs` is the full generation batch from the dataloader
+                # (per_device_train_batch_size * steps_per_generation samples).
+                gen_inputs = inputs
+
+                # Draw the corresponding und batch.
+                und_inputs = next(self._und_iter) if self._und_iter is not None else None
+
+                gen_and_score = self._generate_and_score_completions(
+                    gen_inputs=gen_inputs, und_inputs=und_inputs,
+                )
+                # gen_and_score = {
+                #   "gen": [gen_scoring, gen_advantages, old_gen_logps, ref_gen_logps] or None,
+                #   "und": [und_scoring, und_advantages, old_und_logps, ref_und_logps] or None,
+                #   "mask_seeds": list[int],
+                # }
+
+                # Split into steps_per_generation micro-batches for gradient accumulation.
+                n_chunks = self.args.steps_per_generation
+                gen_chunks = self._split_modality_batch(gen_and_score["gen"], n_chunks)
+                und_chunks = self._split_modality_batch(gen_and_score["und"], n_chunks)
+                mask_seeds = gen_and_score["mask_seeds"]
+                cached_gen_samples = gen_and_score["cached_gen_samples"]
+                cached_und_samples = gen_and_score["cached_und_samples"]
+                cached_gen_masks = gen_and_score["cached_gen_masks"]
+                cached_und_masks = gen_and_score["cached_und_masks"]
+
+                self._buffered_inputs = [
+                    {
+                        "gen_batch": gen_chunks[i],
+                        "und_batch": und_chunks[i],
+                        "mask_seeds": mask_seeds,
+                        "cached_gen_samples": cached_gen_samples,
+                        "cached_und_samples": cached_und_samples,
+                        # Full [num_iterations][N_full] per-sample mask caches.
+                        # Sliced inside _compute_loss to the chunk's samples
+                        # and current iteration before being passed back into
+                        # the model as force masks.
+                        "cached_gen_masks": cached_gen_masks,
+                        "cached_und_masks": cached_und_masks,
+                    }
+                    for i in range(n_chunks)
+                ]
+
+            result = self._buffered_inputs[self._step % self.args.steps_per_generation]
             self._step += 1
             return result
         else:
-            batches = self._generate_and_score_completions(inputs)
-            return batches[0] if batches else inputs
+            gen_and_score = self._generate_and_score_completions(gen_inputs=inputs)
+            # Append None chunk_range to match the 5-element format from _split_modality_batch.
+            gen_b = gen_and_score.get("gen")
+            und_b = gen_and_score.get("und")
+            if gen_b is not None:
+                gen_b = gen_b + [None]  # [scoring, adv, old, ref, None]
+            if und_b is not None:
+                und_b = und_b + [None]
+            return {
+                "gen_batch": gen_b,
+                "und_batch": und_b,
+                "mask_seeds": gen_and_score["mask_seeds"],
+                "cached_gen_samples": gen_and_score["cached_gen_samples"],
+                "cached_und_samples": gen_and_score["cached_und_samples"],
+                "cached_gen_masks": gen_and_score["cached_gen_masks"],
+                "cached_und_masks": gen_and_score["cached_und_masks"],
+            }
 
     def _generate_and_score_completions(
-        self, inputs: dict[str, Union[torch.Tensor, Any]]
+        self, gen_inputs: dict[str, Union[torch.Tensor, Any]] = None, und_inputs: dict[str, Union[torch.Tensor, Any]] = None
     ) -> dict[str, Union[torch.Tensor, Any]]:
-        device = self.accelerator.device
-        beta = float(getattr(self.args, "beta", 0.0))
-        num_iterations = int(getattr(self.args, "num_iterations", 1))
-        prompts = [x["prompt"] for x in inputs]
-        sample_modes = [x.get("task_type", "text") for x in inputs]
-        image_contexts = [None] * len(inputs)
-        answer_contexts = [None] * len(inputs)
-        mode = "eval" if self.control.should_evaluate else "train"
-        _timings: dict[str, float] = {}
-
-        with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
-            image_edit_indices = [idx for idx, mode in enumerate(sample_modes) if mode == "image_edit"]
-            image_edit_batch_size = max(1, int(getattr(self.args, "image_edit_batch_size", 1)))
-            with _timer(_timings, "image_rollout"):
-                for start_idx in trange(0, len(image_edit_indices), image_edit_batch_size, desc="Image Rollout"):
-                    batch_indices = image_edit_indices[start_idx : start_idx + image_edit_batch_size]
-                    batch_examples = [inputs[idx] for idx in batch_indices]
-                    _, batch_contexts = self._rollout_image_edit_latents(unwrapped_model, batch_examples)
-                    for batch_offset, sample_idx in enumerate(batch_indices):
-                        image_contexts[sample_idx] = batch_contexts[batch_offset]
-            image_processor = self._get_image_processor(unwrapped_model)
-            text_indices = [idx for idx, sample_mode in enumerate(sample_modes) if sample_mode != "image_edit"]
-            text_batch_size = 4
-            prefix_lm = bool(getattr(self.args, "prefix_lm", True))
-            generation_kwargs = {
-                "max_new_tokens": int(self.args.max_completion_length),
-                "block_length": int(min(self.args.block_length, self.args.max_completion_length)),
-                "step_per_block": self.args.text_rollout_step_per_block
-                if self.args.text_rollout_step_per_block is not None
-                else int(min(self.args.block_length, self.args.max_completion_length)),
-                "temperature": float(self.args.temperature),
-                "do_sample": bool(self.args.text_rollout_do_sample),
-                "prefix_lm": prefix_lm,
-                "use_fast_dlm": False,
-                "remasking": self.args.remasking,
-                "cfg_scale": self.args.cfg_scale,
-            }
-            generation_kwargs = {k: v for k, v in generation_kwargs.items() if v is not None}
-            with _timer(_timings, "text_rollout"):
-                for start_idx in trange(0, len(text_indices), text_batch_size, desc="Text Rollout"):
-                    batch_indices = text_indices[start_idx : start_idx + text_batch_size]
-                    batch_examples = [inputs[idx] for idx in batch_indices]
-                    _, batch_contexts = self._rollout_multimodal_text_gen(
-                        unwrapped_model,
-                        batch_examples,
-                        image_processor,
-                        generation_kwargs,
-                        device,
-                    )
-                    for batch_offset, sample_idx in enumerate(batch_indices):
-                        answer_contexts[sample_idx] = batch_contexts[batch_offset]
-
-            scoring_examples = []
-            image_data_list = [
-                image_context["payload"]
-                for image_context in image_contexts
-                if image_context is not None
-            ]
-            text_data_list = [
-                answer_context["payload"]
-                for answer_context in answer_contexts
-                if answer_context is not None
-            ]
-            collate_fn = MaskDataCollator(self.processing_class, self.args)
-            dataset_args = self._build_lazy_supervised_data_args(unwrapped_model, image_processor)
-            # Build typed item lists separately so we can interleave them.
-            typed_items: list[list[dict]] = []
-            global_idx = 0
-            for data_list in (image_data_list, text_data_list):
-                if not data_list:
-                    typed_items.append([])
-                    continue
-                dataset = LazySupervisedDataset(
-                    tokenizer=self.processing_class,
-                    data_args=dataset_args,
-                    list_data=data_list,
-                )
-                items = []
-                for idx in range(len(dataset)):
-                    items.append({**dataset[idx], "_sample_idx": global_idx})
-                    global_idx += 1
-                typed_items.append(items)
-            # Interleave image-edit and text items round-robin so that every
-            # DataLoader mini-batch (and especially the *last* one used for
-            # gradient accumulation) activates both generation and understanding
-            # parameters.  This prevents DeepSpeed ZeRO-2 reduce-scatter
-            # deadlocks caused by unused-parameter backward hooks.
-            image_items, text_items = typed_items
-            interleaved: list[dict] = []
-            ii, ti = 0, 0
-            while ii < len(image_items) or ti < len(text_items):
-                if ii < len(image_items):
-                    interleaved.append(image_items[ii]); ii += 1
-                if ti < len(text_items):
-                    interleaved.append(text_items[ti]); ti += 1
-            scoring_examples = interleaved
-            if not scoring_examples:
-                raise ValueError("No scored batches were built from generated completions.")
-        mask_seeds = torch.randint(0, 2**12, (num_iterations,), device=device)
-
-        mask_seed_list = mask_seeds.detach().cpu().tolist() if torch.is_tensor(mask_seeds) else list(mask_seeds)
-        with torch.no_grad():
-            with _timer(_timings, "old_logprobs"):
-                old_per_token_logps, completion_masks = self._get_per_token_logps(
-                    self.model,
-                    scoring_examples,
-                    mask_seed_list,
-                )
-                # Zero out non-completion positions so all downstream math (ratio, KL,
-                # loss) only ever sees real log-probs at completion positions and exact
-                # zeros elsewhere.  completion_masks is built alongside the logps inside
-                # _get_per_token_logps, so it tracks the same routing and padding.
-                old_per_token_logps = old_per_token_logps * completion_masks
-            ref_per_token_logps = None
-            if beta != 0.0:
-                with _timer(_timings, "ref_logprobs"):
-                    if getattr(self, "ref_model", None) is not None:
-                        ref_per_token_logps, _ = self._get_per_token_logps(
-                            self.ref_model, scoring_examples, mask_seed_list
-                        )
-                    else:
-                        unwrapped = self.accelerator.unwrap_model(self.model)
-                        if hasattr(unwrapped, "disable_adapter"):
-                            with unwrapped.disable_adapter():
-                                ref_per_token_logps, _ = self._get_per_token_logps(
-                                    self.model, scoring_examples, mask_seed_list
-                                )
-                        else:
-                            ref_per_token_logps, _ = self._get_per_token_logps(
-                                self.model, scoring_examples, mask_seed_list
-                            )
-                    ref_per_token_logps = ref_per_token_logps * completion_masks
-
-        with _timer(_timings, "reward"):
-            reward_specs = [
-                (
-                    [example for example, image_context in zip(inputs, image_contexts) if image_context is not None],
-                    [image_context["prompt"] for image_context in image_contexts if image_context is not None],
-                    [image_context["decoded_image"] for image_context in image_contexts if image_context is not None],
-                    [perceptual_score_reward_func],
-                ),
-                (
-                    [example for example, answer_context in zip(inputs, answer_contexts) if answer_context is not None],
-                    [answer_context["prompt"] for answer_context in answer_contexts if answer_context is not None],
-                    [
-                        [{"role": "assistant", "content": answer_context["decoded_text"]}]
-                        for answer_context in answer_contexts
-                        if answer_context is not None
-                    ],
-                    [strict_format_reward_func, correctness_reward_func],
-                ),
-            ]
-            local_rewards = []
-            for reward_inputs, branch_prompts, branch_completions, reward_fns in reward_specs:
-                n_branch = len(branch_completions) if branch_completions else 0
-                rewards_per_func = torch.zeros(n_branch, len(reward_fns), device=device)
-                if branch_completions:
-                    for i, reward_func in enumerate(reward_fns):
-                        if isinstance(reward_func, nn.Module):
-                            reward_func_name = f"reward {reward_func.config._name_or_path.split('/')[-1]}"
-                        else:
-                            reward_func_name = reward_func.__name__
-                        with profiling_context(self, reward_func_name):
-                            keys = [key for key in reward_inputs[0] if key not in ["prompt", "completion"]]
-                            reward_kwargs = {key: [example.get(key) for example in reward_inputs] for key in keys}
-                            if reward_func_name == "coding_reward_func":
-                                reward_kwargs["cwd_path"] = os.path.join(self.args.output_dir, "execution_files")
-                            try:
-                                output_reward_func = reward_func(
-                                    prompts=branch_prompts,
-                                    completions=branch_completions,
-                                    step=self._step,
-                                    run_name=self.args.output_dir,
-                                    **reward_kwargs,
-                                )
-                            except Exception:
-                                output_reward_func = [torch.nan for _ in branch_completions]
-                            output_reward_func = [
-                                reward if reward is not None else torch.nan for reward in output_reward_func
-                            ]
-                            rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
-
-                    
-                    
-                    for i, reward_func in enumerate(reward_fns):
-                        if isinstance(reward_func, nn.Module):
-                            reward_func_name = reward_func.config._name_or_path.split("/")[-1]
-                        else:
-                            reward_func_name = reward_func.__name__
-                        
-                        mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
-                        std_rewards = nanstd(rewards_per_func[:, i]).item()
-                        self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
-                        self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_rewards)
-                    local_rewards.append(rewards_per_func.nansum(dim=1))
-
-        if not local_rewards:
-            raise ValueError("No rewards were produced for generated completions.")
-
-        rewards = torch.cat(local_rewards, dim=0)
-        local_n = rewards.size(0)
-        rewards = gather(rewards)
-
-        # Compute grouped-wise rewards
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
-
-        # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = rewards - mean_grouped_rewards
-
-        # Count prompts with zero std deviation
-        zero_std_count = (std_grouped_rewards < 1e-6).sum().item()  # Using a small threshold
-        total_prompts = std_grouped_rewards.size(0)
-        zero_std_ratio = zero_std_count / total_prompts if total_prompts > 0 else 0.0
-
-        process_slice = slice(
-            self.accelerator.process_index * local_num_prompts,
-            (self.accelerator.process_index + 1) * local_num_prompts,
-        )
-        advantages = advantages[process_slice]
-
-        # Log the metrics
-        completion_length = self.accelerator.gather_for_metrics(completion_masks.float().sum(-1).mean(dim=0)).float().mean().item()
-        self._metrics[mode]["completion_length"].append(completion_length)
-        self._metrics[mode]["zero_std_ratio"].append(zero_std_ratio)
-        self._metrics[mode]["completion_length"].append(completion_length)
-        self._metrics[mode]["reward"].append(rewards.mean().item())
-        self._metrics[mode]["reward_std"].append(rewards.std().item())
-        self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
-
-        prompts_text = []
-        completions_text = []
-        for sample_mode, prompt, image_context, answer_context in zip(
-            sample_modes, prompts, image_contexts, answer_contexts
-        ):
-            if sample_mode == "image_edit":
-                prompts_text.append(image_context["prompt"] if image_context is not None else prompt)
-                completions_text.append("")
-            else:
-                prompts_text.append(answer_context["prompt"] if answer_context is not None else prompt)
-                completions_text.append("" if answer_context is None else answer_context["decoded_text"])
-
-        prepared_batches = DataLoader(
-            scoring_examples,
-            batch_size=2,
-            shuffle=False,
-            collate_fn=self._build_scored_batch_collator(
-                collate_fn,
-                advantages,
-                completion_masks,
-                old_per_token_logps,
-                ref_per_token_logps,
-                num_iterations,
-            ),
-        )
-
-        # Log time profile through self._metrics so it goes through the HF callback system
-        for k, v in _timings.items():
-            self._metrics[mode][f"time_profile/{k}"].append(v)
-
-        _TRAINING_KEYS = frozenset({"advantages", "completion_mask", "completion_masks",
-                                    "old_per_token_logps", "ref_per_token_logps"})
-        mask_seeds_val = mask_seeds.detach() if torch.is_tensor(mask_seeds) else mask_seeds
-        return [
-            {
-                "scoring_data_loader": batch["scoring_instances"],
-                **{k: v for k, v in batch.items() if k in _TRAINING_KEYS},
-                "mask_seeds": mask_seeds_val,
-            }
-            for batch in prepared_batches  # DataLoader is iterable; no need to materialise separately
-        ]
-
-    # ------------------------------------------------------------------
-    # Dual-modality generation + scoring (interleave training)
-    # ------------------------------------------------------------------
-    def _generate_and_score_completions_dual(
-        self,
-        gen_inputs: list[dict[str, Any]],
-        und_inputs: list[dict[str, Any]],
-    ) -> tuple[list[dict], list[dict]]:
-        """Generate and score completions for gen (image-edit) and und (text) modalities
-        independently, returning two separate buffer lists for dual backward passes.
-
-        This eliminates the NCCL deadlock caused by mixed-modality batches activating
-        different parameter subsets on different ranks.
-        """
+        
         device = self.accelerator.device
         beta = float(getattr(self.args, "beta", 0.0))
         num_iterations = int(getattr(self.args, "num_iterations", 1))
@@ -1886,160 +1897,224 @@ class DiffuGRPOTrainer(GRPOTrainer):
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
             image_processor = self._get_image_processor(unwrapped_model)
 
-            # ---- Image-edit (gen) rollouts ----
-            image_contexts: list[Optional[dict]] = [None] * len(gen_inputs)
-            image_edit_batch_size = max(1, int(getattr(self.args, "image_edit_batch_size", 1)))
-            with _timer(_timings, "image_rollout"):
-                for start_idx in trange(0, len(gen_inputs), image_edit_batch_size, desc="Image Rollout"):
-                    batch_examples = gen_inputs[start_idx : start_idx + image_edit_batch_size]
-                    _, batch_contexts = self._rollout_image_edit_latents(unwrapped_model, batch_examples)
-                    for offset, ctx in enumerate(batch_contexts):
-                        image_contexts[start_idx + offset] = ctx
+            if gen_inputs is not None:
+                image_contexts: list[Optional[dict]] = [None] * len(gen_inputs)
+                image_edit_batch_size = max(1, int(getattr(self.args, "image_edit_batch_size", 1)))
+                with _timer(_timings, "image_rollout"):
+                    for start_idx in trange(0, len(gen_inputs), image_edit_batch_size, desc="Image Rollout"):
+                        batch_examples = gen_inputs[start_idx : start_idx + image_edit_batch_size]
+                        _, batch_contexts = self._rollout_image_edit_latents(unwrapped_model, batch_examples)
+                        for offset, ctx in enumerate(batch_contexts):
+                            image_contexts[start_idx + offset] = ctx
+            else:
+                image_contexts = None
 
             # ---- Text (und) rollouts ----
-            answer_contexts: list[Optional[dict]] = [None] * len(und_inputs)
-            text_batch_size = 4
-            prefix_lm = bool(getattr(self.args, "prefix_lm", True))
-            generation_kwargs = {
-                "max_new_tokens": int(self.args.max_completion_length),
-                "block_length": int(min(self.args.block_length, self.args.max_completion_length)),
-                "step_per_block": self.args.text_rollout_step_per_block
-                if self.args.text_rollout_step_per_block is not None
-                else int(min(self.args.block_length, self.args.max_completion_length)),
-                "temperature": float(self.args.temperature),
-                "do_sample": bool(self.args.text_rollout_do_sample),
-                "prefix_lm": prefix_lm,
-                "use_fast_dlm": False,
-                "remasking": self.args.remasking,
-                "cfg_scale": self.args.cfg_scale,
-            }
-            generation_kwargs = {k: v for k, v in generation_kwargs.items() if v is not None}
-            with _timer(_timings, "text_rollout"):
-                for start_idx in trange(0, len(und_inputs), text_batch_size, desc="Text Rollout"):
-                    batch_examples = und_inputs[start_idx : start_idx + text_batch_size]
-                    _, batch_contexts = self._rollout_multimodal_text_gen(
-                        unwrapped_model, batch_examples, image_processor,
-                        generation_kwargs, device,
-                    )
-                    for offset, ctx in enumerate(batch_contexts):
-                        answer_contexts[start_idx + offset] = ctx
+            if und_inputs is not None:
+                answer_contexts: list[Optional[dict]] = [None] * len(und_inputs)
+                text_batch_size = 4
+                prefix_lm = bool(getattr(self.args, "prefix_lm", True))
+                generation_kwargs = {
+                    "max_new_tokens": int(self.args.max_completion_length),
+                    "block_length": int(min(self.args.block_length, self.args.max_completion_length)),
+                    "step_per_block": self.args.text_rollout_step_per_block
+                    if self.args.text_rollout_step_per_block is not None
+                    else int(min(self.args.block_length, self.args.max_completion_length)),
+                    "temperature": float(self.args.temperature),
+                    "do_sample": bool(self.args.text_rollout_do_sample),
+                    "prefix_lm": prefix_lm,
+                    "use_fast_dlm": False,
+                    "remasking": self.args.remasking,
+                    "cfg_scale": self.args.cfg_scale,
+                }
+                generation_kwargs = {k: v for k, v in generation_kwargs.items() if v is not None}
+                with _timer(_timings, "text_rollout"):
+                    for start_idx in trange(0, len(und_inputs), text_batch_size, desc="Text Rollout"):
+                        batch_examples = und_inputs[start_idx : start_idx + text_batch_size]
+                        _, batch_contexts = self._rollout_multimodal_text_gen(
+                            unwrapped_model, batch_examples, image_processor,
+                            generation_kwargs, device,
+                        )
+                        for offset, ctx in enumerate(batch_contexts):
+                            answer_contexts[start_idx + offset] = ctx
+            else:
+                answer_contexts = None
 
             # ---- Build scoring examples per modality ----
             collate_fn = MaskDataCollator(self.processing_class, self.args)
             dataset_args = self._build_lazy_supervised_data_args(unwrapped_model, image_processor)
-
-            def _build_scoring_items(data_list: list[dict]) -> list[dict]:
-                ds = LazySupervisedDataset(
+            gen_scoring = None
+            und_scoring = None
+            if gen_inputs is not None:
+                gen_scoring = LazySupervisedDataset(
                     tokenizer=self.processing_class,
                     data_args=dataset_args,
-                    list_data=data_list,
+                    list_data=[context["payload"] for context in image_contexts],
                 )
-                return [{**ds[idx], "_sample_idx": idx} for idx in range(len(ds))]
-
-            gen_data_list = [ctx["payload"] for ctx in image_contexts if ctx is not None]
-            und_data_list = [ctx["payload"] for ctx in answer_contexts if ctx is not None]
-
-            gen_scoring = _build_scoring_items(gen_data_list) if gen_data_list else []
-            und_scoring = _build_scoring_items(und_data_list) if und_data_list else []
-
-            if not gen_scoring:
-                raise ValueError("No gen (image-edit) scoring examples were built.")
-            if not und_scoring:
-                raise ValueError("No und (text) scoring examples were built.")
-
+            if und_inputs is not None:
+                und_scoring = LazySupervisedDataset(
+                    tokenizer=self.processing_class,
+                    data_args=dataset_args,
+                    list_data=[context["payload"] for context in answer_contexts],
+                )
+            assert gen_scoring is not None or und_scoring is not None, "No scoring examples were built."
+        
         # ---- Shared mask seeds across modalities and ranks ----
         mask_seeds = torch.randint(0, 2**12, (num_iterations,), device=device)
         mask_seed_list = mask_seeds.detach().cpu().tolist()
 
-        # ---- Helper: compute old/ref logps for a modality ----
-        def _compute_logps(scoring_examples):
-            with torch.no_grad():
-                old_logps, comp_masks = self._get_per_token_logps(
-                    self.model, scoring_examples, mask_seed_list,
+        with torch.no_grad():
+            with _timer(_timings, "old_logps"):
+                # Populates cached_gen_samples / cached_und_samples from the
+                # scoring datasets AND captures the masks that model.forward
+                # drew for each (seed, sample) pair.  Both are reused by
+                # (a) the ref-model pass below and (b) the backward-path
+                # forward in _compute_loss.  The cached samples guarantee
+                # identical tokenization / padding; the captured masks
+                # guarantee bitwise-identical final_masked_indices /
+                # masked_indices_gen, so coef_1 = exp(curr - old) in the
+                # GRPO loss is identically 1 on step 0.
+                (
+                    old_gen_logps,
+                    old_und_logps,
+                    cached_gen_samples,
+                    cached_und_samples,
+                    cached_gen_masks,
+                    cached_und_masks,
+                ) = self._get_per_token_logps(
+                    self.model,
+                    gen_scoring=gen_scoring,
+                    und_scoring=und_scoring,
+                    mask_seeds=mask_seed_list,
                 )
-                old_logps = old_logps * comp_masks
-                ref_logps = None
+
+            with _timer(_timings, "ref_logps"):
+                ref_gen_logps, ref_und_logps = None, None
                 if beta != 0.0:
+                    # Ref pass: reuse the old pass's samples AND masks.  Since
+                    # the current-policy backward pass will also replay those
+                    # same masks, this keeps the KL term well-defined (ref
+                    # and current score the same exact masked positions).
                     if getattr(self, "ref_model", None) is not None:
-                        ref_logps, _ = self._get_per_token_logps(
-                            self.ref_model, scoring_examples, mask_seed_list,
+                        ref_gen_logps, ref_und_logps, _, _, _, _ = self._get_per_token_logps(
+                            self.ref_model,
+                            gen_scoring=gen_scoring, und_scoring=und_scoring,
+                            mask_seeds=mask_seed_list,
+                            cached_gen_samples=cached_gen_samples,
+                            cached_und_samples=cached_und_samples,
+                            force_gen_masks=cached_gen_masks,
+                            force_und_masks=cached_und_masks,
                         )
                     else:
                         unwrapped = self.accelerator.unwrap_model(self.model)
                         if hasattr(unwrapped, "disable_adapter"):
                             with unwrapped.disable_adapter():
-                                ref_logps, _ = self._get_per_token_logps(
-                                    self.model, scoring_examples, mask_seed_list,
+                                ref_gen_logps, ref_und_logps, _, _, _, _ = self._get_per_token_logps(
+                                    self.model,
+                                    gen_scoring=gen_scoring, und_scoring=und_scoring,
+                                    mask_seeds=mask_seed_list,
+                                    cached_gen_samples=cached_gen_samples,
+                                    cached_und_samples=cached_und_samples,
+                                    force_gen_masks=cached_gen_masks,
+                                    force_und_masks=cached_und_masks,
                                 )
                         else:
-                            ref_logps, _ = self._get_per_token_logps(
-                                self.model, scoring_examples, mask_seed_list,
+                            ref_gen_logps, ref_und_logps, _, _, _, _ = self._get_per_token_logps(
+                                self.model,
+                                gen_scoring=gen_scoring, und_scoring=und_scoring,
+                                mask_seeds=mask_seed_list,
+                                cached_gen_samples=cached_gen_samples,
+                                cached_und_samples=cached_und_samples,
+                                force_gen_masks=cached_gen_masks,
+                                force_und_masks=cached_und_masks,
                             )
-                    ref_logps = ref_logps * comp_masks
-            return old_logps, comp_masks, ref_logps
 
-        with _timer(_timings, "gen_old_logprobs"):
-            gen_old_logps, gen_comp_masks, gen_ref_logps = _compute_logps(gen_scoring)
-        with _timer(_timings, "und_old_logprobs"):
-            und_old_logps, und_comp_masks, und_ref_logps = _compute_logps(und_scoring)
+            # ---- Offload old/ref logps to (pinned) CPU ----
+            # These tensors have shape (num_iterations, N, D) and are buffered in
+            # self._buffered_inputs across every gradient accumulation micro-step.
+            # During backward on the current-policy forward, keeping them on GPU
+            # wastes VRAM since only a single (iteration, chunk) slice is needed
+            # at a time.  Move them to pinned host memory here; _grpo_loss copies
+            # the active slice back to the device non-blocking per chunk.
+            def _offload_cpu_pinned(t):
+                if t is None:
+                    return None
+                cpu = t.detach().to("cpu")
+                try:
+                    cpu = cpu.pin_memory()
+                except RuntimeError:
+                    # Pinning can fail on some platforms / dtypes; fall back to
+                    # regular pageable CPU memory (copy will be blocking).
+                    pass
+                return cpu
+
+            old_gen_logps = _offload_cpu_pinned(old_gen_logps)
+            old_und_logps = _offload_cpu_pinned(old_und_logps)
+            ref_gen_logps = _offload_cpu_pinned(ref_gen_logps)
+            ref_und_logps = _offload_cpu_pinned(ref_und_logps)
+
 
         # ---- Rewards per modality ----
         with _timer(_timings, "reward"):
-            # Gen rewards (image-edit → perceptual)
-            gen_reward_inputs = [ex for ex, ctx in zip(gen_inputs, image_contexts) if ctx is not None]
-            gen_prompts = [ctx["prompt"] for ctx in image_contexts if ctx is not None]
-            gen_completions = [ctx["decoded_image"] for ctx in image_contexts if ctx is not None]
-            gen_reward_fns = [perceptual_score_reward_func]
+            gen_local_rewards = None
+            und_local_rewards = None
+            if gen_inputs is not None:
+                # Gen rewards (image-edit → perceptual)
+                gen_reward_inputs = [ex for ex, ctx in zip(gen_inputs, image_contexts)]
+                gen_prompts = [ctx["prompt"] for ctx in image_contexts]
+                gen_completions = [ctx["decoded_image"] for ctx in image_contexts]
+                gen_reward_fns = [perceptual_score_reward_func]
 
-            gen_rewards_per_func = torch.zeros(len(gen_completions), len(gen_reward_fns), device=device)
-            for i, reward_func in enumerate(gen_reward_fns):
-                reward_func_name = reward_func.__name__
-                with profiling_context(self, reward_func_name):
-                    keys = [k for k in gen_reward_inputs[0] if k not in ["prompt", "completion"]]
-                    reward_kwargs = {k: [ex.get(k) for ex in gen_reward_inputs] for k in keys}
-                    try:
-                        output = reward_func(
-                            prompts=gen_prompts, completions=gen_completions,
-                            step=self._step, run_name=self.args.output_dir, **reward_kwargs,
-                        )
-                    except Exception:
-                        output = [torch.nan for _ in gen_completions]
-                    output = [r if r is not None else torch.nan for r in output]
-                    gen_rewards_per_func[:, i] = torch.tensor(output, dtype=torch.float32, device=device)
-                self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(torch.nanmean(gen_rewards_per_func[:, i]).item())
-                self._metrics[mode][f"rewards/{reward_func_name}/std"].append(nanstd(gen_rewards_per_func[:, i]).item())
-            gen_local_rewards = gen_rewards_per_func.nansum(dim=1)
+                gen_rewards_per_func = torch.zeros(len(gen_completions), len(gen_reward_fns), device=device)
+                for i, reward_func in enumerate(gen_reward_fns):
+                    reward_func_name = reward_func.__name__
+                    with profiling_context(self, reward_func_name):
+                        keys = [k for k in gen_reward_inputs[0] if k not in ["prompt", "completion"]]
+                        reward_kwargs = {k: [ex.get(k) for ex in gen_reward_inputs] for k in keys}
+                        try:
+                            output = reward_func(
+                                prompts=gen_prompts, completions=gen_completions,
+                                step=self._step, run_name=self.args.output_dir, **reward_kwargs,
+                            )
+                        except Exception:
+                            output = [torch.nan for _ in gen_completions]
+                        output = [r if r is not None else torch.nan for r in output]
+                        gen_rewards_per_func[:, i] = torch.tensor(output, dtype=torch.float32, device=device)
+                    self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(torch.nanmean(gen_rewards_per_func[:, i]).item())
+                    self._metrics[mode][f"rewards/{reward_func_name}/std"].append(nanstd(gen_rewards_per_func[:, i]).item())
+                gen_local_rewards = gen_rewards_per_func.nansum(dim=1)
 
-            # Und rewards (text → format + correctness)
-            und_reward_inputs = [ex for ex, ctx in zip(und_inputs, answer_contexts) if ctx is not None]
-            und_prompts = [ctx["prompt"] for ctx in answer_contexts if ctx is not None]
-            und_completions = [
-                [{"role": "assistant", "content": ctx["decoded_text"]}]
-                for ctx in answer_contexts if ctx is not None
-            ]
-            und_reward_fns = [strict_format_reward_func, correctness_reward_func]
+            if und_inputs is not None:
+                # Und rewards (text → format + correctness)
+                und_reward_inputs = [ex for ex, ctx in zip(und_inputs, answer_contexts)]
+                und_prompts = [ctx["prompt"] for ctx in answer_contexts]
+                und_completions = [
+                    [{"role": "assistant", "content": ctx["decoded_text"]}]
+                    for ctx in answer_contexts
+                ]
+                und_reward_fns = [strict_format_reward_func, correctness_reward_func]
 
-            und_rewards_per_func = torch.zeros(len(und_completions), len(und_reward_fns), device=device)
-            for i, reward_func in enumerate(und_reward_fns):
-                reward_func_name = reward_func.__name__
-                with profiling_context(self, reward_func_name):
-                    keys = [k for k in und_reward_inputs[0] if k not in ["prompt", "completion"]]
-                    reward_kwargs = {k: [ex.get(k) for ex in und_reward_inputs] for k in keys}
-                    try:
-                        output = reward_func(
-                            prompts=und_prompts, completions=und_completions,
-                            step=self._step, run_name=self.args.output_dir, **reward_kwargs,
-                        )
-                    except Exception:
-                        output = [torch.nan for _ in und_completions]
-                    output = [r if r is not None else torch.nan for r in output]
-                    und_rewards_per_func[:, i] = torch.tensor(output, dtype=torch.float32, device=device)
-                self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(torch.nanmean(und_rewards_per_func[:, i]).item())
-                self._metrics[mode][f"rewards/{reward_func_name}/std"].append(nanstd(und_rewards_per_func[:, i]).item())
-            und_local_rewards = und_rewards_per_func.nansum(dim=1)
+                und_rewards_per_func = torch.zeros(len(und_completions), len(und_reward_fns), device=device)
+                for i, reward_func in enumerate(und_reward_fns):
+                    reward_func_name = reward_func.__name__
+                    with profiling_context(self, reward_func_name):
+                        keys = [k for k in und_reward_inputs[0] if k not in ["prompt", "completion"]]
+                        reward_kwargs = {k: [ex.get(k) for ex in und_reward_inputs] for k in keys}
+                        try:
+                            output = reward_func(
+                                prompts=und_prompts, completions=und_completions,
+                                step=self._step, run_name=self.args.output_dir, **reward_kwargs,
+                            )
+                        except Exception:
+                            output = [torch.nan for _ in und_completions]
+                        output = [r if r is not None else torch.nan for r in output]
+                        und_rewards_per_func[:, i] = torch.tensor(output, dtype=torch.float32, device=device)
+                    self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(torch.nanmean(und_rewards_per_func[:, i]).item())
+                    self._metrics[mode][f"rewards/{reward_func_name}/std"].append(nanstd(und_rewards_per_func[:, i]).item())
+                und_local_rewards = und_rewards_per_func.nansum(dim=1)
 
         # ---- Advantages per modality ----
-        def _compute_advantages(local_rewards, comp_masks, tag):
+        def _compute_advantages(local_rewards, tag):
             local_n = local_rewards.size(0)
             rewards = gather(local_rewards)
             mean_grouped = rewards.view(-1, self.num_generations).mean(dim=1)
@@ -2053,55 +2128,31 @@ class DiffuGRPOTrainer(GRPOTrainer):
             advantages = (rewards - mean_grouped)[process_slice]
             # Metrics
             is_std_zero = std_grouped < 1e-6
-            comp_length = self.accelerator.gather_for_metrics(
-                comp_masks.float().sum(-1).mean(dim=0)
-            ).float().mean().item()
-            self._metrics[mode][f"{tag}/completion_length"].append(comp_length)
             self._metrics[mode][f"{tag}/reward"].append(rewards.mean().item())
             self._metrics[mode][f"{tag}/reward_std"].append(rewards.std().item())
             self._metrics[mode][f"{tag}/frac_reward_zero_std"].append(is_std_zero.float().mean().item())
             return advantages
 
-        gen_advantages = _compute_advantages(gen_local_rewards, gen_comp_masks, "gen")
-        und_advantages = _compute_advantages(und_local_rewards, und_comp_masks, "und")
-
-        # ---- Build prepared batches per modality ----
-        collate_fn = MaskDataCollator(self.processing_class, self.args)
-        mask_seeds_val = mask_seeds.detach()
-
-        _TRAINING_KEYS = frozenset({"advantages", "completion_mask", "completion_masks",
-                                    "old_per_token_logps", "ref_per_token_logps"})
-
-        def _build_buffer(scoring_examples, advantages, comp_masks, old_logps, ref_logps):
-            # Choose batch_size so total mini-batches == grad_accum_steps.
-            n = len(scoring_examples)
-            batch_size = max(1, n // grad_accum_steps)
-            prepared = DataLoader(
-                scoring_examples,
-                batch_size=batch_size,
-                shuffle=False,
-                collate_fn=self._build_scored_batch_collator(
-                    collate_fn, advantages, comp_masks, old_logps, ref_logps, num_iterations,
-                ),
-            )
-            return [
-                {
-                    "scoring_data_loader": batch["scoring_instances"],
-                    **{k: v for k, v in batch.items() if k in _TRAINING_KEYS},
-                    "mask_seeds": mask_seeds_val,
-                }
-                for batch in prepared
-            ]
-
-        gen_buffer = _build_buffer(gen_scoring, gen_advantages, gen_comp_masks, gen_old_logps, gen_ref_logps)
-        und_buffer = _build_buffer(und_scoring, und_advantages, und_comp_masks, und_old_logps, und_ref_logps)
-
-        # Ensure both buffers have grad_accum_steps entries. Truncate or pad if needed.
-        min_len = min(len(gen_buffer), len(und_buffer), grad_accum_steps)
-        gen_buffer = gen_buffer[:min_len]
-        und_buffer = und_buffer[:min_len]
+        if gen_inputs is not None:
+            gen_advantages = _compute_advantages(gen_local_rewards, "gen")
+        else:
+            gen_advantages = None
+        if und_inputs is not None:
+            und_advantages = _compute_advantages(und_local_rewards, "und")
+        else:
+            und_advantages = None
 
         for k, v in _timings.items():
             self._metrics[mode][f"time_profile/{k}"].append(v)
-
-        return gen_buffer, und_buffer
+        return {
+            "gen": [gen_scoring, gen_advantages, old_gen_logps, ref_gen_logps] if gen_inputs is not None else None,
+            "und": [und_scoring, und_advantages, old_und_logps, ref_und_logps] if und_inputs is not None else None,
+            "mask_seeds": mask_seed_list,
+            "cached_gen_samples": cached_gen_samples,
+            "cached_und_samples": cached_und_samples,
+            # [num_iterations][N_gen_full] of {"text_mask": CPU Tensor, "gen_mask": CPU Tensor}
+            # Sliced by iteration index in _compute_loss, then by chunk range,
+            # before being passed back into the current-policy forward.
+            "cached_gen_masks": cached_gen_masks,
+            "cached_und_masks": cached_und_masks,
+        }

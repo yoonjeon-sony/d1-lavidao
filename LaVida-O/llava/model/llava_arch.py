@@ -449,6 +449,8 @@ class LlavaMetaForCausalLM(ABC):
             latents_height=latents_width = np.sqrt(last_dim).astype(int)
             return latents,(latents_height,latents_width)
         with torch.no_grad():
+            vqvae_param = next(vqvae.parameters())
+            images = images.to(device=vqvae_param.device, dtype=vqvae_param.dtype)
             latents = vqvae.encode(images).latents
             latents_bsz, channels, latents_height, latents_width = latents.shape
             latents = vqvae.quantize(latents)[2][2].reshape(latents_bsz, latents_height, latents_width)

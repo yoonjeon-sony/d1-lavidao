@@ -198,6 +198,8 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
         mask_seeds=None,
         p_mask_prompt=None,
         temperature: float = 1.0,
+        force_text_mask=None,
+        force_gen_mask=None,
         # **kwargs
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         # print(dataset_name)
@@ -349,7 +351,7 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
                     # N x 1
             else:
                 prompt_to_mask = torch.zeros_like(labels_mask)
-            #breakpoint()
+            
             if do_not_mask_text is not None and sum(do_not_mask_text) > 0:
                 do_not_mask = torch.tensor(do_not_mask_text)
                 do_not_mask = do_not_mask & (torch.rand_like(do_not_mask,dtype=torch.float) < 0.8)
@@ -359,7 +361,21 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
             
             final_masked_indices = masked_indices & (~do_not_mask) & (~infill_token_pos)
             final_masked_indices = final_masked_indices | prompt_to_mask
-            
+
+            # Force-mask override: when a caller (e.g. GRPO trainer) supplies
+            # ``force_text_mask``, bypass the random-draw-based masking entirely
+            # and use the provided mask as ``final_masked_indices``.  This
+            # guarantees that two separate forwards over the same (sample,
+            # mask_seed) see bitwise-identical masks, which is required for
+            # the GRPO clipped-ratio loss to be well-defined (otherwise
+            # coef_1 = exp(current_logps - old_logps) explodes at positions
+            # where one forward masked and the other didn't).
+            if force_text_mask is not None:
+                final_masked_indices = force_text_mask.to(
+                    device=final_masked_indices.device,
+                    dtype=final_masked_indices.dtype,
+                )
+
             if do_inv:
                 final_masked_indices_inv = (~masked_indices) & (~do_not_mask) & (~infill_token_pos)
                 final_masked_indices_inv = final_masked_indices_inv | prompt_to_mask
@@ -381,6 +397,9 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
             
             if do_inv:
                 inputs_embeds = torch.cat([inputs_embeds,inputs_embeds_inv])
+            # Declared here so the `output['masked_indices_gen']` assignment
+            # below is safe regardless of whether `images_gen` is provided.
+            masked_indices_gen = None
             if images_gen is not None:
                 gen_latents_masked = gen_latents.clone()
                 if mask_seed is not None:
@@ -424,6 +443,14 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
                     )
                     if is_unitok:
                         masked_indices_gen = masked_indices_gen.unsqueeze(1).repeat(1,8,1) # N 8
+
+                # Force-mask override for the image-latent mask (same
+                # motivation as force_text_mask above).
+                if force_gen_mask is not None:
+                    masked_indices_gen = force_gen_mask.to(
+                        device=masked_indices_gen.device,
+                        dtype=masked_indices_gen.dtype,
+                    )
 
                 gen_latents_masked[masked_indices_gen] = img_mask_id
                 if do_inv:
@@ -572,8 +599,8 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
                         loss_weight = loss_weight.flatten()[_loss_mask].to(gen_loss.dtype)
                         gen_loss = (gen_loss * loss_weight).mean()
                         per_token_ce = torch.nn.functional.cross_entropy(
-                            gen_logits[_loss_mask].float(),
-                            gen_latents_comp_labels.flatten()[_loss_mask],
+                            gen_logits[_loss_mask_flat].float() / temperature,
+                            gen_latents_comp_labels.flatten()[_loss_mask_flat],
                             reduction='none',
                         )
                     else:
@@ -625,6 +652,11 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
             output['new_input_ids']=new_input_ids
             output['labels'] = labels
             output['final_masked_indices']=final_masked_indices
+            # Expose the image-latent mask (if any) so GRPO can capture and
+            # replay it in subsequent forwards via ``force_gen_mask``.
+            output['masked_indices_gen'] = (
+                masked_indices_gen.detach() if masked_indices_gen is not None else None
+            )
             output['p_mask'] = p_mask
             output['do_inv'] = do_inv
             output['skip_batch'] = skip_batch

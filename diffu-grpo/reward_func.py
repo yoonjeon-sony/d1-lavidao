@@ -16,12 +16,26 @@ from math500_utils import remove_boxed, last_boxed_only_string, is_equiv, boxed_
 
 _LPIPS_LOSS_FN = None
 
-def _get_lpips_loss_fn():
+def _get_lpips_loss_fn(device: torch.device = None):
+    """Return a cached LPIPS module, placed on ``device`` if given.
+
+    The module is constructed lazily on first use, its parameters are frozen
+    (``requires_grad_(False)``) so the LPIPS forward does not allocate grad
+    bookkeeping, and it is moved onto the requested device on the first call
+    that specifies one.  Subsequent calls with a different device migrate the
+    cached module in-place.
+    """
     global _LPIPS_LOSS_FN
     if _LPIPS_LOSS_FN is None:
         import lpips
 
         _LPIPS_LOSS_FN = lpips.LPIPS(net='vgg').eval()
+        for p in _LPIPS_LOSS_FN.parameters():
+            p.requires_grad_(False)
+    if device is not None:
+        current_device = next(_LPIPS_LOSS_FN.parameters()).device
+        if current_device != device:
+            _LPIPS_LOSS_FN = _LPIPS_LOSS_FN.to(device)
     return _LPIPS_LOSS_FN
 
 def extract_xml_answer(text: str) -> str:
@@ -118,8 +132,15 @@ def perceptual_score_reward_func(prompts, completions, image_gt, step=None, run_
     Computes perceptual similarity score between generated image and ground truth image.
     Higher is better.
     """
-    
-    loss_fn = _get_lpips_loss_fn()
+
+    # Run LPIPS on the local-rank CUDA device when available. accelerate /
+    # deepspeed set torch.cuda.current_device() per rank, so this picks the
+    # correct GPU for this process without any extra plumbing.
+    if torch.cuda.is_available():
+        lpips_device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        lpips_device = torch.device("cpu")
+    loss_fn = _get_lpips_loss_fn(lpips_device)
 
     def _to_tensor(img):
         """
@@ -173,30 +194,45 @@ def perceptual_score_reward_func(prompts, completions, image_gt, step=None, run_
         img = img * 2.0 - 1.0  # [0,1] → [-1,1]
         return img
 
-    def _pad_to_square_and_resize_tensor(img: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
+    def _pad_to_square(img: torch.Tensor, size: int) -> torch.Tensor:
         """
-        Pad BCHW tensor to square (black) and resize to target H/W.
-        Input is expected in [-1, 1], so black padding uses -1.
+        Pad BCHW tensor (values in [-1, 1]) to a ``size x size`` square with
+        black padding (-1).  No resizing — preserves every original pixel.
         """
         _, _, h, w = img.shape
-        max_side = max(h, w)
-        pad_h = max_side - h
-        pad_w = max_side - w
-
+        pad_h = size - h
+        pad_w = size - w
         pad_top = pad_h // 2
         pad_bottom = pad_h - pad_top
         pad_left = pad_w // 2
         pad_right = pad_w - pad_left
-
-        img = F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), value=-1.0)
-        return F.interpolate(img, size=target_hw, mode="bilinear", align_corners=False)
+        return F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), value=-1.0)
 
     def _lpips_score(img1, img2):
         img1 = _normalize(img1).unsqueeze(0)
         img2 = _normalize(img2).unsqueeze(0)
-        if img1.shape != img2.shape:
-            img2 = _pad_to_square_and_resize_tensor(img2, img1.shape[-2:])
-        return 1.0 - loss_fn(img1, img2).item()  # higher is better
+        # Pass full-resolution images to LPIPS: pad both to a common square
+        # equal to the max side across both images, so neither is downscaled.
+        # LPIPS requires matching (B, C, H, W); padding with -1 (black in
+        # the [-1, 1] normalization) contributes nothing to perceptual distance
+        # since both images are padded identically on the background regions.
+        max_side = max(
+            img1.shape[-2], img1.shape[-1], img2.shape[-2], img2.shape[-1]
+        )
+        img1 = _pad_to_square(img1, max_side)
+        img2 = _pad_to_square(img2, max_side)
+        # Move inputs onto the same device as the (cached) LPIPS module and
+        # disable autograd tracking — LPIPS is called purely for its scalar
+        # output, so building a graph would waste GPU memory and time.
+        img1 = img1.to(lpips_device, non_blocking=True)
+        img2 = img2.to(lpips_device, non_blocking=True)
+        with torch.inference_mode():
+            d = loss_fn(img1, img2).item()
+        # Cap LPIPS distance at 1.0 so the returned score stays in [0, 1].
+        # LPIPS is unbounded above and can exceed 1.0 on very dissimilar
+        # images, which would otherwise produce a negative reward.
+        d = min(d, 1.0)
+        return 1.0 - d  # higher is better
 
     rewards = []
     for pred_img, gt_img in zip(completions, image_gt):
@@ -208,10 +244,10 @@ def perceptual_score_reward_func(prompts, completions, image_gt, step=None, run_
     RED = "\033[91m"
     YELLOW = "\033[93m"
     RESET = "\033[0m"
-    prmpt = prompts[0].replace("<|reserved_token_5|>", "*").replace("<|reserved_token_6|>", ".")
+    prompt = prompts[0].replace("<|reserved_token_6|>", "*").replace("<|reserved_token_5|>", ".")
     print(
         "-" * 20,
-        f"\n{RED}Prompt:{RESET}\n{prmpt}\n",
+        f"\n{RED}Prompt:{RESET}\n{prompt}\n",
         "-" * 20,
         f"\n{YELLOW}Perceptual Score:{RESET}\n{rewards[0]}\n",
     )
