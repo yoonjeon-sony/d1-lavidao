@@ -1,4 +1,16 @@
-NUM_PROCESSES=8
+#!/bin/bash
+#SBATCH --partition=dgm
+#SBATCH --account=dgm
+#SBATCH --job-name=RL-d1-diffuGRPO
+#SBATCH --nodes=1
+#SBATCH --ntasks=1                    # 1 task per GPU
+#SBATCH --gres=gpu:8
+#SBATCH --time=100:00:00               # Max time
+#SBATCH --requeue                     # allow requeue if preempted
+#SBATCH --output=/home/yoonjeon.kim/dLLM-RL/train_sft/slurm-logs/output.%j.log
+#SBATCH --error=/home/yoonjeon.kim/dLLM-RL/train_sft/slurm-logs/error.%j.log
+
+
 export WANDB_ENTITY="jeoni"
 export WANDB_PROJECT="RL_clean_d1"
 export DEBUG_FIX_PADDING=1
@@ -10,10 +22,12 @@ DEBUG="${DEBUG:-0}"
 mkdir -p "$TRITON_CACHE_DIR"
 chmod 700 "$TRITON_CACHE_DIR"
 DATASET="thinkmorph_answer" # thinkmorph_interleave thinkmorph_answer thinkmorph_edit
-RUN_NAME=${DATASET}_Test-LavidaO
+RUN_NAME=${DATASET}-LavidaO
 # MODEL_PATH=/group2/dgm/yoonjeon/ckpts/sft-lavidao-thinkmorph-complete/checkpoint-2420
-MODEL_PATH="/scratch2/yoonjeon.kim/sft_LaViDa-O-thinkmorph_zebracot-step3000/"
-OUTPUT_DIR=/scratch2/yoonjeon.kim/rl-lavidao-thinkmorph/$RUN_NAME
+# MODEL_PATH="/scratch2/yoonjeon.kim/sft_LaViDa-O-thinkmorph_zebracot-step3000/"
+MODEL_PATH="/group2/dgm/yoonjeon/ckpts/sft_LaViDa-O-thinkmorph_zebracot/checkpoint-7000"
+# OUTPUT_DIR=/scratch2/yoonjeon.kim/rl-lavidao-thinkmorph/$RUN_NAME
+OUTPUT_DIR="/group2/dgm/yoonjeon/ckpts/rl-lavidao-thinkmorph/$RUN_NAME"
 
 # ----------------------------
 # Model initialization configs
@@ -71,7 +85,7 @@ TEXT_ROLLOUT_FORCE_PREFIX_LM="true"
 IMAGE_EDIT_SAMPLE_POLICY="multinomial"
 IMAGE_EDIT_CONFIDENCE_POLICY="halton"
 IMAGE_EDIT_GUIDANCE_SCALE=0.0
-IMAGE_EDIT_RESOLUTION=1024
+IMAGE_EDIT_RESOLUTION=512
 IMAGE_EDIT_SHIFT=5
 IMAGE_EDIT_N_STEPS=64
 IMAGE_EDIT_SCHEDULE="shift"
@@ -91,9 +105,10 @@ REF_MODEL_SYNC_STEPS=64
 
 if [[ "${DEBUG}" == "1" || "${DEBUG,,}" == "true" ]]; then
     echo "Running in debug mode!!!!"
-    BATCH_SIZE=4
-    NUM_GENERATIONS=2
-    PER_DEVICE_BATCH_SIZE=1
+    BATCH_SIZE=8
+    NUM_PROCESSES=4
+    NUM_GENERATIONS=8
+    PER_DEVICE_BATCH_SIZE=4
     MAX_STEPS=20
     LOGGING_STEPS=1
     SAVE_STEPS=100000
@@ -101,11 +116,18 @@ if [[ "${DEBUG}" == "1" || "${DEBUG,,}" == "true" ]]; then
     RESUME=false
 else
     BATCH_SIZE=64
+    NUM_PROCESSES=8
     NUM_GENERATIONS=8
-    PER_DEVICE_BATCH_SIZE=4
+    # Chunk size during backward — each grad-accum micro-step retains
+    # PER_DEVICE_BATCH_SIZE autograd graphs (gen + und) simultaneously in
+    # _compute_loss. Dropping from 4 → 1 gives a ~4× reduction in peak
+    # backward activation memory. GRAD_ACCUM_STEPS is auto-recomputed below
+    # so the effective batch size (BATCH_SIZE * NUM_GENERATIONS = 512) is
+    # unchanged.
+    PER_DEVICE_BATCH_SIZE=1
     MAX_STEPS="${MAX_STEPS:-}"
-    LOGGING_STEPS="${LOGGING_STEPS:-1}"
-    SAVE_STEPS="${SAVE_STEPS:-50}"
+    LOGGING_STEPS=1
+    SAVE_STEPS=50
     RETURN_DEBUG_ARTIFACTS=false
     RESUME=false
 fi
@@ -194,4 +216,6 @@ python -m accelerate.commands.launch \
     --per_device_train_batch_size $PER_DEVICE_BATCH_SIZE \
     --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
     --report_to wandb \
-    --save_steps $SAVE_STEPS
+    --save_steps $SAVE_STEPS \
+    --logging_steps $LOGGING_STEPS \
+    --text_rollout_use_gen_image true

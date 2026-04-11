@@ -609,6 +609,19 @@ class DiffuGRPOConfig(TrainingArguments):
         metadata={"help": "Optional step_per_block override for text rollout."},
     )
     text_rollout_do_sample: bool = field(default=False)
+    text_rollout_use_gen_image: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, the image produced by the gen-side image-edit rollout "
+                "is forwarded as a second image into the corresponding und-side "
+                "text rollout (under the key 'gen_image'). Required for "
+                "thinkmorph_interleave so the model can answer questions using "
+                "its own generated auxiliary image. Requires gen_inputs and "
+                "und_inputs to be aligned 1-to-1 by index / sample_id."
+            ),
+        },
+    )
 
     # LaVida model/data arguments.
     version: str = field(default="llada")

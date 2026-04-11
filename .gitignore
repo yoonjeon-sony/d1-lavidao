@@ -10,6 +10,7 @@
 
 # Python cache
 __pycache__/
+.pytest_cache/
 *.pyc
 
 # Virtual environment
@@ -20,3 +21,4 @@ __pycache__/
 
 # Weights & Biases
 wandb/
+lmms-eval/

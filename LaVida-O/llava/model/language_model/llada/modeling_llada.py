@@ -1822,7 +1822,7 @@ class LLaDAModelLM(PreTrainedModel):
             loss = token_loss
             # warnings.warn("Note that for LLaDA, you cannot calculate the loss here.", UserWarning)
             und_loss_none_reduction = F.cross_entropy(
-                (logits / temperature).view(-1, logits.shape[-1]),
+                (logits).view(-1, logits.shape[-1]),
                 labels.view(-1),
                 reduction='none',
             ).view(logits.shape[0], logits.shape[1])  # (B, L)

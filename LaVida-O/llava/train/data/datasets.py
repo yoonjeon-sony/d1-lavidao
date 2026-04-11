@@ -233,7 +233,6 @@ class LazySupervisedDataset(Dataset):
         processor = self.data_args.image_processor_gen
         image = self.load_image_path(image_file,image_cache)
         if crop_parms is not None:
-            #print (f"Cropping: {crop_parms}")
             assert self.data_args.image_gen_size == 1024 # hack
             image_dict = resize_and_crop(image,crop_parms[0])
             # image_dict = {

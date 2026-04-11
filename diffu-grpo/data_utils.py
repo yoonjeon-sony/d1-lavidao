@@ -160,8 +160,8 @@ def get_code_questions(split="train"):
 
 
 def get_image_edit_placeholder_questions() -> Dataset:
-    data_root = THINKMORPH_DEFAULT_DATA_ROOT
-    image_root = THINKMORPH_DEFAULT_IMAGE_ROOT
+    data_root = DATA_ROOT
+    image_root = DATA_ROOT
     train_data_paths = [os.path.join(data_root, name) for name in THINKMORPH_LOCAL_JSONL_FILES]
 
     missing_paths = [path for path in train_data_paths if not os.path.isfile(path)]
@@ -227,8 +227,8 @@ def get_image_edit_placeholder_questions() -> Dataset:
 
 
 def get_image_answer_placeholder_questions() -> Dataset:
-    data_root = THINKMORPH_DEFAULT_DATA_ROOT
-    image_root = THINKMORPH_DEFAULT_IMAGE_ROOT
+    data_root = DATA_ROOT
+    image_root = DATA_ROOT
     train_data_paths = [os.path.join(data_root, name) for name in THINKMORPH_LOCAL_JSONL_FILES]
 
     missing_paths = [path for path in train_data_paths if not os.path.isfile(path)]
@@ -329,8 +329,8 @@ def get_thinkmorph_interleave_questions(split: str = "train") -> tuple[Dataset, 
     if split != "train":
         raise ValueError(f"Unsupported split '{split}' for ThinkMorph interleave data. Use 'train'.")
 
-    data_root = THINKMORPH_DEFAULT_DATA_ROOT
-    image_root = THINKMORPH_DEFAULT_IMAGE_ROOT
+    data_root = DATA_ROOT
+    image_root = DATA_ROOT
     train_data_paths = [os.path.join(data_root, name) for name in THINKMORPH_LOCAL_JSONL_FILES]
 
     missing_paths = [path for path in train_data_paths if not os.path.isfile(path)]
@@ -441,10 +441,8 @@ THINKMORPH_LOCAL_JSONL_FILES = (
     "ThinkMorph-Chart_Refocus_loc_val.jsonl",
     "ThinkMorph-Jigsaw_Assembly_loc_val.jsonl",
 )
-THINKMORPH_DEFAULT_DATA_ROOT = "/home/yoonjeon.kim/dllm-RL/data/"
-THINKMORPH_DEFAULT_IMAGE_ROOT = "/scratch2/yoonjeon.kim/data/"
-ARXIVQA_JSONL = "arxivqa.jsonl"
-ARXIVQA_DEFAULT_IMAGE_ROOT = "/group2/dgm/yoonjeon/data/arxivqa"
+DATA_ROOT = "/scratch2/yoonjeon.kim/data/"
+
 
 
 COT_PROMPT = (
@@ -565,12 +563,10 @@ def get_arxivqa_interleave_questions(
     if split != "train":
         raise ValueError(f"Unsupported split '{split}' for ArxivQA. Use 'train'.")
 
-    if data_root is None:
-        data_root = "./data"
-    if image_root is None:
-        image_root = ARXIVQA_DEFAULT_IMAGE_ROOT
+    data_root = DATA_ROOT
+    image_root = os.path.join(data_root, "arxivqa")
 
-    data_path = os.path.join(data_root, ARXIVQA_JSONL)
+    data_path = os.path.join(data_root, "arxivqa_select_10k.jsonl")
     if not os.path.isfile(data_path):
         raise FileNotFoundError(f"ArxivQA file not found: {data_path}")
 
