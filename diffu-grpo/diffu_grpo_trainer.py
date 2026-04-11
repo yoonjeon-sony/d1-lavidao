@@ -324,7 +324,30 @@ class DiffuGRPOTrainer(GRPOTrainer):
             None,
         ),
         peft_config: Optional["PeftConfig"] = None,
+        modality: str = "gen",
     ):
+        # ``modality`` controls how the main train_dataset is interpreted:
+        #   - "gen":  train_dataset is the gen side (image-edit rollout driver);
+        #             train_dataset_und (optional) supplies paired und rows via
+        #             sample_id lookup. This is the standard interleave flow.
+        #   - "und":  train_dataset is the und side (text-only rollout driver);
+        #             train_dataset_und MUST be None; the image rollout is
+        #             bypassed entirely. Used by thinkmorph_answer.
+        # For thinkmorph_edit (gen-only) the default "gen" modality with
+        # train_dataset_und=None is exactly the right behavior — the text
+        # rollout is already bypassed when self._und_by_sample_id is None.
+        if modality not in ("gen", "und"):
+            raise ValueError(
+                f"modality must be 'gen' or 'und', got {modality!r}"
+            )
+        if modality == "und" and train_dataset_und is not None:
+            raise ValueError(
+                "modality='und' requires train_dataset_und=None: pass the "
+                "und rows as train_dataset instead. Got a non-None "
+                "train_dataset_und."
+            )
+        self.modality = modality
+
         _register_lavida_architectures()
         super().__init__(
             model=model,
@@ -377,17 +400,40 @@ class DiffuGRPOTrainer(GRPOTrainer):
         # Filled by _prepare_inputs on generation steps, consumed on subsequent steps.
         self._buffered_inputs = None
         
-        self._und_iter = None
+        # ---------- und side: sample-id pairing (no second dataloader) ----------
+        # Rationale: running a second DataLoader with its own RepeatSampler drifts
+        # from the gen-side sampler in distributed training, because each loader's
+        # ``accelerator.prepare`` dispatches batches to ranks independently.  The
+        # observed failure is
+        #     gen sample_id='arxivqa:q-bio-5057' vs und sample_id='arxivqa:cs-30504'
+        # at row 0 — same step, different ArxivQA rows on the two sides.
+        #
+        # Fix: build a ``{sample_id -> und_row}`` map once at init, then in
+        # ``_prepare_inputs`` resolve und rows from the gen batch by sample_id.
+        # This makes the pairing bulletproof regardless of sampler / shard /
+        # worker ordering — a gen row and its paired und row always share
+        # sample_id by construction (they were jointly permuted upstream in
+        # diffu_grpo_train.py).
+        self._und_by_sample_id = None
         if train_dataset_und is not None:
-            und_dataloader =self._get_dataloader(
-                dataset=train_dataset_und,
-                description="Training",
-                batch_size=self._train_batch_size * self.args.steps_per_generation,  # < this is the change
-                sampler_fn=self._get_train_sampler,
-                is_training=True,
-            )
-            self._und_dataloader = und_dataloader
-            self._und_iter = iter(und_dataloader)
+            if "sample_id" not in train_dataset_und.column_names:
+                raise ValueError(
+                    "train_dataset_und must carry a 'sample_id' column for "
+                    "gen/und pairing. Got columns: "
+                    f"{train_dataset_und.column_names}"
+                )
+            # Materialize to a dict for O(1) lookup. The und rows are small
+            # (text prompt + answer_gt + image path), so the memory cost is
+            # negligible compared to the model.
+            self._und_by_sample_id = {
+                row["sample_id"]: row for row in train_dataset_und
+            }
+            if len(self._und_by_sample_id) != len(train_dataset_und):
+                raise ValueError(
+                    f"train_dataset_und has duplicate sample_ids: "
+                    f"{len(train_dataset_und)} rows but only "
+                    f"{len(self._und_by_sample_id)} unique sample_ids."
+                )
 
 
     @staticmethod
@@ -2026,10 +2072,42 @@ class DiffuGRPOTrainer(GRPOTrainer):
             if self._step % generate_every == 0 or self._buffered_inputs is None:
                 # `inputs` is the full generation batch from the dataloader
                 # (per_device_train_batch_size * steps_per_generation samples).
-                gen_inputs = inputs
-
-                # Draw the corresponding und batch.
-                und_inputs = next(self._und_iter) if self._und_iter is not None else None
+                # Dispatch based on modality:
+                #   - "gen": inputs drive the gen side; und side (if any) is
+                #     resolved by sample_id lookup.
+                #   - "und": inputs drive the und side; gen side is None and
+                #     the image rollout is bypassed entirely.
+                if self.modality == "und":
+                    gen_inputs = None
+                    und_inputs = inputs
+                else:
+                    gen_inputs = inputs
+                    # Resolve the paired und batch by sample_id (NOT by a
+                    # second dataloader — see __init__ for why).  We look up
+                    # one und row per gen row, in order, so ``und_inputs[i]``
+                    # always refers to the same source sample as
+                    # ``gen_inputs[i]``.
+                    und_inputs = None
+                    if self._und_by_sample_id is not None:
+                        und_inputs = []
+                        for i, g in enumerate(gen_inputs):
+                            sid = g.get("sample_id") if hasattr(g, "get") else None
+                            if sid is None:
+                                raise ValueError(
+                                    f"gen row {i} is missing 'sample_id' — "
+                                    f"cannot pair with und row. Check that "
+                                    f"sample_id is not being stripped by "
+                                    f"_remove_unused_columns."
+                                )
+                            u = self._und_by_sample_id.get(sid)
+                            if u is None:
+                                raise KeyError(
+                                    f"gen row {i} has sample_id={sid!r} but "
+                                    f"no matching und row exists. Was "
+                                    f"train_dataset built from a different "
+                                    f"source than train_dataset_und?"
+                                )
+                            und_inputs.append(u)
 
                 gen_and_score = self._generate_and_score_completions(
                     gen_inputs=gen_inputs, und_inputs=und_inputs,
@@ -2071,7 +2149,11 @@ class DiffuGRPOTrainer(GRPOTrainer):
             self._step += 1
             return result
         else:
-            gen_and_score = self._generate_and_score_completions(gen_inputs=inputs)
+            # Eval path: route ``inputs`` to whichever side ``modality`` points to.
+            if self.modality == "und":
+                gen_and_score = self._generate_and_score_completions(und_inputs=inputs)
+            else:
+                gen_and_score = self._generate_and_score_completions(gen_inputs=inputs)
             # Append None chunk_range to match the 5-element format from _split_modality_batch.
             gen_b = gen_and_score.get("gen")
             und_b = gen_and_score.get("und")

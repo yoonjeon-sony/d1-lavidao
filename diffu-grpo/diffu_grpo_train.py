@@ -357,6 +357,12 @@ def _validate_reward_dataset_compatibility(dataset_name: str, dataset, reward_fu
 def main(grpo_config, model_config):
     set_random_seed(grpo_config.seed)
 
+    # ``modality`` controls whether train_dataset drives the gen-side
+    # (image-edit rollout) or the und-side (text rollout). Default "gen"
+    # matches every legacy dataset path. ``thinkmorph_answer`` is text-only
+    # and flips this to "und" so the image rollout is bypassed entirely.
+    modality = "gen"
+
     if grpo_config.dataset == "gsm8k":
         dataset = get_gsm8k_questions("train")
         reward_functions = [
@@ -381,14 +387,23 @@ def main(grpo_config, model_config):
         dataset = get_code_questions()
         reward_functions = [xmlcount_reward_func, coding_reward_func]
     elif grpo_config.dataset == "thinkmorph_edit":
+        # Gen-only flow: train_dataset carries the image-edit rows and
+        # drives the image rollout. und_dataset is None so the trainer
+        # automatically skips the text rollout / text loss.
         dataset = get_image_edit_placeholder_questions()
         reward_functions = [perceptual_score_reward_func]
+        modality = "gen"
     elif grpo_config.dataset == "thinkmorph_answer":
+        # Und-only flow: train_dataset carries the text-QA rows and drives
+        # the text rollout. modality="und" tells the trainer to treat
+        # train_dataset as und-side inputs and bypass the image rollout
+        # entirely. und_dataset MUST stay None.
         dataset = get_image_answer_placeholder_questions()
         reward_functions = [
             strict_format_reward_func,
             correctness_reward_func,
         ]
+        modality = "und"
     elif grpo_config.dataset == "thinkmorph_interleave":
         tm_gen, tm_und = get_thinkmorph_interleave_questions()
         ax_gen, ax_und = get_arxivqa_interleave_questions()
@@ -449,6 +464,7 @@ def main(grpo_config, model_config):
         train_dataset=train_set,
         train_dataset_und=und_train_set,
         optimizers=(optimizer, None),
+        modality=modality,
     )
 
     if grpo_config.save_steps % grpo_config.num_iterations != 0:

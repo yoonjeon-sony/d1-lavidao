@@ -403,33 +403,60 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
             if images_gen is not None:
                 gen_latents_masked = gen_latents.clone()
                 if mask_seed is not None:
-                    # Scoring mode: deterministic masking with the same seeded generator
-                    # used for text masking (continues its random sequence).
+                    # Scoring mode: deterministic masking using the SAME
+                    # logic as ``masked_indices`` (torch.rand < mask_prob),
+                    # but with a SEPARATE seeded generator so the gen mask
+                    # is purely a function of (mask_seed, gen_latents.shape)
+                    # — independent of the text draw's consumption of the
+                    # shared generator.
+                    #
+                    # Why this matters: the previous implementation reused
+                    # the ``generator`` already advanced by the text draw at
+                    # line 316 above, so the gen mask implicitly depended on
+                    # ``text_seq_len``.  Any drift in text_seq_len between
+                    # two forwards (padding differences, collator corners,
+                    # adapter-dependent sequence reshaping under
+                    # disable_adapter()) would land the gen torch.rand call
+                    # on different generator state, producing a handful of
+                    # mismatched positions in ``masked_indices_gen`` across
+                    # old / ref / current passes.  That's what drove the
+                    # debug-log KL "ref zero-padded at N positions where
+                    # old_ptl is real" warning on the gen modality.
+                    #
+                    # Deriving a second generator from ``mask_seed`` (offset
+                    # by a constant to decorrelate from the text stream)
+                    # decouples the gen mask from text_seq_len entirely.
+                    GEN_SEED_OFFSET = 0x5F3759DF  # arbitrary constant
+                    gen_generator = torch.Generator(device=labels_mask.device)
+                    gen_generator.manual_seed(int(mask_seed) ^ GEN_SEED_OFFSET)
                     N_gen = gen_latents_masked.shape[0]
                     if is_unitok_submask:
                         raw_len = gen_latents.shape[-1] * 8
                         masked_indices_gen = (torch.rand(
                             (N_gen, raw_len),
                             device=raw_inputs_ids.device,
-                            generator=generator,
+                            generator=gen_generator,
                         ) < mask_prob)
                         masked_indices_gen = masked_indices_gen.view(-1, 8, gen_latents.shape[-1])
                     else:
                         masked_indices_gen = (torch.rand(
                             (N_gen, gen_latents.shape[-1]),
                             device=raw_inputs_ids.device,
-                            generator=generator,
+                            generator=gen_generator,
                         ) < mask_prob)
                         if is_unitok:
                             masked_indices_gen = masked_indices_gen.unsqueeze(1).repeat(1, 8, 1)
                 elif is_unitok_submask:
+                    # Non-scoring path (regular SFT forward).  forward_process
+                    # does NOT accept a ``mask_seeds`` kwarg — passing it here
+                    # used to be a latent crash for any caller that reached
+                    # this branch with mask_seeds set.  Strip it.
                     masked_indices_gen, p_mask = forward_process(
                         gen_latents_masked.shape[0],
                         gen_latents.shape[-1] * 8,
                         raw_inputs_ids.device,
                         policy=policy,
                         policy_args=policy_args,
-                        mask_seeds=mask_seeds,
                     )
                     masked_indices_gen = masked_indices_gen.view(-1,8,gen_latents.shape[-1])
                 else:
@@ -439,7 +466,6 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
                         raw_inputs_ids.device,
                         policy=policy,
                         policy_args=policy_args,
-                        mask_seeds=mask_seeds,
                     )
                     if is_unitok:
                         masked_indices_gen = masked_indices_gen.unsqueeze(1).repeat(1,8,1) # N 8
