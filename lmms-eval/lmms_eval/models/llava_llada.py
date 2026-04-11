@@ -353,7 +353,10 @@ class Llava_Llada(lmms):
         num_generated = 0
 
         # Resolve vision-tower image processor once up front (needed by both
-        # rollout paths). Mirrors Diffu_Grpo_Trainer._get_image_processor.
+        # rollout paths). Mirrors Diffu_Grpo_Trainer._get_image_processor with
+        # a final fallback to the processor load_pretrained_model produced.
+        # Must be non-None: if it is, run_image_rollout silently short-circuits
+        # to invalid contexts (see rollout.py:390-396).
         vt = self.model.get_vision_tower() if hasattr(self.model, "get_vision_tower") else None
         image_processor = getattr(vt, "image_processor", None)
         if image_processor is None and hasattr(self.model, "get_model"):
@@ -362,6 +365,13 @@ class Llava_Llada(lmms):
                 bvt = base.get_vision_tower()
                 if bvt is not None and hasattr(bvt, "image_processor"):
                     image_processor = bvt.image_processor
+        if image_processor is None:
+            image_processor = self._image_processor
+        if image_processor is None:
+            raise RuntimeError(
+                "Llava_Llada.generate_until: could not resolve an image_processor from "
+                "the vision tower or load_pretrained_model. Both rollout paths require one."
+            )
         device = self.model.get_model().device
 
         # Build image-gen config once — shared across all batches in this
@@ -414,16 +424,42 @@ class Llava_Llada(lmms):
 
             # Build the per-sample "example" dicts that the trainer-style
             # rollout functions expect. The trainer rollout takes a single
-            # primary image per sample (not a list).
+            # primary image per sample (not a list); lmms-eval hands us a
+            # bare question string + a separate images list, so we
+            # reconstruct the same prompt format both rollout paths expect:
+            #   - text rollout (run_text_rollout): ``example["prompt"]`` is the
+            #     user-turn string wrapped in the conv template by
+            #     _build_llada_prompt. It must contain DEFAULT_IMAGE_TOKEN so
+            #     _build_llada_prompt's ``has_gen_image=True`` branch (used in
+            #     image_gen mode) can duplicate it into two <image>\n slots.
+            #     Mirrors the pre-refactor _build_text_prompt helper:
+            #     ``"<image>\n {COT_PROMPT} {ctx}"``.
+            #   - image rollout (run_image_rollout): ``example["instruction"]``
+            #     is read by _extract_image_edit_instruction and appended into
+            #     the edit-prompt template. Mirrors the pre-refactor
+            #     _build_edit_prompt helper: ``f"{EDIT_PROMPT} {ctx}"``. The
+            #     image rollout builds its own ``<image>`` slot internally, so
+            #     the instruction must NOT carry DEFAULT_IMAGE_TOKEN.
+            # ``example["image"]`` is the primary PIL image, consumed by both
+            # paths: the edit path feeds it to the VQ-VAE via
+            # image_processor_gen.preprocess, and the text path feeds it to the
+            # vision tower via prepare_inputs_labels_for_multimodal.
+            from data_utils import COT_PROMPT, EDIT_PROMPT
+
             examples = []
             for ctx, images, task_name, split_name, doc_id in zip(
                 batched_contexts, batch_pil_images, batched_task, batched_split, batched_doc_id
             ):
                 primary_image = images[0] if isinstance(images, (list, tuple)) and len(images) > 0 else images
+                if primary_image is not None and DEFAULT_IMAGE_TOKEN not in (ctx or ""):
+                    user_content = f"{DEFAULT_IMAGE_TOKEN}\n {COT_PROMPT} {ctx}"
+                else:
+                    user_content = f"{COT_PROMPT} {ctx}"
+                edit_instruction = f"{EDIT_PROMPT} {ctx}"
                 examples.append({
-                    "prompt": ctx,          # _build_llada_prompt handles raw strings
-                    "image": primary_image,  # PIL.Image — used by both rollout paths
-                    "instruction": ctx,      # picked up by _extract_image_edit_instruction
+                    "prompt": user_content,        # wrapped in conv template by _build_llada_prompt
+                    "image": primary_image,        # PIL.Image — consumed by both rollout paths
+                    "instruction": edit_instruction,  # read by _extract_image_edit_instruction
                     "sample_id": f"{task_name}_{split_name}_{doc_id}",
                 })
 
