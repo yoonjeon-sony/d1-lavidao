@@ -1,4 +1,4 @@
-from datasets import load_dataset, Dataset, Features, Value, concatenate_datasets
+from datasets import load_dataset, load_from_disk, Dataset, Features, Value, concatenate_datasets
 import json
 import os
 import random
@@ -326,9 +326,6 @@ def get_thinkmorph_interleave_questions() -> tuple[Dataset, Dataset]:
     at the same index, sharing a `sample_id` so the trainer can assert alignment.
     Both rows are tagged ``dataset_type="image_answer"``.
     """
-    if split != "train":
-        raise ValueError(f"Unsupported split '{split}' for ThinkMorph interleave data. Use 'train'.")
-
     data_root = DATA_ROOT
     image_root = DATA_ROOT
     train_data_paths = [os.path.join(data_root, name) for name in THINKMORPH_LOCAL_JSONL_FILES]
@@ -547,12 +544,48 @@ def download_process_arxivqa(data_root: str = "./data"):
 
 
 
+ARXIVQA_DEFAULT_DATASET_PATH = "/scratch2/yoonjeon.kim/data/arxivqa_select_10k"
+
+
+
+def _resolve_arxivqa_pil_image(image, image_cache_dir: str, sample_id: str) -> str:
+    """Return a filesystem path for an ArxivQA image cell.
+
+    The HF Image() feature loads each row's image as either a PIL Image
+    (in-memory) or a dict with ``path`` / ``bytes``. The downstream trainer
+    consumes string paths, so we materialize PIL images into a cache dir
+    on first call and return the cached path on subsequent calls (the
+    second .map() pass becomes a cheap stat check).
+    """
+    if isinstance(image, str) and image.strip():
+        return image
+    if isinstance(image, dict):
+        if image.get("path"):
+            return image["path"]
+        # Fall through: dict with bytes only is treated like a PIL below.
+    if hasattr(image, "save"):
+        safe = sample_id.replace(":", "_").replace("/", "_").replace(os.sep, "_")
+        path = os.path.join(image_cache_dir, f"{safe}.png")
+        if not os.path.exists(path):
+            image.convert("RGB").save(path)
+        return path
+    raise ValueError(
+        f"ArxivQA sample '{sample_id}' has unsupported image type: {type(image)!r}"
+    )
+
+
 def get_arxivqa_interleave_questions(
     split: str = "train",
-    data_root: str | None = None,
-    image_root: str | None = None,
+    dataset_path: str | None = None,
+    image_cache_dir: str | None = None,
 ) -> tuple[Dataset, Dataset]:
     """Build paired (gen_ds, und_ds) ArxivQA datasets for `thinkmorph_interleave`.
+
+    Loads the source dataset from ``dataset_path`` (an HF Dataset saved via
+    ``save_to_disk``, default ``ARXIVQA_DEFAULT_DATASET_PATH``) and uses two
+    ``.map()`` passes to project each row into a gen row and an und row sharing
+    a sample_id. Image cells are materialized to ``image_cache_dir`` so the
+    string-path schema in INTERLEAVE_*_FEATURES is preserved.
 
     The gen row has ``image_gt=None`` so the trainer skips perceptual reward,
     advantage, and loss computation for it (rollout-only). The und row carries
@@ -563,64 +596,79 @@ def get_arxivqa_interleave_questions(
     if split != "train":
         raise ValueError(f"Unsupported split '{split}' for ArxivQA. Use 'train'.")
 
-    data_root = DATA_ROOT
-    image_root = os.path.join(data_root, "arxivqa")
+    if dataset_path is None:
+        dataset_path = ARXIVQA_DEFAULT_DATASET_PATH
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"ArxivQA dataset not found: {dataset_path}")
 
-    data_path = os.path.join(data_root, "arxivqa_select_10k.jsonl")
-    if not os.path.isfile(data_path):
-        raise FileNotFoundError(f"ArxivQA file not found: {data_path}")
-
-    gen_rows: list[dict] = []
-    und_rows: list[dict] = []
-    with open(data_path, "r", encoding="utf-8") as f:
-        for idx, line in enumerate(tqdm(f, desc="Loading arxivqa.jsonl", unit="line")):
-            if not line.strip():
-                continue
-            sample = json.loads(line)
-            raw_id = sample.get("id", f"row-{idx}")
-            sample_id = f"arxivqa:{raw_id}"
-
-            question = sample.get("question")
-            if not isinstance(question, str) or not question.strip():
-                raise ValueError(f"ArxivQA sample '{sample_id}' has invalid question: {question!r}")
-
-            normalized_options = _normalize_arxivqa_options(sample.get("options"))
-            question_text = (
-                f"{question.strip()}\n"
-                f"{chr(10).join(normalized_options)}\n"
-                "choose one of the options (char ord by len(options))"
+    raw = load_from_disk(dataset_path)
+    # If the on-disk artifact is a DatasetDict, pick the train split.
+    if hasattr(raw, "keys") and not isinstance(raw, Dataset):
+        if "train" not in raw:
+            raise ValueError(
+                f"ArxivQA DatasetDict at {dataset_path} has no 'train' split: keys={list(raw.keys())}"
             )
-            image_path = _resolve_arxivqa_image_path(sample.get("image"), image_root, sample_id)
-            answer_gt = _normalize_arxivqa_label(sample.get("label"))
+        raw = raw["train"]
 
-            edit_instruction = f"{EDIT_PROMPT} {question_text}"
-            cot_instruction = f"{COT_PROMPT} {question_text}"
+    def _build_question_text(example: dict) -> str:
+        question = example.get("question")
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError(f"ArxivQA sample has invalid question: {question!r}")
+        normalized = _normalize_arxivqa_options(example.get("options"))
+        return (
+            f"{question.strip()}\n"
+            f"{chr(10).join(normalized)}\n"
+            "Choose one of the options."
+        )
 
-            gen_rows.append(
-                {
-                    "task_type": "image_edit",
-                    "dataset_type": "answer_only",
-                    "sample_id": sample_id,
-                    "prompt": [{"role": "user", "content": f"<image>\n{edit_instruction}"}],
-                    "instruction": edit_instruction,
-                    "image": image_path,
-                    "image_gen_enc": image_path,
-                    "image_gt": None,  # gating signal: no perceptual reward / advantage / loss
-                    "answer_gt": None,
-                }
-            )
-            und_rows.append(
-                {
-                    "task_type": "text",
-                    "dataset_type": "answer_only",
-                    "sample_id": sample_id,
-                    "prompt": [{"role": "user", "content": f"<image>\n{cot_instruction}"}],
-                    "instruction": cot_instruction,
-                    "image": image_path,
-                    "answer_gt": answer_gt,
-                }
-            )
+    def _to_gen(example: dict, idx: int) -> dict:
+        raw_id = example.get("id", f"row-{idx}")
+        sample_id = f"arxivqa:{raw_id}"
+        question_text = example.get("question")
+        image_path = os.path.join(DATA_ROOT, "arxivqa", example.get("image"))
+        
+        edit_instruction = f"{EDIT_PROMPT} {question_text}"
+        return {
+            "task_type": "image_edit",
+            "dataset_type": "answer_only",
+            "sample_id": sample_id,
+            "prompt": [{"role": "user", "content": f"<image>\n{edit_instruction}"}],
+            "instruction": edit_instruction,
+            "image": image_path,
+            "image_gen_enc": image_path,
+            "image_gt": None,  # gating signal: no perceptual reward / advantage / loss
+            "answer_gt": None,
+        }
 
-    gen_ds = Dataset.from_list(gen_rows, features=INTERLEAVE_GEN_FEATURES)
-    und_ds = Dataset.from_list(und_rows, features=INTERLEAVE_UND_FEATURES)
+    def _to_und(example: dict, idx: int) -> dict:
+        raw_id = example.get("id", f"row-{idx}")
+        sample_id = f"arxivqa:{raw_id}"
+        question_text = _build_question_text(example)
+        image_path = os.path.join(DATA_ROOT, "arxivqa", example.get("image"))
+        cot_instruction = f"{COT_PROMPT} {question_text}"
+        answer_gt = _normalize_arxivqa_label(example.get("label"))
+        return {
+            "task_type": "text",
+            "dataset_type": "answer_only",
+            "sample_id": sample_id,
+            "prompt": [{"role": "user", "content": f"<image>\n{cot_instruction}"}],
+            "instruction": cot_instruction,
+            "image": image_path,
+            "answer_gt": answer_gt,
+        }
+
+    gen_ds = raw.map(
+        _to_gen,
+        with_indices=True,
+        remove_columns=raw.column_names,
+        features=INTERLEAVE_GEN_FEATURES,
+        desc="ArxivQA → gen rows",
+    )
+    und_ds = raw.map(
+        _to_und,
+        with_indices=True,
+        remove_columns=raw.column_names,
+        features=INTERLEAVE_UND_FEATURES,
+        desc="ArxivQA → und rows",
+    )
     return gen_ds, und_ds

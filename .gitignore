@@ -21,4 +21,4 @@ __pycache__/
 
 # Weights & Biases
 wandb/
-lmms-eval/
+# lmms-eval/

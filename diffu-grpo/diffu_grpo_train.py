@@ -56,7 +56,6 @@ from reward_func import (
     countdown_reward_func,
     int_reward_func,
     perceptual_score_reward_func,
-    soft_format_reward_func,
     strict_format_reward_func,
     sudoku_reward_func,
     xmlcount_reward_func,
@@ -362,7 +361,6 @@ def main(grpo_config, model_config):
         dataset = get_gsm8k_questions("train")
         reward_functions = [
             xmlcount_reward_func,
-            soft_format_reward_func,
             strict_format_reward_func,
             int_reward_func,
             correctness_reward_func,
@@ -383,18 +381,17 @@ def main(grpo_config, model_config):
         dataset = get_code_questions()
         reward_functions = [xmlcount_reward_func, coding_reward_func]
     elif grpo_config.dataset == "thinkmorph_edit":
-        dataset = get_image_edit_placeholder_questions("train")
+        dataset = get_image_edit_placeholder_questions()
         reward_functions = [perceptual_score_reward_func]
     elif grpo_config.dataset == "thinkmorph_answer":
-        dataset = get_image_answer_placeholder_questions("train")
+        dataset = get_image_answer_placeholder_questions()
         reward_functions = [
-            soft_format_reward_func,
             strict_format_reward_func,
             correctness_reward_func,
         ]
     elif grpo_config.dataset == "thinkmorph_interleave":
-        tm_gen, tm_und = get_thinkmorph_interleave_questions("train")
-        ax_gen, ax_und = get_arxivqa_interleave_questions("train")
+        tm_gen, tm_und = get_thinkmorph_interleave_questions()
+        ax_gen, ax_und = get_arxivqa_interleave_questions()
 
         # Concatenate gen and und sides. Each loader emits its gen and und rows
         # in the same order, so within each sub-dataset row i refers to the same

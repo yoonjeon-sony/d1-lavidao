@@ -18,13 +18,13 @@ DEBUG="${DEBUG:-0}"
 
 mkdir -p "$TRITON_CACHE_DIR"
 chmod 700 "$TRITON_CACHE_DIR"
-DATASET="thinkmorph_answer" # thinkmorph_interleave thinkmorph_answer thinkmorph_edit
+DATASET="thinkmorph_interleave" # thinkmorph_interleave thinkmorph_answer thinkmorph_edit
 RUN_NAME=${DATASET}-LavidaO
 # MODEL_PATH=/group2/dgm/yoonjeon/ckpts/sft-lavidao-thinkmorph-complete/checkpoint-2420
-# MODEL_PATH="/scratch2/yoonjeon.kim/sft_LaViDa-O-thinkmorph_zebracot-step3000/"
-MODEL_PATH="/group2/dgm/yoonjeon/ckpts/sft_LaViDa-O-thinkmorph_zebracot/checkpoint-7000"
-# OUTPUT_DIR=/scratch2/yoonjeon.kim/rl-lavidao-thinkmorph/$RUN_NAME
-OUTPUT_DIR="/group2/dgm/yoonjeon/ckpts/rl-lavidao-thinkmorph/$RUN_NAME"
+MODEL_PATH="/scratch2/yoonjeon.kim/sft_LaViDa-O-thinkmorph_zebracot-step3000/"
+# MODEL_PATH="/group2/dgm/yoonjeon/ckpts/sft_LaViDa-O-thinkmorph_zebracot/checkpoint-7000"
+OUTPUT_DIR=/scratch2/yoonjeon.kim/rl-lavidao-thinkmorph/$RUN_NAME
+# OUTPUT_DIR="/group2/dgm/yoonjeon/ckpts/rl-lavidao-thinkmorph/$RUN_NAME"
 
 # ----------------------------
 # Model initialization configs
@@ -96,12 +96,17 @@ IMAGE_EDIT_MIN_TEMPERATURE=0.5
 # ----------------------------
 NUM_ITER=2
 BETA=0.04
-EPSILON=0.5
+EPSILON=0.2
 SYNC_REF_MODEL="false"
 REF_MODEL_SYNC_STEPS=64
 
 if [[ "${DEBUG}" == "1" || "${DEBUG,,}" == "true" ]]; then
     echo "Running in debug mode!!!!"
+    # Turn on GRPO loss instrumentation (shape / coef_1 / KL / reduced-loss
+    # logging in diffu_grpo_trainer._grpo_loss) so blow-ups are localized.
+    export DIFFU_GRPO_DEBUG=1
+    export DIFFU_GRPO_STEP0_ASSERT=1
+    export DIFFU_GRPO_STEP0_STRICT=1
     BATCH_SIZE=8
     NUM_PROCESSES=4
     NUM_GENERATIONS=8

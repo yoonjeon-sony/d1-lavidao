@@ -48,6 +48,41 @@ os.environ.setdefault("NOT_ALWASY_DO_2DPOOL", "1")
 # per_token_logps (2B, L) and the stored old_per_token_logps (B, L).
 os.environ.setdefault("SKIP_COMPLEMENTARY_MASKING", "1")
 
+# ---------------------------------------------------------------------------
+# Loss-explosion debug instrumentation
+# ---------------------------------------------------------------------------
+# Gated by the DIFFU_GRPO_DEBUG env var.  When enabled, the GRPO loss helper
+# runs a battery of shape / magnitude checks around ``coef_1 = exp(curr - old)``
+# and the KL term so we can localize the source of the astronomical loss /
+# grad_norm values observed in training.  Kept out of the hot path in release
+# mode so there's zero overhead when DIFFU_GRPO_DEBUG is off.
+DIFFU_GRPO_DEBUG = os.environ.get("DIFFU_GRPO_DEBUG", "0") == "1"
+# When debug is on, also promote the step-0 determinism check to strict (raise
+# instead of warn) so any non-determinism aborts loudly on the first step.
+if DIFFU_GRPO_DEBUG:
+    os.environ.setdefault("DIFFU_GRPO_STEP0_STRICT", "1")
+
+
+def _debug_log(msg: str) -> None:
+    """Tagged print gated by DIFFU_GRPO_DEBUG. No-op when debug is off."""
+    if DIFFU_GRPO_DEBUG:
+        print(f"[DIFFU_GRPO_DEBUG] {msg}", flush=True)
+
+
+def _debug_run(fn):
+    """Run ``fn`` only when DIFFU_GRPO_DEBUG is on.  Used as a cheap guard so
+    callers can write ``_debug_run(lambda: ...)`` without an explicit ``if``
+    everywhere.  Any exception inside is printed (not raised) so the debug
+    hooks can't take down a real training run when left on by accident.
+    """
+    if not DIFFU_GRPO_DEBUG:
+        return None
+    try:
+        return fn()
+    except Exception as e:
+        print(f"[DIFFU_GRPO_DEBUG] hook raised: {type(e).__name__}: {e}", flush=True)
+        return None
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LAVIDA_ROOT = REPO_ROOT / "LaVida-O"
 if str(LAVIDA_ROOT) not in sys.path:
@@ -1753,16 +1788,100 @@ class DiffuGRPOTrainer(GRPOTrainer):
                             else:
                                 print("[WARN]", msg, flush=True)
 
+            # -------- DEBUG: pre-exp shape / zero-pattern checks --------
+            # These catch the "current-pass logps are zero-padded at positions
+            # where old_ptl is non-zero" footgun, which makes
+            # coef_1 = exp(0 - old_ptl) blow up into the 1e8+ range and, via
+            # the clipped-PPO asymmetry on negative advantages, produces the
+            # observed 1e7-1e13 loss values.
+            def _dbg_preexp():
+                cur_mask = (per_token_logps.detach() != 0)
+                old_mask = (old_ptl.detach() != 0)
+                # Positions where old thinks the token is real but current is
+                # zero-padded (the dangerous class).
+                only_old = (old_mask & ~cur_mask).sum().item()
+                only_cur = (cur_mask & ~old_mask).sum().item()
+                shape_ok = per_token_logps.shape == old_ptl.shape
+                msg = (
+                    f"{prefix}shape check | per_token_logps={tuple(per_token_logps.shape)} "
+                    f"old_ptl={tuple(old_ptl.shape)} shape_match={shape_ok} "
+                    f"only_old_nonzero={only_old} only_cur_nonzero={only_cur}"
+                )
+                _debug_log(msg)
+                if only_old > 0:
+                    # This is the primary suspected cause: sample a handful of
+                    # offending positions and print old_ptl values so we can
+                    # see the magnitude of exp(-old_ptl) it will produce.
+                    bad = (old_mask & ~cur_mask).nonzero(as_tuple=False)[:5]
+                    for idx in bad:
+                        i, j = int(idx[0]), int(idx[1])
+                        old_v = float(old_ptl[i, j].detach())
+                        _debug_log(
+                            f"{prefix}pad-mismatch @[{i},{j}]: "
+                            f"old_ptl={old_v:.3e} → coef_1 would be exp({-old_v:.3e})"
+                        )
+            _debug_run(_dbg_preexp)
+
             coef_1 = torch.exp(per_token_logps - old_ptl)
             coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
             per_token_loss1 = coef_1 * advantages.unsqueeze(1)
             per_token_loss2 = coef_2 * advantages.unsqueeze(1)
             per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
 
+            # -------- DEBUG: coef_1 magnitude ----------
+            def _dbg_coef1():
+                mask = (old_ptl.detach() != 0)
+                if not mask.any():
+                    return
+                diff = (per_token_logps.detach() - old_ptl.detach())[mask]
+                c1 = coef_1.detach()[mask]
+                _debug_log(
+                    f"{prefix}coef_1 | min={float(c1.min()):.3e} "
+                    f"max={float(c1.max()):.3e} mean={float(c1.mean()):.3e} "
+                    f"| logdiff min={float(diff.min()):.3e} "
+                    f"max={float(diff.max()):.3e} "
+                    f"| adv min={float(advantages.min()):.3e} "
+                    f"max={float(advantages.max()):.3e}"
+                )
+                # Early warning for any catastrophic entry.
+                if float(c1.max()) > 1e4:
+                    topk = diff.abs().topk(min(5, diff.numel()))
+                    _debug_log(
+                        f"{prefix}coef_1 EXPLOSION | top |logdiff|="
+                        f"{[float(v) for v in topk.values.tolist()]}"
+                    )
+            _debug_run(_dbg_coef1)
+
             if ref_ptl is not None:
                 log_ratio = ref_ptl - per_token_logps
                 per_token_kl = torch.exp(log_ratio) - log_ratio - 1
                 per_token_loss = per_token_loss + beta * per_token_kl
+
+                # -------- DEBUG: KL term magnitude ----------
+                def _dbg_kl():
+                    mask = (old_ptl.detach() != 0)
+                    if not mask.any():
+                        return
+                    lr = log_ratio.detach()[mask]
+                    kl = per_token_kl.detach()[mask]
+                    _debug_log(
+                        f"{prefix}kl | log_ratio min={float(lr.min()):.3e} "
+                        f"max={float(lr.max()):.3e} abs_max={float(lr.abs().max()):.3e} "
+                        f"| per_token_kl min={float(kl.min()):.3e} "
+                        f"max={float(kl.max()):.3e} mean={float(kl.mean()):.3e} "
+                        f"| beta={beta}"
+                    )
+                    # Flag ref-side zero-padding mismatch (the KL analogue of
+                    # the coef_1 mismatch above: ref padded with 0 where curr
+                    # is very negative → exp(-curr) blows up).
+                    ref_mask = (ref_ptl.detach() != 0)
+                    only_old = (mask & ~ref_mask).sum().item()
+                    if only_old > 0:
+                        _debug_log(
+                            f"{prefix}kl | ref zero-padded at {only_old} positions "
+                            f"where old_ptl is real — KL term is unsafe here"
+                        )
+                _debug_run(_dbg_kl)
             else:
                 per_token_kl = None
 
@@ -1774,6 +1893,21 @@ class DiffuGRPOTrainer(GRPOTrainer):
             completion_mask = (old_ptl != 0).float()
             denom = completion_mask.sum().clamp(min=1.0)
             loss = (per_token_loss * completion_mask).sum() / denom
+
+            # -------- DEBUG: per-chunk reduced loss ----------
+            def _dbg_loss():
+                l = float(loss.detach())
+                ptl_masked = (per_token_loss.detach() * completion_mask)
+                per_pos_max = float(ptl_masked.abs().max()) if completion_mask.any() else 0.0
+                _debug_log(
+                    f"{prefix}reduced loss={l:.3e} | denom={int(denom.item())} "
+                    f"| per_pos |loss| max={per_pos_max:.3e} "
+                    f"| global_step={int(getattr(self.state, 'global_step', 0))} "
+                    f"inner_step={int(self._step)}"
+                )
+                if not math.isfinite(l):
+                    _debug_log(f"{prefix}LOSS NON-FINITE — aborting hook chain")
+            _debug_run(_dbg_loss)
 
             # ---- Metrics ----
             if per_token_kl is not None:
