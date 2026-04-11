@@ -319,7 +319,7 @@ INTERLEAVE_UND_FEATURES = Features(
 )
 
 
-def get_thinkmorph_interleave_questions(split: str = "train") -> tuple[Dataset, Dataset]:
+def get_thinkmorph_interleave_questions() -> tuple[Dataset, Dataset]:
     """Build paired (gen_ds, und_ds) ThinkMorph datasets for `thinkmorph_interleave`.
 
     Each source jsonl sample contributes one row to gen_ds and one row to und_ds

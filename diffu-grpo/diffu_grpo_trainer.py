@@ -656,6 +656,12 @@ class DiffuGRPOTrainer(GRPOTrainer):
         _, completion_ids = self._normalize_text_rollout(generated, prompt_ids, prefix_lm)
         decoded_texts = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
 
+        # Per-row prompt / completion token counts (non-pad). Reported as
+        # und/prompt_length and und/completion_length metrics.
+        pad_id = self.processing_class.pad_token_id
+        per_row_prompt_lens = (prompt_ids != pad_id).sum(dim=1).tolist()
+        per_row_completion_lens = (completion_ids != pad_id).sum(dim=1).tolist()
+
         image_contexts = []
         for batch_idx, example in enumerate(examples):
             prompt_data = example.get("prompt", "")
@@ -664,6 +670,8 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 {
                     "decoded_text": decoded_texts[batch_idx],
                     "prompt": prompt_texts[batch_idx],
+                    "prompt_len_tokens": int(per_row_prompt_lens[batch_idx]),
+                    "completion_len_tokens": int(per_row_completion_lens[batch_idx]),
                     "payload": {
                         "id": str(example.get("sample_id", example.get("pid", example.get("id", "")))),
                         "image": source_images_per_example[batch_idx],
@@ -838,6 +846,9 @@ class DiffuGRPOTrainer(GRPOTrainer):
             ).unsqueeze(0).to(device)
             all_input_ids.append(input_ids)
 
+        # Per-row prompt token lengths (un-padded), captured before left-padding
+        # so we can log them later as gen/prompt_length metrics.
+        per_row_prompt_lens = [int(t.shape[1]) for t in all_input_ids]
         all_input_ids = self._left_pad_2d(all_input_ids, self.processing_class.pad_token_id, torch.long)
         attention_mask = (all_input_ids != self.processing_class.pad_token_id).long()
         image_tensor = process_images(all_edit_images, image_processor, model.config)
@@ -1118,12 +1129,18 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 source_enc_images = [source_enc_images]
 
             instruction = self._extract_image_edit_instruction(example)
+            # Number of generated image tokens for this row (constant per run,
+            # determined by the gen config; reported per-row for symmetry with
+            # the und/text path).
+            row_completion_len = int(gen_cfg["n_tokens"])
             image_contexts.append(
                 {
                     "valid": True,
                     "latent_shape": tuple(xt[batch_idx].shape),
                     "decoded_image": decoded_image_obj,
                     "prompt": prompt,
+                    "prompt_len_tokens": per_row_prompt_lens[batch_idx],
+                    "completion_len_tokens": row_completion_len,
                     "payload": {
                         "id": sample_id,
                         "image_gen": str(decoded_image_path),
@@ -2050,6 +2067,38 @@ class DiffuGRPOTrainer(GRPOTrainer):
                             answer_contexts[start_idx + offset] = ctx
             else:
                 answer_contexts = None
+
+            # ---- Length metrics (gen / und prompt + completion tokens) ----
+            # Aggregate per-rank then gather across ranks so the logged values
+            # reflect the global step batch (matching the style of the standard
+            # GRPOTrainer's completions/* metrics).
+            def _log_length_metric(prefix: str, lengths_list: list[int]) -> None:
+                if not lengths_list:
+                    return
+                local = torch.tensor(lengths_list, dtype=torch.float32, device=device)
+                gathered = self.accelerator.gather(local)
+                self._metrics[mode][f"{prefix}/mean_length"].append(gathered.mean().item())
+                self._metrics[mode][f"{prefix}/min_length"].append(gathered.min().item())
+                self._metrics[mode][f"{prefix}/max_length"].append(gathered.max().item())
+
+            if image_contexts is not None:
+                _log_length_metric(
+                    "gen/prompt",
+                    [ctx.get("prompt_len_tokens", 0) for ctx in image_contexts if ctx is not None],
+                )
+                _log_length_metric(
+                    "gen/completion",
+                    [ctx.get("completion_len_tokens", 0) for ctx in image_contexts if ctx is not None],
+                )
+            if answer_contexts is not None:
+                _log_length_metric(
+                    "und/prompt",
+                    [ctx.get("prompt_len_tokens", 0) for ctx in answer_contexts if ctx is not None],
+                )
+                _log_length_metric(
+                    "und/completion",
+                    [ctx.get("completion_len_tokens", 0) for ctx in answer_contexts if ctx is not None],
+                )
 
             # ---- Build scoring examples per modality ----
             collate_fn = MaskDataCollator(self.processing_class, self.args)

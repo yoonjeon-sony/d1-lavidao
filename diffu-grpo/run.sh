@@ -10,9 +10,6 @@
 #SBATCH --output=/home/yoonjeon.kim/dLLM-RL/train_sft/slurm-logs/output.%j.log
 #SBATCH --error=/home/yoonjeon.kim/dLLM-RL/train_sft/slurm-logs/error.%j.log
 
-
-export WANDB_ENTITY="jeoni"
-export WANDB_PROJECT="RL_clean_d1"
 export DEBUG_FIX_PADDING=1
 export NOT_ALWASY_DO_2DPOOL=1
 export SKIP_COMPLEMENTARY_MASKING=1
