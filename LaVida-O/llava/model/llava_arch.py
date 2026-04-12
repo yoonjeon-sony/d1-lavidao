@@ -358,7 +358,8 @@ class LlavaMetaModel:
             rank0_print(f"Loaded mm projector weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
             incompatible_keys = self.vision_resampler.load_state_dict(get_w(mm_projector_weights, "vision_resampler"), strict=False)
             rank0_print(f"Loaded vision resampler weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
-
+import os
+NOT_ALWASY_DO_2DPOOL = os.environ.get("NOT_ALWASY_DO_2DPOOL", True)
 ALWASY_DO_2DPOOL = not NOT_ALWASY_DO_2DPOOL
 # ALWASY_DO_2DPOOL = True
 # breakpoint()

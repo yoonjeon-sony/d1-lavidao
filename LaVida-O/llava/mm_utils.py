@@ -25,6 +25,7 @@ import os
 import numpy as np
 from PIL import Image, ImageOps
 
+DEBUG_FIX_PADDING = os.environ.get("DEBUG_FIX_PADDING", True)
 def pad_to_square_and_resize(img, size=1024):
     padded_img = ImageOps.pad(img, (max(img.size), max(img.size)), color=(0, 0, 0))
     resized_img = padded_img.resize((size, size))
