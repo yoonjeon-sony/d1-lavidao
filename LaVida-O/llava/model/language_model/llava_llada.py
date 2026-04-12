@@ -125,10 +125,6 @@ def forward_process(bsz,seq_len,device, eps=1e-3,policy='uniform',policy_args=No
     
     return masked_indices, p_mask
 
-import os
-LOG_BATCH_LENGTH = os.environ.get('LOG_BATCH_LENGTH', False)
-DEBUG_PRINT_IMAGE_RES = os.environ.get("DEBUG_PRINT_IMAGE_RES", False)
-
 SKIP_COMPLEMENTARY_MASKING = os.environ.get("SKIP_COMPLEMENTARY_MASKING", False)
 
 class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):

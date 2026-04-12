@@ -575,7 +575,7 @@ class DiffuGRPOConfig(TrainingArguments):
     )
     # Image editing rollout defaults (LaVida-O eval_img baseline)
     image_edit_sample_policy: str = field(default="multinomial")
-    image_edit_confidence_policy: str = field(default="halton")
+    image_edit_confidence_policy: str = field(default="stratified")
     image_edit_guidance_scale: float = field(default=0.0)
     image_edit_batch_size: int = field(default=1)
     image_edit_resolution: int = field(default=1024)
@@ -593,7 +593,7 @@ class DiffuGRPOConfig(TrainingArguments):
     image_edit_min_temperature_samp: float = field(default=1.0)
     image_edit_cfg_interval_start: float = field(default=0.0)
     image_edit_cfg_interval_end: float = field(default=1.0)
-    image_edit_guidance_scale_image: float = field(default=5.0)
+    image_edit_guidance_scale_image: float = field(default=0.0)
     image_edit_edit_mode: int = field(default=0)
     image_edit_order_cutoff: float = field(default=1.0)
 

@@ -359,9 +359,6 @@ class LlavaMetaModel:
             incompatible_keys = self.vision_resampler.load_state_dict(get_w(mm_projector_weights, "vision_resampler"), strict=False)
             rank0_print(f"Loaded vision resampler weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
 
-import os
-DEBUG_PRINT_IMAGE_RES = os.environ.get("DEBUG_PRINT_IMAGE_RES", False)
-NOT_ALWASY_DO_2DPOOL = os.environ.get("NOT_ALWASY_DO_2DPOOL", False)
 ALWASY_DO_2DPOOL = not NOT_ALWASY_DO_2DPOOL
 # ALWASY_DO_2DPOOL = True
 # breakpoint()
@@ -589,8 +586,7 @@ class LlavaMetaForCausalLM(ABC):
             image_aspect_ratio = getattr(self.config, "image_aspect_ratio", "square")
             mm_newline_position = getattr(self.config, "mm_newline_position", "one_token")
             # mm_patch_merge_type = 'spatial_unpad'
-            if DEBUG_PRINT_IMAGE_RES:
-                print(f"DEBUG_PRINT_IMAGE_RES: {image_aspect_ratio,mm_patch_merge_type,mm_newline_position}")
+            
             if mm_patch_merge_type == "flat":
                 image_features = [x.flatten(0, 1) for x in image_features]
                 # print(len(image_features))

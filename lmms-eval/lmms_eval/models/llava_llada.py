@@ -105,14 +105,14 @@ class Llava_Llada(lmms):
         mc_num=16,
         chat_mode: Optional[str] = None,
         use_bbox: Optional[bool] = True,
-        img_gen_guidance_scale: float = 1.2,
-        img_gen_guidance_scale_image: float = 1.4,
+        img_gen_guidance_scale: float = 0,
+        img_gen_guidance_scale_image: float = 0,
         img_gen_conf_policy: str = "stratified",
-        img_gen_edit_mode: int = 1,
+        img_gen_edit_mode: int = 0,
         img_gen_n_steps: int = 64,
         img_gen_temperature: float = 0.8,
         img_gen_enable_stratified: bool = False,
-        img_gen_resolution: int = 512,
+        img_gen_resolution: int = 1024,
         gen_img_dir: Optional[str] = None,
         **kwargs,
     ) -> None:
@@ -380,6 +380,7 @@ class Llava_Llada(lmms):
         image_gen_cfg = build_image_edit_gen_cfg(
             image_resolution=self.img_gen_resolution,
             n_steps=self.img_gen_n_steps,
+            temperature=self.img_gen_temperature,
             guidance_scale=self.img_gen_guidance_scale,
             guidance_scale_image=self.img_gen_guidance_scale_image,
             confidence_policy=self.img_gen_conf_policy,
@@ -456,15 +457,27 @@ class Llava_Llada(lmms):
             for ctx, images, task_name, split_name, doc_id in zip(
                 batched_contexts, batch_pil_images, batched_task, batched_split, batched_doc_id
             ):
-                primary_image = images[0] if isinstance(images, (list, tuple)) and len(images) > 0 else images
-                if primary_image is not None and DEFAULT_IMAGE_TOKEN not in (ctx or ""):
-                    user_content = f"{DEFAULT_IMAGE_TOKEN}\n {COT_PROMPT} {ctx}"
+                # Normalize images to a flat list of PIL Images
+                if isinstance(images, (list, tuple)):
+                    image_list = [img for img in images if img is not None]
+                elif images is not None:
+                    image_list = [images]
+                else:
+                    image_list = []
+
+                num_images = len(image_list)
+                primary_image = image_list[0] if num_images > 0 else None
+
+                if num_images > 0 and DEFAULT_IMAGE_TOKEN not in (ctx or ""):
+                    image_tokens = (DEFAULT_IMAGE_TOKEN + "\n") * num_images
+                    user_content = f"{image_tokens} {COT_PROMPT} {ctx}"
                 else:
                     user_content = f"{COT_PROMPT} {ctx}"
                 edit_instruction = f"{EDIT_PROMPT} {ctx}"
                 examples.append({
                     "prompt": user_content,        # wrapped in conv template by _build_llada_prompt
-                    "image": primary_image,        # PIL.Image — consumed by both rollout paths
+                    "image": primary_image,        # first PIL.Image — used by image rollout (edit_image / init_image)
+                    "images": image_list,           # all PIL.Images — used by text rollout
                     "instruction": edit_instruction,  # read by _extract_image_edit_instruction
                     "sample_id": f"{task_name}_{split_name}_{doc_id}",
                 })

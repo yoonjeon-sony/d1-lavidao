@@ -356,7 +356,7 @@ def text_to_image(model,
         n_mask_remask = max(int(n_tokens * remask_ratio),1)
         indices = np.arange(n_tokens)
         np.random.shuffle(indices)
-        init_mask_indices = indices[:n_mask_remask]
+        init_mask_indices = indices[n_mask_remask:]
         xt[:,init_mask_indices] = init_latents[:,init_mask_indices]
         
     mask_idx = xt == img_mask_id

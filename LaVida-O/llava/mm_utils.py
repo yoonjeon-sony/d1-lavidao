@@ -339,8 +339,6 @@ def get_anyres_image_grid_shape(image_size, grid_pinpoints, patch_size):
     width, height = select_best_resolution(image_size, possible_resolutions)
     return width // patch_size, height // patch_size
 import os
-DEBUG_PRINT_IMAGE_RES = os.environ.get("DEBUG_PRINT_IMAGE_RES", False)
-DEBUG_FIX_PADDING = os.environ.get("DEBUG_FIX_PADDING", False)
 def process_anyres_image(image, processor, grid_pinpoints):
     """
     Process an image with variable resolutions.
@@ -374,8 +372,7 @@ def process_anyres_image(image, processor, grid_pinpoints):
     else:
         possible_resolutions = ast.literal_eval(grid_pinpoints)
     best_resolution = select_best_resolution(image.size, possible_resolutions)
-    if DEBUG_PRINT_IMAGE_RES:
-        print(best_resolution)
+
     image_padded = resize_and_pad_image(image, best_resolution)
 
     patches = divide_to_patches(image_padded, processor.crop_size["height"])
@@ -418,8 +415,7 @@ def expand2square(pil_img, background_color):
 def process_images(images, image_processor, model_cfg):
     image_aspect_ratio = getattr(model_cfg, "image_aspect_ratio", None)
     new_images = []
-    if DEBUG_PRINT_IMAGE_RES:
-        print("Preprocess:Image Aspect Ratio",image_aspect_ratio)
+
     if image_aspect_ratio == "highres":
         for image in images:
             image = process_highres_image(image, image_processor, model_cfg.image_grid_pinpoints)

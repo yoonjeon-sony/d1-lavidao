@@ -19,7 +19,7 @@ BATCH_SIZE=${BATCH_SIZE:-16}
 
 # CKPT="/group2/dgm/yoonjeon/LaViDa-O"
 # CKPT="/group2/dgm/yoonjeon/ckpts/sft-lavidao-thinkmorph-complete/checkpoint-2420" # SFT model 1
-CKPT="/group2/dgm/yoonjeon/ckpts/sft_LaViDa-O-thinkmorph_zebracot/checkpoint-7000" # SFT model 2
+CKPT="/group2/dgm/yoonjeon/ckpts/sft_LaViDa-O-thinkmorph_zebracot/checkpoint-9000" # SFT model 2
 # CKPT="yjyjyj98/thinkmorph-interleaved_reasoning-multimodal_reward-beta0.04_attnFixed-SFT_NEW-yes_bbox_ckpt100"
 # CKPT="yjyjyj98/thinkmorph-interleaved_reasoning-multimodal_reward-beta0.04_attnFixed-SFT_NEW-yes_bbox_ckpt200"
 # CKPT=/group2/dgm/yoonjeon/ckpts/rl-lavidao-thinkmorph/thinkmorph-interleaved_reasoning-multimodal_reward-beta0_attnFixed-yes_bbox/checkpoint-50
@@ -39,7 +39,6 @@ PARITY_CASES_ROOT=${PARITY_CASES_ROOT:-DEBUG/parity_text_gen}
 PARITY_CASES_MAX_PER_TASK=${PARITY_CASES_MAX_PER_TASK:-4}
 
 export NOT_ALWASY_DO_2DPOOL=1
-export DEBUG_PRINT_IMAGE_RES=1
 export DEBUG_FIX_PADDING=1
 
 MODEL_NAME=$(basename "$(dirname "$CKPT")")-$(basename "$CKPT")

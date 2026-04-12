@@ -6,7 +6,6 @@ set -x
 
 export TASKS=${TASKS:-"mme,mmmu_val,mmbench_en_dev,textvqa_val,docvqa_val,chartqa,infovqa_val,scienceqa_full,ai2d,mathverse_testmini_vision_dominant,mathvista_testmini_format"}
 export NOT_ALWASY_DO_2DPOOL=1
-export DEBUG_PRINT_IMAGE_RES=1
 export DEBUG_FIX_PADDING=1 # new runs must have this !!!!!!!!!!!!
 echo $TASKS
 

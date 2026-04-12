@@ -60,10 +60,9 @@ __all__ = [
 # Defaults mirror ``diffu-grpo/diffu_grpo_config.py`` image_edit_* fields.
 _IMAGE_EDIT_DEFAULTS: dict[str, Any] = {
     "sample_policy": "multinomial",
-    "confidence_policy": "halton",
+    "confidence_policy": "stratified",
     "guidance_scale": 0.0,
-    "guidance_scale_image": 5.0,
-    "batch_size": 1,
+    "guidance_scale_image": 0.0,
     "image_resolution": 1024,
     # n_tokens / prompt_n_tokens are resolved from image_resolution below
     # unless explicitly overridden.
@@ -82,6 +81,7 @@ _IMAGE_EDIT_DEFAULTS: dict[str, Any] = {
     "edit_mode": 0,
     "micro_cond": "",
     "remask_ratio": 0.01,
+    "temperature": 0.8,
 }
 
 
@@ -113,7 +113,6 @@ def build_image_edit_gen_cfg(**overrides: Any) -> dict[str, Any]:
     cfg["prompt_n_tokens"] = int(cfg["prompt_n_tokens"])
     cfg["shift"] = int(cfg["shift"])
     cfg["n_steps"] = int(cfg["n_steps"])
-    cfg["batch_size"] = int(cfg["batch_size"])
     cfg["alg_temp"] = float(cfg["alg_temp"])
     cfg["min_temperature"] = float(cfg["min_temperature"])
     cfg["min_temperature_samp"] = float(cfg["min_temperature_samp"])
@@ -124,6 +123,7 @@ def build_image_edit_gen_cfg(**overrides: Any) -> dict[str, Any]:
     cfg["dynamic_temperature"] = bool(cfg["dynamic_temperature"])
     cfg["dynamic_temperature_samp"] = bool(cfg["dynamic_temperature_samp"])
     cfg["remask_ratio"] = float(cfg["remask_ratio"])
+    cfg["temperature"] = float(cfg["temperature"])
     if isinstance(cfg["cfg_interval"], (tuple, list)):
         cfg["cfg_interval"] = [float(cfg["cfg_interval"][0]), float(cfg["cfg_interval"][1])]
     return cfg
@@ -234,13 +234,17 @@ def _build_llada_prompt(
     prompt = conv.get_prompt()
 
     if has_gen_image:
-        if "<image>\n" not in prompt:
+        # Insert an additional <image>\n after the *last* existing <image>\n
+        # so the model sees the gen_image as the final image slot.
+        last_idx = prompt.rfind("<image>\n")
+        if last_idx == -1:
             raise ValueError(
                 "has_gen_image=True but the built prompt does not contain "
                 "'<image>\\n' to duplicate. Check the conversation template "
                 "and the sample's 'prompt' field."
             )
-        prompt = prompt.replace("<image>\n", "<image>\n<image>\n", 1)
+        insert_pos = last_idx + len("<image>\n")
+        prompt = prompt[:insert_pos] + "<image>\n" + prompt[insert_pos:]
     return prompt
 
 
@@ -514,7 +518,7 @@ def run_image_rollout(
         n_mask_remask = max(int(n_tokens * remask_ratio), 1)
         indices = np.arange(n_tokens)
         np.random.shuffle(indices)
-        init_mask_indices = indices[:n_mask_remask]
+        init_mask_indices = indices[n_mask_remask:]
         xt[:, init_mask_indices] = init_latents[:, init_mask_indices]
 
     use_3d = False
@@ -642,7 +646,7 @@ def run_image_rollout(
         if gen_cfg["sample_policy"] == "argmax":
             x0 = safe_logits.argmax(-1)
         else:
-            temperature = 1.0
+            temperature = gen_cfg["temperature"]
             if gen_cfg["dynamic_temperature_samp"]:
                 temperature = temperature * float(local_temp_samp)
             if temperature <= 0:
@@ -800,13 +804,23 @@ def run_text_rollout(
         all_input_ids.append(prompt_ids.unsqueeze(0))
         prompt_texts.append(prompt_text)
 
-        image = _load_image(example.get("image"))
-        if image is None:
+        raw_images = example.get("images", None)
+        if raw_images is None:
+            # Fallback: single image under "image" key
+            single = _load_image(example.get("image"))
+            raw_images = [single] if single is not None else []
+        for img in raw_images:
+            if img is None:
+                continue
+            loaded = _load_image(img)
+            if loaded is None:
+                continue
+            processed_image = pad_to_square_and_resize(loaded.convert("RGB"), resolution)
+            all_images.append(processed_image)
+            image_sizes.append(processed_image.size)
+        if not any(img is not None for img in raw_images):
             sample_id = example.get("id", example.get("pid", "unknown"))
             raise ValueError(f"Text rollout example is missing an image: sample_id={sample_id}")
-        processed_image = pad_to_square_and_resize(image.convert("RGB"), resolution)
-        all_images.append(processed_image)
-        image_sizes.append(processed_image.size)
 
         if has_gen_image:
             gen_image = _load_image(example.get("gen_image"))

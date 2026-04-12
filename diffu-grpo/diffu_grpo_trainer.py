@@ -492,7 +492,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
             "sample_policy": self.args.image_edit_sample_policy,
             "confidence_policy": self.args.image_edit_confidence_policy,
             "guidance_scale": float(self.args.image_edit_guidance_scale),
-            "guidance_scale_image": float(getattr(self.args, "image_edit_guidance_scale_image", 5.0)),
+            "guidance_scale_image": float(getattr(self.args, "image_edit_guidance_scale_image", 0.0)),
             "batch_size": int(self.args.image_edit_batch_size),
             "image_resolution": res,
             "n_tokens": n_tokens,
@@ -1124,7 +1124,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
             if gen_cfg["sample_policy"] == "argmax":
                 x0 = safe_logits.argmax(-1)
             else:
-                temperature = 1.0
+                temperature = gen_cfg.get("temperature", 0.8)
                 if gen_cfg["dynamic_temperature_samp"]:
                     temperature = temperature * float(local_temp_samp)
                 if temperature <= 0:
@@ -2494,6 +2494,80 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(torch.nanmean(gen_rewards_per_func[:, i]).item())
                     self._metrics[mode][f"rewards/{reward_func_name}/std"].append(nanstd(gen_rewards_per_func[:, i]).item())
                 gen_local_rewards = gen_rewards_per_func.nansum(dim=1)
+
+                # ---- DEBUG: save first sample's completion, gt, prompt, reward ----
+                if DIFFU_GRPO_DEBUG and len(gen_completions) > 0 and sub_idx:
+                    try:
+                        from PIL import Image, ImageDraw, ImageFont
+                        import textwrap
+
+                        debug_dir = Path("./debug")
+                        debug_dir.mkdir(parents=True, exist_ok=True)
+
+                        comp_img = gen_completions[0]
+                        if not isinstance(comp_img, Image.Image):
+                            comp_img = Image.open(comp_img).convert("RGB") if isinstance(comp_img, str) else None
+
+                        gt_path = gen_reward_inputs[0].get("image_gt")
+                        gt_img = None
+                        if gt_path is not None:
+                            gt_img = Image.open(gt_path).convert("RGB") if isinstance(gt_path, str) else gt_path
+                            if not isinstance(gt_img, Image.Image):
+                                gt_img = None
+
+                        if comp_img is not None and gt_img is not None:
+                            # Resize both to same height
+                            h = max(comp_img.height, gt_img.height)
+                            comp_resized = comp_img.resize((int(comp_img.width * h / comp_img.height), h))
+                            gt_resized = gt_img.resize((int(gt_img.width * h / gt_img.height), h))
+                            concat_w = comp_resized.width + gt_resized.width
+
+                            # Prepare prompt text
+                            prompt_text = gen_prompts[0]
+                            prompt_text = prompt_text.replace("<|reserved_token_5|>", "*").replace("<|reserved_token_6|>", "-")
+
+                            font_size = 18
+                            try:
+                                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+                            except (IOError, OSError):
+                                font = ImageFont.load_default()
+
+                            # Wrap text to fit concat image width
+                            chars_per_line = max(1, concat_w // (font_size * 2 // 3))
+                            wrapped_lines = textwrap.wrap(prompt_text, width=chars_per_line)
+
+                            # Reward text
+                            reward_val = float(gen_rewards_per_func[0, 0].item())
+                            reward_text = f"Perceptual Reward: {reward_val:.4f}"
+
+                            line_height = font_size + 4
+                            text_height = (len(wrapped_lines) + 2) * line_height  # +2 for gap and reward line
+                            total_h = h + text_height
+
+                            canvas = Image.new("RGB", (concat_w, total_h), (255, 255, 255))
+                            canvas.paste(comp_resized, (0, 0))
+                            canvas.paste(gt_resized, (comp_resized.width, 0))
+
+                            draw = ImageDraw.Draw(canvas)
+                            y_pos = h + 4
+                            for line in wrapped_lines:
+                                draw.text((4, y_pos), line, fill=(0, 0, 0), font=font)
+                                y_pos += line_height
+
+                            # Reward centered at bottom
+                            try:
+                                rw_bbox = draw.textbbox((0, 0), reward_text, font=font)
+                                rw = rw_bbox[2] - rw_bbox[0]
+                            except AttributeError:
+                                rw = len(reward_text) * (font_size * 2 // 3)
+                            draw.text(((concat_w - rw) // 2, y_pos + line_height // 2), reward_text, fill=(0, 0, 200), font=font)
+
+                            rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+                            save_path = debug_dir / f"step{self._step}_rank{rank}.png"
+                            canvas.save(save_path)
+                            _dbg_print(f"Saved debug image to {save_path}")
+                    except Exception as e:
+                        _dbg_print(f"Debug image save failed: {e}")
 
             if und_inputs is not None:
                 # Und rewards (text → format + correctness)
