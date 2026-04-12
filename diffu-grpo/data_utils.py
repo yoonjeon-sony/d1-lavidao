@@ -346,7 +346,7 @@ def get_thinkmorph_interleave_questions() -> tuple[Dataset, Dataset]:
                     continue
 
                 example = json.loads(line)
-                sample_id = str(example.get("pid", f"{basename}:{idx}"))
+                sample_id = f"{basename}:{idx}"
 
                 question = example.get("question")
                 image_input_rel = example.get("problem_image_0")
@@ -622,8 +622,7 @@ def get_arxivqa_interleave_questions(
         )
 
     def _to_gen(example: dict, idx: int) -> dict:
-        raw_id = example.get("id", f"row-{idx}")
-        sample_id = f"arxivqa:{raw_id}"
+        sample_id = f"arxivqa:{idx}"
         question_text = example.get("question")
         image_path = os.path.join(DATA_ROOT, "arxivqa", example.get("image"))
         
@@ -641,8 +640,7 @@ def get_arxivqa_interleave_questions(
         }
 
     def _to_und(example: dict, idx: int) -> dict:
-        raw_id = example.get("id", f"row-{idx}")
-        sample_id = f"arxivqa:{raw_id}"
+        sample_id = f"arxivqa:{idx}"
         question_text = _build_question_text(example)
         image_path = os.path.join(DATA_ROOT, "arxivqa", example.get("image"))
         cot_instruction = f"{COT_PROMPT} {question_text}"
