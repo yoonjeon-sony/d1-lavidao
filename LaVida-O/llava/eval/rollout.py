@@ -81,6 +81,7 @@ _IMAGE_EDIT_DEFAULTS: dict[str, Any] = {
     "order_cutoff": 1.0,
     "edit_mode": 0,
     "micro_cond": "",
+    "remask_ratio": 0.01,
 }
 
 
@@ -122,6 +123,7 @@ def build_image_edit_gen_cfg(**overrides: Any) -> dict[str, Any]:
     cfg["edit_mode"] = int(cfg["edit_mode"])
     cfg["dynamic_temperature"] = bool(cfg["dynamic_temperature"])
     cfg["dynamic_temperature_samp"] = bool(cfg["dynamic_temperature_samp"])
+    cfg["remask_ratio"] = float(cfg["remask_ratio"])
     if isinstance(cfg["cfg_interval"], (tuple, list)):
         cfg["cfg_interval"] = [float(cfg["cfg_interval"][0]), float(cfg["cfg_interval"][1])]
     return cfg
@@ -356,6 +358,7 @@ def run_image_rollout(
     device: torch.device,
     gen_cfg: dict[str, Any],
     conv_version: str = "llada",
+    init_image=None,
 ) -> tuple[torch.Tensor, list[dict[str, Any]]]:
     """Block-wise masked diffusion image rollout.
 
@@ -499,8 +502,21 @@ def run_image_rollout(
         raise ValueError("Not Supported edit_mode")
     is_gen_enc_null = torch.zeros_like(is_gen_enc, dtype=torch.bool)
 
-    xt = init_latents.clone()
-    xt[:] = img_mask_id
+    n_tokens = gen_cfg["n_tokens"]
+    image_gen_latents_offset = torch.zeros(batch_size, n_tokens, dtype=torch.long, device=device)
+    if is_unitok:
+        image_gen_latents_offset = image_gen_latents_offset.unsqueeze(1).repeat(1, 8, 1)
+    image_gen_latents_offset[:] = img_mask_id
+
+    xt = image_gen_latents_offset.clone()
+    if init_image is not None:
+        remask_ratio = gen_cfg.get("remask_ratio", 0.01)
+        n_mask_remask = max(int(n_tokens * remask_ratio), 1)
+        indices = np.arange(n_tokens)
+        np.random.shuffle(indices)
+        init_mask_indices = indices[:n_mask_remask]
+        xt[:, init_mask_indices] = init_latents[:, init_mask_indices]
+
     use_3d = False
     mask_idx_sched = xt == img_mask_id
     if is_unitok and not use_3d:

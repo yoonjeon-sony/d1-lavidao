@@ -358,7 +358,7 @@ def text_to_image(model,
         np.random.shuffle(indices)
         init_mask_indices = indices[:n_mask_remask]
         xt[:,init_mask_indices] = init_latents[:,init_mask_indices]
-        print("INIT INDICES",init_mask_indices)
+        
     mask_idx = xt == img_mask_id
     if is_unitok: 
         mask_idx = mask_idx[:,0,:]

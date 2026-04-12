@@ -850,6 +850,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
         self,
         model,
         examples: list[dict[str, Any]],
+        init_image=None,
     ) -> tuple[torch.Tensor, list[dict[str, Any]]]:
         if isinstance(examples, dict):
             examples = [examples]
@@ -985,8 +986,21 @@ class DiffuGRPOTrainer(GRPOTrainer):
             raise ValueError("Not Supported edit_mode")
         is_gen_enc_null = torch.zeros_like(is_gen_enc, dtype=torch.bool)
 
-        xt = init_latents.clone()
-        xt[:] = img_mask_id
+        n_tokens = gen_cfg["n_tokens"]
+        image_gen_latents_offset = torch.zeros(batch_size, n_tokens, dtype=torch.long, device=device)
+        if is_unitok:
+            image_gen_latents_offset = image_gen_latents_offset.unsqueeze(1).repeat(1, 8, 1)
+        image_gen_latents_offset[:] = img_mask_id
+
+        xt = image_gen_latents_offset.clone()
+        if init_image is not None:
+            remask_ratio = gen_cfg.get("remask_ratio", 0.01)
+            n_mask_remask = max(int(n_tokens * remask_ratio), 1)
+            indices = np.arange(n_tokens)
+            np.random.shuffle(indices)
+            init_mask_indices = indices[:n_mask_remask]
+            xt[:, init_mask_indices] = init_latents[:, init_mask_indices]
+
         use_3d = False
         mask_idx_sched = xt == img_mask_id
         if is_unitok and not use_3d:
@@ -2206,7 +2220,8 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 with _timer(_timings, "image_rollout"):
                     for start_idx in trange(0, len(gen_inputs), image_edit_batch_size, desc="Image Rollout"):
                         batch_examples = gen_inputs[start_idx : start_idx + image_edit_batch_size]
-                        _, batch_contexts = self._rollout_image_edit_latents(unwrapped_model, batch_examples)
+                        batch_init_images = [ex.get("image") for ex in batch_examples]
+                        _, batch_contexts = self._rollout_image_edit_latents(unwrapped_model, batch_examples, init_image=batch_init_images)
                         for offset, ctx in enumerate(batch_contexts):
                             image_contexts[start_idx + offset] = ctx
             else:

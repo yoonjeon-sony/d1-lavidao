@@ -473,6 +473,7 @@ class Llava_Llada(lmms):
                     device=device,
                     gen_cfg=image_gen_cfg,
                     conv_version=self.conv_template,
+                    init_image=[ex.get("image") for ex in examples],
                 )
                 # Inject the decoded PIL image as gen_image on each example so
                 # run_text_rollout's _build_llada_prompt duplicates <image>\n.
