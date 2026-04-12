@@ -444,7 +444,13 @@ class Llava_Llada(lmms):
             # paths: the edit path feeds it to the VQ-VAE via
             # image_processor_gen.preprocess, and the text path feeds it to the
             # vision tower via prepare_inputs_labels_for_multimodal.
-            from data_utils import COT_PROMPT, EDIT_PROMPT
+            COT_PROMPT = (
+                "Let's think step-by-step to solve the question."
+                "Put your final answer in <answer> </answer> tags. "
+            )
+            EDIT_PROMPT = (
+                "Edit the region where auxiliary line, box, or drawing could help solve the following problem."
+            )
 
             examples = []
             for ctx, images, task_name, split_name, doc_id in zip(
