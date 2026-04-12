@@ -2495,20 +2495,22 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     self._metrics[mode][f"rewards/{reward_func_name}/std"].append(nanstd(gen_rewards_per_func[:, i]).item())
                 gen_local_rewards = gen_rewards_per_func.nansum(dim=1)
 
-                # ---- DEBUG: save first sample's completion, gt, prompt, reward ----
+                # ---- DEBUG: save first sample (with image_gt) ----
                 if DIFFU_GRPO_DEBUG and len(gen_completions) > 0 and sub_idx:
                     try:
                         from PIL import Image, ImageDraw, ImageFont
                         import textwrap
 
+                        # Use sub_idx[0]: first sample that has image_gt
+                        dbg_idx = sub_idx[0]
                         debug_dir = Path("./debug")
                         debug_dir.mkdir(parents=True, exist_ok=True)
 
-                        comp_img = gen_completions[0]
+                        comp_img = gen_completions[dbg_idx]
                         if not isinstance(comp_img, Image.Image):
                             comp_img = Image.open(comp_img).convert("RGB") if isinstance(comp_img, str) else None
 
-                        gt_path = gen_reward_inputs[0].get("image_gt")
+                        gt_path = gen_reward_inputs[dbg_idx].get("image_gt")
                         gt_img = None
                         if gt_path is not None:
                             gt_img = Image.open(gt_path).convert("RGB") if isinstance(gt_path, str) else gt_path
@@ -2523,7 +2525,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
                             concat_w = comp_resized.width + gt_resized.width
 
                             # Prepare prompt text
-                            prompt_text = gen_prompts[0]
+                            prompt_text = gen_prompts[dbg_idx]
                             prompt_text = prompt_text.replace("<|reserved_token_5|>", "*").replace("<|reserved_token_6|>", "-")
 
                             font_size = 18
@@ -2537,7 +2539,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
                             wrapped_lines = textwrap.wrap(prompt_text, width=chars_per_line)
 
                             # Reward text
-                            reward_val = float(gen_rewards_per_func[0, 0].item())
+                            reward_val = float(gen_rewards_per_func[dbg_idx, 0].item())
                             reward_text = f"Perceptual Reward: {reward_val:.4f}"
 
                             line_height = font_size + 4
@@ -2566,8 +2568,11 @@ class DiffuGRPOTrainer(GRPOTrainer):
                             save_path = debug_dir / f"step{self._step}_rank{rank}.png"
                             canvas.save(save_path)
                             _dbg_print(f"Saved debug image to {save_path}")
+                        else:
+                            _dbg_print(f"Debug image skip: comp_img={comp_img is not None}, gt_img={gt_img is not None}, gt_path={gt_path!r}")
                     except Exception as e:
-                        _dbg_print(f"Debug image save failed: {e}")
+                        import traceback
+                        _dbg_print(f"Debug image save failed: {e}\n{traceback.format_exc()}")
 
             if und_inputs is not None:
                 # Und rewards (text → format + correctness)
