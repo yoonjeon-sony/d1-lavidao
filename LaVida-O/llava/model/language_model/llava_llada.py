@@ -510,8 +510,6 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
                 final_masked_indices = torch.cat([final_masked_indices,final_masked_indices_inv])
             seq_len = labels.shape[-1]
             # print(seq_len)
-            if LOG_BATCH_LENGTH:
-                print("Batch Length",seq_len)
             CUFOFF=30720
             if seq_len > CUFOFF:
                 print(seq_len,labels.shape)
