@@ -610,6 +610,15 @@ def get_arxivqa_interleave_questions(
             )
         raw = raw["train"]
 
+    # Subsample to 1k rows with a fixed seed so gen/und share the same
+    # source slice and sample_ids align by post-select row index. The
+    # shuffle before select ensures the 1k rows are a random subset of
+    # the full dataset rather than the first 1k entries.
+    ARXIVQA_SAMPLE_SIZE = 1000
+    ARXIVQA_SAMPLE_SEED = 42
+    if len(raw) > ARXIVQA_SAMPLE_SIZE:
+        raw = raw.shuffle(seed=ARXIVQA_SAMPLE_SEED).select(range(ARXIVQA_SAMPLE_SIZE))
+
     def _build_question_text(example: dict) -> str:
         question = example.get("question")
         if not isinstance(question, str) or not question.strip():
