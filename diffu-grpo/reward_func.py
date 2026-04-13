@@ -113,26 +113,37 @@ def perceptual_score_reward_func(
     run_name=None,
     **kwargs,
 ) -> list[float]:
-    """Anisotropic 2D Total Variation distance on VQ codebook embeddings.
+    """2D TV energy on the VQ codebook embedding residual.
 
     Takes pre-computed embeddings from the rollout path:
-      * ``gen_vq_embeds[i]``: (N, D) CPU tensor — embeddings of the generated
-        image's final VQ indices (xt), looked up via ``call_gen_embedding``.
+      * ``gen_vq_embeds[i]``: (N, D) CPU tensor — codebook-embedding lookup of
+        the generated image's final VQ indices (xt).
       * ``gt_vq_embeds[i]``:  (N, D) CPU tensor — same for the ground-truth
-        image (image_gt path encoded once during rollout).
+        image (encoded once during rollout).
       * ``gen_grid_shape[i]``: (H, W) tuple giving the 2D layout of the
         ``N = H*W`` tokens.
 
-    Metric::
+    On the residual ``Z = E_gen - E_gt`` of shape ``(H, W, D)``::
 
-        R  = E_gen - E_gt                                    # (H, W, D)
-        tv = sum_{i,j} |R[i+1,j] - R[i,j]|_1
-           + sum_{i,j} |R[i,j+1] - R[i,j]|_1                 # anisotropic L1
-        reward = exp(-tv / (tau * H * W * D))                # in (0, 1]
+        E_h  = (1 / |N_h|) * sum_{(i,j) in N_h} ||Z[i, j+1] - Z[i, j]||_2^2
+        E_v  = (1 / |N_v|) * sum_{(i,j) in N_v} ||Z[i+1, j] - Z[i, j]||_2^2
+        E_2D = (E_h + E_v) / D
+        s_r  = 1 / (1 + E_2D / tau)
 
-    ``tau`` is read from ``TV_REWARD_TAU`` (default ``1.0``). Higher reward =
-    smaller / smoother residual between generated and ground-truth embedding
-    grids.
+    |N_h| = H * (W-1), |N_v| = (H-1) * W. The L2-squared difference is summed
+    over the embedding dimension D inside the norm, then averaged over the
+    pair count; dividing by D afterwards makes the energy per-element and
+    scale-invariant across embedding widths.
+
+    Reward properties:
+      * ``E_2D = 0`` (identical embeddings)     -> reward = 1.0
+      * ``E_2D -> infinity`` (maximally different) -> reward -> 0.0
+      * ``E_2D = tau``                           -> reward = 0.5
+
+    ``tau`` is read from ``TV_REWARD_TAU`` (default ``1.0``). Tune up to make
+    the reward more forgiving (rewards stay closer to 1 for moderate TV); tune
+    down to penalize TV more aggressively. Inspect logged ``E_2D`` values with
+    ``DIFFU_GRPO_DEBUG=1`` to calibrate.
     """
     tau = float(os.environ.get("TV_REWARD_TAU", "1.0"))
     n = len(completions)
@@ -169,14 +180,32 @@ def perceptual_score_reward_func(
                 continue
             g_hw = g.float().view(H, W, -1)
             t_hw = t.float().view(H, W, -1)
-            R = g_hw - t_hw
-            D = R.shape[-1]
-            tv_h = (R[1:, :, :] - R[:-1, :, :]).abs().sum()
-            tv_w = (R[:, 1:, :] - R[:, :-1, :]).abs().sum()
-            tv = float((tv_h + tv_w).item())
-            denom = max(H * W * D, 1)
-            r = float(np.exp(-tv / (tau * denom)))
-            rewards.append(r if np.isfinite(r) else float("nan"))
+            Z = (g_hw - t_hw).unsqueeze(0)          # (1, H, W, D) residual
+
+            # Horizontal differences: Z[i, j+1] - Z[i, j]
+            diff_h = Z[:, :, 1:, :] - Z[:, :, :-1, :]   # (1, H, W-1, D)
+            Eh = diff_h.pow(2).sum(dim=-1).mean()       # avg over all (i,j)
+
+            # Vertical differences: Z[i+1, j] - Z[i, j]
+            diff_v = Z[:, 1:, :, :] - Z[:, :-1, :, :]   # (1, H-1, W, D)
+            Ev = diff_v.pow(2).sum(dim=-1).mean()
+
+            D_chan = Z.shape[-1]
+            E2D = (Eh + Ev) / (D_chan + 1e-8)           # 2D TV energy
+            sr = 1.0 / (1.0 + E2D / (tau + 1e-8))       # normalized score
+
+            e_2d = float(E2D.item())
+            r = float(sr.item())
+            if not np.isfinite(r):
+                r = float("nan")
+            if debug and i == 0:
+                print(
+                    f"[tv_reward] sample 0: E_h={float(e_h):.4f} "
+                    f"E_v={float(e_v):.4f} E_2D={e_2d:.4f} "
+                    f"tau={tau:.3f} reward={r:.4f}",
+                    flush=True,
+                )
+            rewards.append(r)
         except Exception as e:
             print(f"[tv_reward] sample {i} failed: {e}", flush=True)
             rewards.append(float("nan"))
