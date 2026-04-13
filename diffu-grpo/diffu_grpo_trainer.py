@@ -2017,33 +2017,41 @@ class DiffuGRPOTrainer(GRPOTrainer):
         torch.cuda.synchronize() if torch.cuda.is_available() else None
         _elapsed_curr = time.perf_counter() - _t0_curr
         self._metrics[mode]["time_profile/curr_logprobs_and_update"].append(_elapsed_curr)
-        self._wandb_log_metrics()
         return loss
 
-    def _wandb_log_metrics(self):
-        """Average self._metrics and log to wandb every ``logging_steps``."""
-        if not self.accelerator.is_main_process:
-            return
-        if wandb.run is None:
-            return
+    def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+        """Average accumulated self._metrics and merge into the logs dict.
 
+        Called by transformers' Trainer on the ``logging_steps`` cadence.
+        This mirrors TRL's GRPOTrainer.log pattern: we accumulate metrics
+        across ALL gradient-accumulation micro-steps of a logging window,
+        then average + clear here. ``grad_norm``, ``loss``, and
+        ``learning_rate`` are already injected into ``logs`` by the parent
+        Trainer's ``_maybe_log_save_evaluate``.
+        """
         mode = "train" if self.model.training else "eval"
         raw = self._metrics.get(mode, {})
-        if not raw:
-            return
 
-        averaged = {}
+        averaged: dict[str, float] = {}
         for key, vals in raw.items():
             valid = [v for v in vals if not math.isnan(v)]
-            averaged[key] = sum(valid) / len(valid) if valid else None
+            if valid:
+                averaged[key] = sum(valid) / len(valid)
 
         if mode == "eval":
             averaged = {f"eval_{k}": v for k, v in averaged.items()}
-        logs = {k: v for k, v in averaged.items() if v is not None}
-        
-        
-        if logs:
-            wandb.log({**logs, "train/gen_step": self._step, "train/global_step": self.state.global_step})
+
+        # Attach our custom step counter so wandb users can x-axis against
+        # generation steps rather than only global optimizer steps.
+        if self.accelerator.is_main_process:
+            averaged["train/gen_step"] = float(self._step)
+
+        logs = {**logs, **averaged}
+        try:
+            super().log(logs, start_time)
+        except TypeError:
+            # Older transformers versions don't accept start_time.
+            super().log(logs)
 
         raw.clear()
 
@@ -2615,12 +2623,22 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 self.accelerator.process_index * local_n,
                 (self.accelerator.process_index + 1) * local_n,
             )
-            advantages = (rewards - mean_grouped)[process_slice]
+            centered = rewards - mean_grouped  # global advantages (pre-slice)
+            advantages = centered[process_slice]
             # Metrics
             is_std_zero = std_grouped < 1e-6
             self._metrics[mode][f"{tag}/reward"].append(rewards.mean().item())
             self._metrics[mode][f"{tag}/reward_std"].append(rewards.std().item())
             self._metrics[mode][f"{tag}/frac_reward_zero_std"].append(is_std_zero.float().mean().item())
+            # Advantages distribution (global — computed on the full gathered
+            # tensor before process slicing). Tracks whether GRPO advantages
+            # are informative: mean should be ~0 (by construction), std and
+            # abs_mean indicate signal strength.
+            self._metrics[mode][f"{tag}/advantages_mean"].append(centered.mean().item())
+            self._metrics[mode][f"{tag}/advantages_std"].append(centered.std().item())
+            self._metrics[mode][f"{tag}/advantages_abs_mean"].append(centered.abs().mean().item())
+            self._metrics[mode][f"{tag}/advantages_min"].append(centered.min().item())
+            self._metrics[mode][f"{tag}/advantages_max"].append(centered.max().item())
             return advantages
 
         if gen_inputs is not None:
