@@ -102,155 +102,154 @@ def correct_grounding_reward_func(prompts, completions, ground_gt, step=None, ru
     )
     return rewards
 
+_CLIP_MODEL = None
+_CLIP_PROCESSOR = None
+
+
+def _get_clip(device: torch.device = None):
+    """Return a cached frozen CLIP image encoder + processor.
+
+    Lazily loads on first use, freezes parameters, and migrates to ``device``
+    on demand. Matches the LPIPS-cache pattern that lived here before. Model
+    id is read from ``CLIP_REWARD_MODEL`` (default ``openai/clip-vit-base-patch32``).
+    """
+    global _CLIP_MODEL, _CLIP_PROCESSOR
+    if _CLIP_MODEL is None:
+        from transformers import CLIPModel, CLIPProcessor
+
+        model_id = os.environ.get("CLIP_REWARD_MODEL", "openai/clip-vit-base-patch32")
+        _CLIP_MODEL = CLIPModel.from_pretrained(model_id).eval()
+        _CLIP_PROCESSOR = CLIPProcessor.from_pretrained(model_id)
+        for p in _CLIP_MODEL.parameters():
+            p.requires_grad_(False)
+    if device is not None:
+        cur = next(_CLIP_MODEL.parameters()).device
+        if cur != device:
+            _CLIP_MODEL = _CLIP_MODEL.to(device)
+    return _CLIP_MODEL, _CLIP_PROCESSOR
+
+
 def perceptual_score_reward_func(
     prompts,
     completions,
     image_gt,
-    gen_vq_embeds=None,
-    gt_vq_embeds=None,
-    gen_grid_shape=None,
     step=None,
     run_name=None,
     **kwargs,
 ) -> list[float]:
-    """2D TV energy on the VQ codebook embedding residual.
+    """CLIP-image cosine similarity between generated image and ground truth.
 
-    Takes pre-computed embeddings from the rollout path:
-      * ``gen_vq_embeds[i]``: (N, D) CPU tensor — codebook-embedding lookup of
-        the generated image's final VQ indices (xt).
-      * ``gt_vq_embeds[i]``:  (N, D) CPU tensor — same for the ground-truth
-        image (encoded once during rollout).
-      * ``gen_grid_shape[i]``: (H, W) tuple giving the 2D layout of the
-        ``N = H*W`` tokens.
+    Inputs:
+      * ``completions[i]``: PIL.Image — the rollout-decoded generated image.
+      * ``image_gt[i]``:    string path or PIL.Image — the ground-truth image.
 
-    On the residual ``Z = E_gen - E_gt`` of shape ``(H, W, D)``::
+    For each pair we encode both images with a frozen CLIP image tower,
+    L2-normalize, and take cosine similarity in [-1, 1]. The similarity is
+    then linearly remapped to a reward in [0, 1] via::
 
-        E_h  = (1 / |N_h|) * sum_{(i,j) in N_h} ||Z[i, j+1] - Z[i, j]||_2^2
-        E_v  = (1 / |N_v|) * sum_{(i,j) in N_v} ||Z[i+1, j] - Z[i, j]||_2^2
-        E_2D = (E_h + E_v) / D
-        s_r  = 1 / (1 + E_2D / tau)
+        reward = max(0, (sim - threshold) / (1 - threshold))
 
-    |N_h| = H * (W-1), |N_v| = (H-1) * W. The L2-squared difference is summed
-    over the embedding dimension D inside the norm, then averaged over the
-    pair count; dividing by D afterwards makes the energy per-element and
-    scale-invariant across embedding widths.
+    With the default ``CLIP_REWARD_THRESHOLD=0.5``:
+      * sim = 1.0 (identical images)        -> reward = 1.0
+      * sim = 0.75 (visually similar)       -> reward = 0.5
+      * sim <= threshold (unrelated/poor)   -> reward = 0.0
 
-    Reward properties:
-      * ``E_2D = 0`` (identical embeddings)     -> reward = 1.0
-      * ``E_2D -> infinity`` (maximally different) -> reward -> 0.0
-      * ``E_2D = tau``                           -> reward = 0.5
-
-    ``tau`` is read from ``TV_REWARD_TAU`` (default ``1.0``). Tune up to make
-    the reward more forgiving (rewards stay closer to 1 for moderate TV); tune
-    down to penalize TV more aggressively. Inspect logged ``E_2D`` values with
-    ``DIFFU_GRPO_DEBUG=1`` to calibrate.
+    Lower the threshold (env var) for a more forgiving curve, raise it to
+    only reward near-perfect matches. Set ``DIFFU_GRPO_DEBUG=1`` to log the
+    raw similarity for sample 0.
     """
-    tau = float(os.environ.get("TV_REWARD_TAU", "1.0"))
-    n = len(completions)
-    gen_vq_embeds = gen_vq_embeds if gen_vq_embeds is not None else [None] * n
-    gt_vq_embeds = gt_vq_embeds if gt_vq_embeds is not None else [None] * n
-    gen_grid_shape = gen_grid_shape if gen_grid_shape is not None else [None] * n
+    from PIL import Image as _PILImage
+
+    threshold = float(os.environ.get("CLIP_REWARD_THRESHOLD", "0.5"))
+    debug = os.environ.get("DIFFU_GRPO_DEBUG") == "1"
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        device = torch.device("cpu")
+
+    try:
+        clip_model, clip_proc = _get_clip(device)
+    except Exception as e:
+        print(f"[clip_reward] CLIP load failed: {type(e).__name__}: {e}", flush=True)
+        return [float("nan") for _ in completions]
+
+    def _to_pil(x):
+        if x is None:
+            return None
+        if isinstance(x, _PILImage.Image):
+            return x.convert("RGB")
+        if isinstance(x, str):
+            return _PILImage.open(x).convert("RGB")
+        # numpy / torch fall-through
+        try:
+            import numpy as _np
+            if isinstance(x, _np.ndarray):
+                return _PILImage.fromarray(x).convert("RGB")
+        except Exception:
+            pass
+        if isinstance(x, torch.Tensor):
+            arr = x.detach().cpu()
+            if arr.ndim == 3 and arr.shape[0] in (1, 3):
+                arr = arr.permute(1, 2, 0)
+            arr = arr.clamp(0, 1).mul(255).to(torch.uint8).numpy()
+            return _PILImage.fromarray(arr).convert("RGB")
+        return None
 
     rewards: list[float] = []
-    debug = os.environ.get("DIFFU_GRPO_DEBUG") == "1"
-    for i in range(n):
-        g = gen_vq_embeds[i]
-        t = gt_vq_embeds[i]
-        shp = gen_grid_shape[i]
-        if g is None or t is None or shp is None:
-            if debug:
-                print(
-                    f"[tv_reward] sample {i} NaN (missing input): "
-                    f"gen={g is not None} gt={t is not None} shape={shp}",
-                    flush=True,
-                )
-            rewards.append(float("nan"))
-            continue
+    sims: list[float] = []
+    for i, (pred_img, gt_img) in enumerate(zip(completions, image_gt)):
         try:
-            H, W = int(shp[0]), int(shp[1])
-            if g.shape[0] != H * W or t.shape != g.shape:
+            pred_pil = _to_pil(pred_img)
+            gt_pil = _to_pil(gt_img)
+            if pred_pil is None or gt_pil is None:
                 if debug:
                     print(
-                        f"[tv_reward] sample {i} NaN (shape mismatch): "
-                        f"gen={tuple(g.shape)} gt={tuple(t.shape)} grid=({H},{W}) "
-                        f"expected_N={H * W}",
+                        f"[clip_reward] sample {i} NaN (missing image): "
+                        f"pred={pred_pil is not None} gt={gt_pil is not None}",
                         flush=True,
                     )
                 rewards.append(float("nan"))
-                continue
-            g_hw = g.float().view(H, W, -1)
-            t_hw = t.float().view(H, W, -1)
-            # Early diagnostic: catch NaN coming from the embeddings themselves
-            # (e.g. training diverged and gen_embedding has NaN weights).
-            g_nan = int(torch.isnan(g_hw).sum().item())
-            t_nan = int(torch.isnan(t_hw).sum().item())
-            if g_nan or t_nan:
-                if debug:
-                    print(
-                        f"[tv_reward] sample {i} NaN (input has NaN): "
-                        f"gen_nan={g_nan} gt_nan={t_nan}",
-                        flush=True,
-                    )
-                rewards.append(float("nan"))
+                sims.append(float("nan"))
                 continue
 
-            Z = (g_hw - t_hw).unsqueeze(0)          # (1, H, W, D) residual
-
-            # Horizontal differences: Z[i, j+1] - Z[i, j]
-            diff_h = Z[:, :, 1:, :] - Z[:, :, :-1, :]   # (1, H, W-1, D)
-            Eh = diff_h.pow(2).sum(dim=-1).mean()       # avg over all (i,j)
-
-            # Vertical differences: Z[i+1, j] - Z[i, j]
-            diff_v = Z[:, 1:, :, :] - Z[:, :-1, :, :]   # (1, H-1, W, D)
-            Ev = diff_v.pow(2).sum(dim=-1).mean()
-
-            D_chan = Z.shape[-1]
-            E2D = (Eh + Ev) / (D_chan + 1e-8)           # 2D TV energy
-            sr = 1.0 / (1.0 + E2D / (tau + 1e-8))       # normalized score
-
-            e_2d = float(E2D.item())
-            r = float(sr.item())
+            inputs = clip_proc(images=[pred_pil, gt_pil], return_tensors="pt")
+            inputs = {k: v.to(device, non_blocking=True) for k, v in inputs.items()}
+            with torch.inference_mode():
+                feats = clip_model.get_image_features(**inputs)  # (2, D)
+            feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
+            sim = float((feats[0] * feats[1]).sum().item())
+            r = max(0.0, (sim - threshold) / max(1.0 - threshold, 1e-8))
             if not np.isfinite(r):
-                if debug:
-                    print(
-                        f"[tv_reward] sample {i} NaN (non-finite score): "
-                        f"E_h={float(Eh):.4e} E_v={float(Ev):.4e} E_2D={e_2d:.4e}",
-                        flush=True,
-                    )
                 r = float("nan")
-            if debug and i == 0:
-                print(
-                    f"[tv_reward] sample 0: E_h={float(Eh):.4f} "
-                    f"E_v={float(Ev):.4f} E_2D={e_2d:.4f} "
-                    f"tau={tau:.3f} reward={r:.4f}",
-                    flush=True,
-                )
             rewards.append(r)
+            sims.append(sim)
         except Exception as e:
             import traceback
             print(
-                f"[tv_reward] sample {i} failed: {type(e).__name__}: {e}\n"
+                f"[clip_reward] sample {i} failed: {type(e).__name__}: {e}\n"
                 f"{traceback.format_exc()}",
                 flush=True,
             )
             rewards.append(float("nan"))
+            sims.append(float("nan"))
 
-    # ANSI colors (kept for parity with the previous LPIPS banner)
+    # ANSI colors for the per-batch banner
     RED = "\033[91m"
     YELLOW = "\033[93m"
     RESET = "\033[0m"
     if prompts and rewards:
-        # Collapse the long reserved-token runs to single characters so the
-        # printed prompt is readable.
         prompt0 = prompts[0] if prompts[0] is not None else ""
         prompt0 = prompt0.replace("<|reserved_token_5|>", "*").replace(
             "<|reserved_token_6|>", "-"
         )
+        sim0 = sims[0] if sims else float("nan")
         print(
             "-" * 20,
             f"\n{RED}Prompt:{RESET}\n{prompt0}\n",
             "-" * 20,
-            f"\n{YELLOW}TV-on-VQ Reward:{RESET}\n{rewards[0]}\n",
+            f"\n{YELLOW}CLIP Similarity:{RESET} {sim0:.4f}  "
+            f"(threshold={threshold:.3f})  reward={rewards[0]:.4f}\n",
             flush=True,
         )
     return rewards
