@@ -261,9 +261,12 @@ def int_reward_func(completions, **kwargs) -> list[float]:
 
 
 def strict_format_reward_func(completions, **kwargs) -> list[float]:
+    # <answer>...</answer> can appear anywhere in the response, possibly
+    # spanning multiple lines. Use re.search + re.DOTALL so the pattern is
+    # not anchored to the start of the string.
     pattern = r"<answer>(.*?)</answer>"
     responses = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, r) for r in responses]
+    matches = [re.search(pattern, r, flags=re.DOTALL) for r in responses]
     return [0.5 if match else 0.0 for match in matches]
 
 
