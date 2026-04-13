@@ -180,6 +180,20 @@ def perceptual_score_reward_func(
                 continue
             g_hw = g.float().view(H, W, -1)
             t_hw = t.float().view(H, W, -1)
+            # Early diagnostic: catch NaN coming from the embeddings themselves
+            # (e.g. training diverged and gen_embedding has NaN weights).
+            g_nan = int(torch.isnan(g_hw).sum().item())
+            t_nan = int(torch.isnan(t_hw).sum().item())
+            if g_nan or t_nan:
+                if debug:
+                    print(
+                        f"[tv_reward] sample {i} NaN (input has NaN): "
+                        f"gen_nan={g_nan} gt_nan={t_nan}",
+                        flush=True,
+                    )
+                rewards.append(float("nan"))
+                continue
+
             Z = (g_hw - t_hw).unsqueeze(0)          # (1, H, W, D) residual
 
             # Horizontal differences: Z[i, j+1] - Z[i, j]
@@ -197,17 +211,28 @@ def perceptual_score_reward_func(
             e_2d = float(E2D.item())
             r = float(sr.item())
             if not np.isfinite(r):
+                if debug:
+                    print(
+                        f"[tv_reward] sample {i} NaN (non-finite score): "
+                        f"E_h={float(Eh):.4e} E_v={float(Ev):.4e} E_2D={e_2d:.4e}",
+                        flush=True,
+                    )
                 r = float("nan")
             if debug and i == 0:
                 print(
-                    f"[tv_reward] sample 0: E_h={float(e_h):.4f} "
-                    f"E_v={float(e_v):.4f} E_2D={e_2d:.4f} "
+                    f"[tv_reward] sample 0: E_h={float(Eh):.4f} "
+                    f"E_v={float(Ev):.4f} E_2D={e_2d:.4f} "
                     f"tau={tau:.3f} reward={r:.4f}",
                     flush=True,
                 )
             rewards.append(r)
         except Exception as e:
-            print(f"[tv_reward] sample {i} failed: {e}", flush=True)
+            import traceback
+            print(
+                f"[tv_reward] sample {i} failed: {type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()}",
+                flush=True,
+            )
             rewards.append(float("nan"))
 
     # ANSI colors (kept for parity with the previous LPIPS banner)
@@ -215,9 +240,15 @@ def perceptual_score_reward_func(
     YELLOW = "\033[93m"
     RESET = "\033[0m"
     if prompts and rewards:
+        # Collapse the long reserved-token runs to single characters so the
+        # printed prompt is readable.
+        prompt0 = prompts[0] if prompts[0] is not None else ""
+        prompt0 = prompt0.replace("<|reserved_token_5|>", "*").replace(
+            "<|reserved_token_6|>", "-"
+        )
         print(
             "-" * 20,
-            f"\n{RED}Prompt:{RESET}\n{prompts[0]}\n",
+            f"\n{RED}Prompt:{RESET}\n{prompt0}\n",
             "-" * 20,
             f"\n{YELLOW}TV-on-VQ Reward:{RESET}\n{rewards[0]}\n",
             flush=True,
