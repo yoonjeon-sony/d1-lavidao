@@ -379,11 +379,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
         if getattr(self, "ref_model", None) is not None:
             self._hard_disable_dropout(self.ref_model)
 
-        # Remove the default WandbCallback — we call wandb.log explicitly
-        # in _wandb_log_metrics so the default callback would double-log /
-        # conflict with our custom metric keys.
-        self.remove_callback(WandbCallback)
-
         # Initialize wandb on the main process only.
         if self.accelerator.is_main_process and wandb.run is None:
             wandb.init(
@@ -824,6 +819,9 @@ class DiffuGRPOTrainer(GRPOTrainer):
             "valid": False,
             "latent_shape": tuple(latent_template.shape),
             "decoded_image": None,
+            "gen_vq_embeds": None,
+            "gt_vq_embeds": None,
+            "gen_grid_shape": None,
         }
 
     def _build_image_edit_temperature_schedule(
@@ -1176,6 +1174,46 @@ class DiffuGRPOTrainer(GRPOTrainer):
             xt[transfer_index] = x0[transfer_index]
 
         xt[xt == img_mask_id] = x0[xt == img_mask_id]
+
+        # ---- Pre-compute VQ codebook embeddings for TV-on-VQ reward ----
+        # Generated-side embeddings come from the final xt VQ indices.
+        # Ground-truth embeddings are computed by encoding each example's
+        # image_gt path through the same VQ pipeline. Both are detached to
+        # CPU so reward_func can process them outside the model forward.
+        gen_embeds_batch = None
+        if not is_unitok:
+            try:
+                with torch.no_grad():
+                    gen_embeds_batch = base_model.call_gen_embedding(xt, gen_shape)  # (B, N, D)
+            except Exception as _e:
+                print(f"[tv_reward] gen embedding failed: {_e}", flush=True)
+                gen_embeds_batch = None
+
+        gt_embeds_list: list[Optional[torch.Tensor]] = []
+        for _ex_idx, _example in enumerate(examples):
+            _gt_path = _example.get("image_gt")
+            if _gt_path is None or is_unitok:
+                gt_embeds_list.append(None)
+                continue
+            try:
+                from PIL import Image as _PILImage
+                _gt_img = (
+                    _PILImage.open(_gt_path).convert("RGB")
+                    if isinstance(_gt_path, str)
+                    else _gt_path
+                )
+                _gt_1024 = pad_to_square_and_resize(_gt_img, gen_cfg["image_resolution"])
+                _gt_vq_latent = base_model.image_processor_gen.preprocess(_gt_1024).to(
+                    device, dtype=model.dtype
+                )
+                with torch.no_grad():
+                    _gt_codes, _gt_shape = model.encode_image_gen(_gt_vq_latent)
+                    _gt_emb = base_model.call_gen_embedding(_gt_codes, _gt_shape)
+                gt_embeds_list.append(_gt_emb[0].detach().cpu())
+            except Exception as _e:
+                print(f"[tv_reward] gt encode failed for row {_ex_idx}: {_e}", flush=True)
+                gt_embeds_list.append(None)
+
         decoded_images = model.decode_image_gen(
             xt,
             gen_cfg["image_resolution"],
@@ -1228,6 +1266,14 @@ class DiffuGRPOTrainer(GRPOTrainer):
             # determined by the gen config; reported per-row for symmetry with
             # the und/text path).
             row_completion_len = int(gen_cfg["n_tokens"])
+            _row_gen_embed = (
+                gen_embeds_batch[batch_idx].detach().cpu()
+                if gen_embeds_batch is not None
+                else None
+            )
+            _row_gt_embed = (
+                gt_embeds_list[batch_idx] if batch_idx < len(gt_embeds_list) else None
+            )
             image_contexts.append(
                 {
                     "valid": True,
@@ -1236,6 +1282,9 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     "prompt": prompt,
                     "prompt_len_tokens": per_row_prompt_lens[batch_idx],
                     "completion_len_tokens": row_completion_len,
+                    "gen_vq_embeds": _row_gen_embed,
+                    "gt_vq_embeds": _row_gt_embed,
+                    "gen_grid_shape": tuple(gen_shape),
                     "payload": {
                         "id": sample_id,
                         "image_gen": str(decoded_image_path),
@@ -2486,8 +2535,15 @@ class DiffuGRPOTrainer(GRPOTrainer):
                             sub_inputs = [gen_reward_inputs[j] for j in sub_idx]
                             sub_prompts = [gen_prompts[j] for j in sub_idx]
                             sub_completions = [gen_completions[j] for j in sub_idx]
+                            sub_ctxs = [image_contexts[j] for j in sub_idx]
                             keys = [k for k in sub_inputs[0] if k not in ["prompt", "completion"]]
                             reward_kwargs = {k: [ex.get(k) for ex in sub_inputs] for k in keys}
+                            # Plumb pre-computed VQ embeddings from rollout so
+                            # perceptual_score_reward_func (TV-on-VQ) can compute
+                            # TV(E_gen - E_gt) without re-encoding the images.
+                            reward_kwargs["gen_vq_embeds"] = [c.get("gen_vq_embeds") for c in sub_ctxs]
+                            reward_kwargs["gt_vq_embeds"] = [c.get("gt_vq_embeds") for c in sub_ctxs]
+                            reward_kwargs["gen_grid_shape"] = [c.get("gen_grid_shape") for c in sub_ctxs]
                             try:
                                 output = reward_func(
                                     prompts=sub_prompts, completions=sub_completions,

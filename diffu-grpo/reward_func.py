@@ -11,32 +11,7 @@ import shutil
 
 import torch
 import torch.nn.functional as F
-import lpips
 from math500_utils import remove_boxed, last_boxed_only_string, is_equiv, boxed_in_answer
-
-_LPIPS_LOSS_FN = None
-
-def _get_lpips_loss_fn(device: torch.device = None):
-    """Return a cached LPIPS module, placed on ``device`` if given.
-
-    The module is constructed lazily on first use, its parameters are frozen
-    (``requires_grad_(False)``) so the LPIPS forward does not allocate grad
-    bookkeeping, and it is moved onto the requested device on the first call
-    that specifies one.  Subsequent calls with a different device migrate the
-    cached module in-place.
-    """
-    global _LPIPS_LOSS_FN
-    if _LPIPS_LOSS_FN is None:
-        import lpips
-
-        _LPIPS_LOSS_FN = lpips.LPIPS(net='vgg').eval()
-        for p in _LPIPS_LOSS_FN.parameters():
-            p.requires_grad_(False)
-    if device is not None:
-        current_device = next(_LPIPS_LOSS_FN.parameters()).device
-        if current_device != device:
-            _LPIPS_LOSS_FN = _LPIPS_LOSS_FN.to(device)
-    return _LPIPS_LOSS_FN
 
 def extract_xml_answer(text: str) -> str:
     answer = text.split("<answer>")[-1]
@@ -127,131 +102,83 @@ def correct_grounding_reward_func(prompts, completions, ground_gt, step=None, ru
     )
     return rewards
 
-def perceptual_score_reward_func(prompts, completions, image_gt, step=None, run_name=None, **kwargs) -> list[float]:
+def perceptual_score_reward_func(
+    prompts,
+    completions,
+    image_gt,
+    gen_vq_embeds=None,
+    gt_vq_embeds=None,
+    gen_grid_shape=None,
+    step=None,
+    run_name=None,
+    **kwargs,
+) -> list[float]:
+    """Anisotropic 2D Total Variation distance on VQ codebook embeddings.
+
+    Takes pre-computed embeddings from the rollout path:
+      * ``gen_vq_embeds[i]``: (N, D) CPU tensor — embeddings of the generated
+        image's final VQ indices (xt), looked up via ``call_gen_embedding``.
+      * ``gt_vq_embeds[i]``:  (N, D) CPU tensor — same for the ground-truth
+        image (image_gt path encoded once during rollout).
+      * ``gen_grid_shape[i]``: (H, W) tuple giving the 2D layout of the
+        ``N = H*W`` tokens.
+
+    Metric::
+
+        R  = E_gen - E_gt                                    # (H, W, D)
+        tv = sum_{i,j} |R[i+1,j] - R[i,j]|_1
+           + sum_{i,j} |R[i,j+1] - R[i,j]|_1                 # anisotropic L1
+        reward = exp(-tv / (tau * H * W * D))                # in (0, 1]
+
+    ``tau`` is read from ``TV_REWARD_TAU`` (default ``1.0``). Higher reward =
+    smaller / smoother residual between generated and ground-truth embedding
+    grids.
     """
-    Computes perceptual similarity score between generated image and ground truth image.
-    Higher is better.
-    """
+    tau = float(os.environ.get("TV_REWARD_TAU", "1.0"))
+    n = len(completions)
+    gen_vq_embeds = gen_vq_embeds if gen_vq_embeds is not None else [None] * n
+    gt_vq_embeds = gt_vq_embeds if gt_vq_embeds is not None else [None] * n
+    gen_grid_shape = gen_grid_shape if gen_grid_shape is not None else [None] * n
 
-    # Run LPIPS on the local-rank CUDA device when available. accelerate /
-    # deepspeed set torch.cuda.current_device() per rank, so this picks the
-    # correct GPU for this process without any extra plumbing.
-    if torch.cuda.is_available():
-        lpips_device = torch.device("cuda", torch.cuda.current_device())
-    else:
-        lpips_device = torch.device("cpu")
-    loss_fn = _get_lpips_loss_fn(lpips_device)
+    rewards: list[float] = []
+    for i in range(n):
+        g = gen_vq_embeds[i]
+        t = gt_vq_embeds[i]
+        shp = gen_grid_shape[i]
+        if g is None or t is None or shp is None:
+            rewards.append(float("nan"))
+            continue
+        try:
+            H, W = int(shp[0]), int(shp[1])
+            if g.shape[0] != H * W or t.shape != g.shape:
+                rewards.append(float("nan"))
+                continue
+            g_hw = g.float().view(H, W, -1)
+            t_hw = t.float().view(H, W, -1)
+            R = g_hw - t_hw
+            D = R.shape[-1]
+            tv_h = (R[1:, :, :] - R[:-1, :, :]).abs().sum()
+            tv_w = (R[:, 1:, :] - R[:, :-1, :]).abs().sum()
+            tv = float((tv_h + tv_w).item())
+            denom = max(H * W * D, 1)
+            r = float(np.exp(-tv / (tau * denom)))
+            rewards.append(r if np.isfinite(r) else float("nan"))
+        except Exception as e:
+            print(f"[tv_reward] sample {i} failed: {e}", flush=True)
+            rewards.append(float("nan"))
 
-    def _to_tensor(img):
-        """
-        Convert PIL / numpy / tensor → torch.Tensor [C, H, W]
-        """
-        from PIL import Image
-        import numpy as np
-
-        if isinstance(img, str):
-            with Image.open(img) as pil_img:
-                img = torch.from_numpy(np.array(pil_img.convert("RGB")))
-
-        if isinstance(img, dict):
-            if img.get("bytes") is not None:
-                with Image.open(io.BytesIO(img["bytes"])) as pil_img:
-                    img = torch.from_numpy(np.array(pil_img.convert("RGB")))
-            elif img.get("path"):
-                with Image.open(img["path"]) as pil_img:
-                    img = torch.from_numpy(np.array(pil_img.convert("RGB")))
-
-        if isinstance(img, Image.Image):
-            img = torch.from_numpy(np.array(img))  # [H, W, C]
-
-        if isinstance(img, np.ndarray):
-            img = torch.from_numpy(img)
-
-        if isinstance(img, torch.Tensor):
-            # Ensure float
-            img = img.float()
-
-            # If [H, W, C] → [C, H, W]
-            if img.ndim == 3 and img.shape[-1] in [1, 3]:
-                img = img.permute(2, 0, 1)
-
-            # If grayscale [H, W] → [1, H, W]
-            if img.ndim == 2:
-                img = img.unsqueeze(0)
-
-            return img
-
-        raise TypeError(f"Unsupported image type: {type(img)}")
-
-    def _normalize(img: torch.Tensor):
-        """
-        Normalize image to [-1, 1] for LPIPS or flatten for cosine.
-        """
-        img = _to_tensor(img)
-        if img.max() > 1:
-            img = img / 255.0
-
-        img = img * 2.0 - 1.0  # [0,1] → [-1,1]
-        return img
-
-    def _pad_to_square(img: torch.Tensor, size: int) -> torch.Tensor:
-        """
-        Pad BCHW tensor (values in [-1, 1]) to a ``size x size`` square with
-        black padding (-1).  No resizing — preserves every original pixel.
-        """
-        _, _, h, w = img.shape
-        pad_h = size - h
-        pad_w = size - w
-        pad_top = pad_h // 2
-        pad_bottom = pad_h - pad_top
-        pad_left = pad_w // 2
-        pad_right = pad_w - pad_left
-        return F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), value=-1.0)
-
-    def _lpips_score(img1, img2):
-        img1 = _normalize(img1).unsqueeze(0)
-        img2 = _normalize(img2).unsqueeze(0)
-        # Pass full-resolution images to LPIPS: pad both to a common square
-        # equal to the max side across both images, so neither is downscaled.
-        # LPIPS requires matching (B, C, H, W); padding with -1 (black in
-        # the [-1, 1] normalization) contributes nothing to perceptual distance
-        # since both images are padded identically on the background regions.
-        max_side = max(
-            img1.shape[-2], img1.shape[-1], img2.shape[-2], img2.shape[-1]
-        )
-        img1 = _pad_to_square(img1, max_side)
-        img2 = _pad_to_square(img2, max_side)
-        # Move inputs onto the same device as the (cached) LPIPS module and
-        # disable autograd tracking — LPIPS is called purely for its scalar
-        # output, so building a graph would waste GPU memory and time.
-        img1 = img1.to(lpips_device, non_blocking=True)
-        img2 = img2.to(lpips_device, non_blocking=True)
-        with torch.inference_mode():
-            d = loss_fn(img1, img2).item()
-        # Cap LPIPS distance at 1.0 so the returned score stays in [0, 1].
-        # LPIPS is unbounded above and can exceed 1.0 on very dissimilar
-        # images, which would otherwise produce a negative reward.
-        d = min(d, 1.0)
-        return 1.0 - d  # higher is better
-
-    rewards = []
-    for pred_img, gt_img in zip(completions, image_gt):
-        
-        score = _lpips_score(pred_img, gt_img)
-        rewards.append(score)
-
-    # ANSI colors
+    # ANSI colors (kept for parity with the previous LPIPS banner)
     RED = "\033[91m"
     YELLOW = "\033[93m"
     RESET = "\033[0m"
-
-    print(
-        "-" * 20,
-        f"\n{RED}Prompt:{RESET}\n{prompts[0]}\n",
-        "-" * 20,
-        f"\n{YELLOW}Perceptual Score:{RESET}\n{rewards[0]}\n",
-    )
-
+    if prompts and rewards:
+        print(
+            "-" * 20,
+            f"\n{RED}Prompt:{RESET}\n{prompts[0]}\n",
+            "-" * 20,
+            f"\n{YELLOW}TV-on-VQ Reward:{RESET}\n{rewards[0]}\n",
+            flush=True,
+        )
     return rewards
 
 def int_reward_func(completions, **kwargs) -> list[float]:

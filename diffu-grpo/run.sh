@@ -20,9 +20,7 @@ mkdir -p "$TRITON_CACHE_DIR"
 chmod 700 "$TRITON_CACHE_DIR"
 DATASET="thinkmorph_interleave" # thinkmorph_interleave thinkmorph_answer thinkmorph_edit
 RUN_NAME=${DATASET}-LavidaO
-# MODEL_PATH=/group2/dgm/yoonjeon/ckpts/sft-lavidao-thinkmorph-complete/checkpoint-2420
-MODEL_PATH="/scratch2/yoonjeon.kim/sft_LaViDa-O-thinkmorph_zebracot-step3000/"
-# MODEL_PATH="/group2/dgm/yoonjeon/ckpts/sft_LaViDa-O-thinkmorph_zebracot/checkpoint-7000"
+MODEL_PATH="/scratch2/yoonjeon.kim/sft_LaViDa-O-thinkmorph_zebracot-step9000"
 OUTPUT_DIR=/scratch2/yoonjeon.kim/rl-lavidao-thinkmorph/$RUN_NAME
 # OUTPUT_DIR="/group2/dgm/yoonjeon/ckpts/rl-lavidao-thinkmorph/$RUN_NAME"
 
@@ -55,7 +53,7 @@ VQVAE="Meissonic/vqvae"
 # ----------------------------
 # Optimizer / scheduler configs
 # ----------------------------
-LEARNING_RATE=5e-6
+LEARNING_RATE=1e-5
 ADAM_BETA1=0.9
 ADAM_BETA2=0.99
 WEIGHT_DECAY=0.1
@@ -66,7 +64,7 @@ WARMUP_RATIO=0.0001
 # ----------------------------
 # Sampling configs
 # ----------------------------
-TEMPERATURE=0.1
+TEMPERATURE=0.6
 MAX_PROMPT_LENGTH=1024
 MAX_COMPLETION_LENGTH=256
 BLOCK_LENGTH=32
