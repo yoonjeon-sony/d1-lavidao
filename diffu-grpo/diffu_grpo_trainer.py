@@ -2575,12 +2575,12 @@ class DiffuGRPOTrainer(GRPOTrainer):
                             rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
                             save_path = debug_dir / f"step{self._step}_rank{rank}.png"
                             canvas.save(save_path)
-                            _dbg_print(f"Saved debug image to {save_path}")
+                            _debug_log(f"Saved debug image to {save_path}")
                         else:
-                            _dbg_print(f"Debug image skip: comp_img={comp_img is not None}, gt_img={gt_img is not None}, gt_path={gt_path!r}")
+                            _debug_log(f"Debug image skip: comp_img={comp_img is not None}, gt_img={gt_img is not None}, gt_path={gt_path!r}")
                     except Exception as e:
                         import traceback
-                        _dbg_print(f"Debug image save failed: {e}\n{traceback.format_exc()}")
+                        _debug_log(f"Debug image save failed: {e}\n{traceback.format_exc()}")
 
             if und_inputs is not None:
                 # Und rewards (text → format + correctness)
