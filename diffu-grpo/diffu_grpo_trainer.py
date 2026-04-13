@@ -1176,15 +1176,18 @@ class DiffuGRPOTrainer(GRPOTrainer):
         xt[xt == img_mask_id] = x0[xt == img_mask_id]
 
         # ---- Pre-compute VQ codebook embeddings for TV-on-VQ reward ----
-        # Generated-side embeddings come from the final xt VQ indices.
-        # Ground-truth embeddings are computed by encoding each example's
-        # image_gt path through the same VQ pipeline. Both are detached to
-        # CPU so reward_func can process them outside the model forward.
+        # We use ``base_model.gen_embedding`` (the raw nn.Embedding codebook
+        # lookup) directly, NOT ``call_gen_embedding`` — the latter passes
+        # through ``downsample_gen`` which halves each spatial dimension,
+        # producing (B, H/2 * W/2, D) instead of (B, H*W, D). TV on the raw
+        # codebook lookup matches the user's "TV on codebook embeddings"
+        # intent and keeps the grid shape == gen_shape. Both sides are
+        # detached to CPU so reward_func can process them off-device.
         gen_embeds_batch = None
         if not is_unitok:
             try:
                 with torch.no_grad():
-                    gen_embeds_batch = base_model.call_gen_embedding(xt, gen_shape)  # (B, N, D)
+                    gen_embeds_batch = base_model.gen_embedding(xt)  # (B, H*W, D)
             except Exception as _e:
                 print(f"[tv_reward] gen embedding failed: {_e}", flush=True)
                 gen_embeds_batch = None
@@ -1208,7 +1211,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 )
                 with torch.no_grad():
                     _gt_codes, _gt_shape = model.encode_image_gen(_gt_vq_latent)
-                    _gt_emb = base_model.call_gen_embedding(_gt_codes, _gt_shape)
+                    _gt_emb = base_model.gen_embedding(_gt_codes)  # (1, H*W, D)
                 gt_embeds_list.append(_gt_emb[0].detach().cpu())
             except Exception as _e:
                 print(f"[tv_reward] gt encode failed for row {_ex_idx}: {_e}", flush=True)

@@ -141,16 +141,30 @@ def perceptual_score_reward_func(
     gen_grid_shape = gen_grid_shape if gen_grid_shape is not None else [None] * n
 
     rewards: list[float] = []
+    debug = os.environ.get("DIFFU_GRPO_DEBUG") == "1"
     for i in range(n):
         g = gen_vq_embeds[i]
         t = gt_vq_embeds[i]
         shp = gen_grid_shape[i]
         if g is None or t is None or shp is None:
+            if debug:
+                print(
+                    f"[tv_reward] sample {i} NaN (missing input): "
+                    f"gen={g is not None} gt={t is not None} shape={shp}",
+                    flush=True,
+                )
             rewards.append(float("nan"))
             continue
         try:
             H, W = int(shp[0]), int(shp[1])
             if g.shape[0] != H * W or t.shape != g.shape:
+                if debug:
+                    print(
+                        f"[tv_reward] sample {i} NaN (shape mismatch): "
+                        f"gen={tuple(g.shape)} gt={tuple(t.shape)} grid=({H},{W}) "
+                        f"expected_N={H * W}",
+                        flush=True,
+                    )
                 rewards.append(float("nan"))
                 continue
             g_hw = g.float().view(H, W, -1)
