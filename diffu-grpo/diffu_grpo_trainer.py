@@ -748,6 +748,13 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     "prompt": prompt_texts[batch_idx],
                     "prompt_len_tokens": int(per_row_prompt_lens[batch_idx]),
                     "completion_len_tokens": int(per_row_completion_lens[batch_idx]),
+                    # ``instruction`` is the raw COT-prefixed question
+                    # ("{COT_PROMPT} {question}") set by the dataset loader.
+                    # Surfaced here so the unified-mode payload builder in
+                    # ``_generate_and_score_completions`` can compose
+                    # ``"<image> <image_gen_enc> {instruction}"`` without
+                    # re-deriving it from the prompt template.
+                    "instruction": example.get("instruction", ""),
                     "payload": {
                         "id": str(example.get("sample_id", example.get("pid", example.get("id", "")))),
                         "image": source_images_per_example[batch_idx],
@@ -1501,20 +1508,32 @@ class DiffuGRPOTrainer(GRPOTrainer):
             # loss tensor covering every row of that batch.
             prepared.pop("sample_is_image_edit", None)
             prepared.pop("prompts", None)
-            # Force do_not_mask_text to always be absent (= None) during GRPO
-            # scoring forwards.  LlavaLladaForMaskedDiffusion.forward has a
-            # non-deterministic branch at llava_llada.py:353 that applies a
-            # 80% ``torch.rand_like`` gate to the per-sample do_not_mask_text
-            # flags using the global default RNG, not the seeded generator.
-            # Across the old-policy and current-policy passes this produces
-            # different final_masked_indices for the same (sample, mask_seed),
-            # which makes coef_1 = exp(curr - old) explode at masked positions.
-            # Popping the key here means the model's forward receives None,
-            # short-circuiting that branch and yielding deterministic masks.
-            prepared.pop("do_not_mask_text", None)
+            # ``do_not_mask_text``: this triggers a non-deterministic 80%
+            # gate at llava_llada.py:353. For legacy gen-only / und-only
+            # scoring (which never sets the flag) we pop it defensively so
+            # the model's forward sees None and the gate is short-circuited.
+            #
+            # In UNIFIED mode (text_rollout_use_gen_image=True), the payload
+            # intentionally sets ``do_not_mask_text=True`` to keep the
+            # rollout-decoded text as mostly-frozen reasoning context (~80%
+            # of text positions excluded from the diffusion loss). RNG
+            # non-determinism is contained to the single old-pass draw —
+            # the captured ``final_masked_indices`` is then replayed via
+            # ``force_text_mask`` on every subsequent pass (ref + current),
+            # which overrides the gate at llava_llada.py:369-373. So
+            # cross-pass divergence is impossible. Honor the flag when set.
+            dnmt = prepared.get("do_not_mask_text", None)
+            keep = dnmt is not None and (
+                (isinstance(dnmt, (list, tuple)) and any(bool(x) for x in dnmt))
+                or (isinstance(dnmt, torch.Tensor) and bool(dnmt.any().item()))
+                or (isinstance(dnmt, bool) and dnmt)
+            )
+            if not keep:
+                prepared.pop("do_not_mask_text", None)
             return prepared
 
-        def _run_modality(selected: list, modality: str, force_masks: list = None):
+        def _run_modality(selected: list, modality: str, force_masks: list = None,
+                          unified: bool = False):
             """Run model.forward over ``selected`` (all one modality, in order).
 
             Row i of ``selected`` → row i of the concatenated per-seed output,
@@ -1523,6 +1542,15 @@ class DiffuGRPOTrainer(GRPOTrainer):
 
             modality: "gen" (reads gen_loss_none_reduction) or
                       "und" (reads und_loss_none_reduction).
+
+            unified: when True, the sample is a unified gen+und payload (image
+                in `<image_gen>` slot AND text response in the same gpt turn).
+                A single forward emits BOTH `gen_loss_none_reduction` (over
+                latent positions) and `und_loss_none_reduction` (over text
+                positions). They are concatenated along the sequence dim
+                (gen-first, und-second) into a single per-token logp tensor.
+                Both `final_masked_indices` and `masked_indices_gen` are
+                captured for replay.
 
             force_masks: Optional[list[list[dict]]] indexed by
                 [seed_index_in_mask_seeds][sample_local_idx].  When provided,
@@ -1589,7 +1617,20 @@ class DiffuGRPOTrainer(GRPOTrainer):
                         force_text_mask=force_text_mask,
                         force_gen_mask=force_gen_mask,
                     )
-                    if modality == "gen":
+                    if unified and modality == "gen":
+                        # Unified payload: forward emits BOTH losses in one
+                        # shot. Concatenate along the sequence dim
+                        # (gen-first, und-second) so per-token logps cover
+                        # the full <image_gen>+text response in one tensor.
+                        gen_none = output.get("gen_loss_none_reduction")
+                        und_none = output.get("und_loss_none_reduction")
+                        assert gen_none is not None and und_none is not None, (
+                            "unified forward must return BOTH gen_loss_none_reduction "
+                            "and und_loss_none_reduction; got "
+                            f"gen={gen_none is not None} und={und_none is not None}"
+                        )
+                        loss_none = torch.cat([gen_none, und_none], dim=-1)
+                    elif modality == "gen":
                         # (batch_size, latent_total) — covers every (all-gen) row.
                         loss_none = output.get("gen_loss_none_reduction")
                         assert loss_none is not None, (
@@ -1607,8 +1648,12 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     # caller can replay it.  If force_masks was provided, the
                     # model round-trips it unchanged, so the capture is still
                     # a safe single source of truth for downstream calls.
+                    # In unified mode, capture BOTH text and gen masks.
                     captured_text = output.get("final_masked_indices")
-                    captured_gen = output.get("masked_indices_gen") if modality == "gen" else None
+                    if unified or modality == "gen":
+                        captured_gen = output.get("masked_indices_gen")
+                    else:
+                        captured_gen = None
                     captured_masks.append({
                         "text_mask": (
                             captured_text.detach().to("cpu")
@@ -1627,8 +1672,16 @@ class DiffuGRPOTrainer(GRPOTrainer):
             return per_seed_outputs, captured_masks_per_seed
 
         # Gen fully first, then und — each in its own forward loop.
+        # In unified mode (text_rollout_use_gen_image=True), the entire batch
+        # routes through the "gen" branch with `unified=True`; und_selected
+        # is empty and the und branch is a no-op.
+        unified_mode = (
+            getattr(self.args, "text_rollout_use_gen_image", False)
+            and und_scoring is None
+            and gen_scoring is not None
+        )
         all_gen_logps, captured_gen_masks = _run_modality(
-            gen_selected, "gen", force_masks=force_gen_masks,
+            gen_selected, "gen", force_masks=force_gen_masks, unified=unified_mode,
         )
         all_und_logps, captured_und_masks = _run_modality(
             und_selected, "und", force_masks=force_und_masks,
@@ -1991,12 +2044,30 @@ class DiffuGRPOTrainer(GRPOTrainer):
             )
             return loss
 
-        # ---- Compute gen / und losses independently ----
-        gen_loss = _grpo_loss(gen_logps, old_gen_logps, ref_gen_logps, gen_advantages, "gen/")
-        und_loss = _grpo_loss(und_logps, old_und_logps, ref_und_logps, und_advantages, "und/")
+        # ---- Compute losses ----
+        # Unified mode (text_rollout_use_gen_image=True at rollout time):
+        # ``gen_logps`` carries the concatenated gen+und per-token logps for
+        # the unified payload (set by `_run_modality(unified=True)`),
+        # ``und_logps`` is None (und_batch was None in the batch dict
+        # returned by _generate_and_score_completions). Run a single
+        # _grpo_loss with the ``unified/`` prefix; skip the und call.
+        unified_mode_loss = (gen_logps is not None and und_logps is None
+                             and getattr(self.args, "text_rollout_use_gen_image", False))
+        if unified_mode_loss:
+            unified_loss = _grpo_loss(
+                gen_logps, old_gen_logps, ref_gen_logps, gen_advantages, "unified/",
+            )
+            gen_loss = None
+            und_loss = None
+        else:
+            gen_loss = _grpo_loss(gen_logps, old_gen_logps, ref_gen_logps, gen_advantages, "gen/")
+            und_loss = _grpo_loss(und_logps, old_und_logps, ref_und_logps, und_advantages, "und/")
+            unified_loss = None
 
         # ---- Combine ----
-        if gen_loss is not None and und_loss is not None:
+        if unified_loss is not None:
+            loss = unified_loss
+        elif gen_loss is not None and und_loss is not None:
             loss = gen_loss + und_loss
         elif gen_loss is not None:
             loss = gen_loss
@@ -2005,6 +2076,8 @@ class DiffuGRPOTrainer(GRPOTrainer):
         else:
             raise ValueError("Both gen_batch and und_batch are None — nothing to train on.")
 
+        if unified_loss is not None:
+            self._metrics[mode]["unified/loss"].append(unified_loss.detach().item())
         if gen_loss is not None:
             self._metrics[mode]["gen/loss"].append(gen_loss.detach().item())
         if und_loss is not None:
@@ -2336,22 +2409,84 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 )
 
             # ---- Build scoring examples per modality ----
+            # Unified-mode contract: when text_rollout_use_gen_image=True AND
+            # both modalities ran, fold each (gen, und) pair into ONE
+            # LazySupervisedDataset payload whose gpt turn carries both
+            # ``<image_gen>`` and the rollout-decoded text. The unified
+            # payload is fed through the gen code path
+            # (cached_gen_samples / cached_gen_masks / force_gen_masks /
+            # old_gen_logps) — und is set to None. ``_run_modality`` reads
+            # both gen_loss_none_reduction AND und_loss_none_reduction from
+            # one forward and concatenates them on the sequence dim.
+            unified_mode = bool(
+                getattr(self.args, "text_rollout_use_gen_image", False)
+                and gen_inputs is not None
+                and und_inputs is not None
+                and image_contexts is not None
+                and answer_contexts is not None
+            )
+
             collate_fn = MaskDataCollator(self.processing_class, self.args)
             dataset_args = self._build_lazy_supervised_data_args(unwrapped_model, image_processor)
             gen_scoring = None
             und_scoring = None
-            if gen_inputs is not None:
+
+            if unified_mode:
+                assert len(image_contexts) == len(answer_contexts), (
+                    f"unified mode: gen/und length mismatch "
+                    f"({len(image_contexts)} vs {len(answer_contexts)})"
+                )
+                unified_payloads = []
+                for _i, (img_ctx, ans_ctx) in enumerate(
+                    zip(image_contexts, answer_contexts)
+                ):
+                    assert (
+                        img_ctx is not None
+                        and img_ctx.get("valid", False)
+                        and img_ctx.get("decoded_image") is not None
+                    ), f"unified mode: row {_i} has no valid decoded_image — image rollout failed"
+                    assert (
+                        ans_ctx is not None and ans_ctx.get("decoded_text") is not None
+                    ), f"unified mode: row {_i} has no decoded_text — text rollout failed"
+
+                    gen_pl = dict(img_ctx["payload"])  # shallow copy to mutate
+                    instruction = ans_ctx.get("instruction", "")
+                    decoded_text = ans_ctx["decoded_text"]
+                    # ``do_not_mask_text=True``: keep ~80% of text positions
+                    # unmasked so the rollout-generated text acts as
+                    # mostly-frozen reasoning context. _prepare_batch is
+                    # patched to honor this flag in unified mode.
+                    gen_pl["do_not_mask_text"] = True
+                    gen_pl["conversations"] = [
+                        {
+                            "from": "human",
+                            "value": f"<image> <image_gen_enc> {instruction}",
+                        },
+                        {
+                            "from": "gpt",
+                            "value": f"<image_gen> {decoded_text}",
+                        },
+                    ]
+                    unified_payloads.append(gen_pl)
                 gen_scoring = LazySupervisedDataset(
                     tokenizer=self.processing_class,
                     data_args=dataset_args,
-                    list_data=[context["payload"] for context in image_contexts],
+                    list_data=unified_payloads,
                 )
-            if und_inputs is not None:
-                und_scoring = LazySupervisedDataset(
-                    tokenizer=self.processing_class,
-                    data_args=dataset_args,
-                    list_data=[context["payload"] for context in answer_contexts],
-                )
+                # und_scoring stays None by design.
+            else:
+                if gen_inputs is not None:
+                    gen_scoring = LazySupervisedDataset(
+                        tokenizer=self.processing_class,
+                        data_args=dataset_args,
+                        list_data=[context["payload"] for context in image_contexts],
+                    )
+                if und_inputs is not None:
+                    und_scoring = LazySupervisedDataset(
+                        tokenizer=self.processing_class,
+                        data_args=dataset_args,
+                        list_data=[context["payload"] for context in answer_contexts],
+                    )
             assert gen_scoring is not None or und_scoring is not None, "No scoring examples were built."
         
         # ---- Shared mask seeds across modalities and ranks ----
@@ -2637,20 +2772,48 @@ class DiffuGRPOTrainer(GRPOTrainer):
             self._metrics[mode][f"{tag}/advantages_max"].append(centered.max().item())
             return advantages
 
-        if gen_inputs is not None:
-            gen_advantages = _compute_advantages(gen_local_rewards, "gen")
-        else:
-            gen_advantages = None
-        if und_inputs is not None:
-            und_advantages = _compute_advantages(und_local_rewards, "und")
-        else:
+        if unified_mode:
+            # Unified reward = sum of per-sample perceptual + format +
+            # correctness. Each per-modality block above wrote into its
+            # own *_local_rewards (length = N_samples since both modalities
+            # have the same sample count in unified mode). NaN is treated
+            # as 0 so partial-failures degrade gracefully (e.g. ArxivQA
+            # rows with image_gt=None get a 0 perceptual contribution but
+            # still carry format/correctness signal).
+            assert gen_local_rewards is not None and und_local_rewards is not None, (
+                "unified mode: both gen_local_rewards and und_local_rewards "
+                "must be populated"
+            )
+            assert gen_local_rewards.size(0) == und_local_rewards.size(0), (
+                f"unified mode: per-modality reward length mismatch: "
+                f"{gen_local_rewards.size(0)} vs {und_local_rewards.size(0)}"
+            )
+            unified_local_rewards = (
+                torch.nan_to_num(gen_local_rewards, nan=0.0)
+                + torch.nan_to_num(und_local_rewards, nan=0.0)
+            )
+            gen_advantages = _compute_advantages(unified_local_rewards, "unified")
             und_advantages = None
+        else:
+            if gen_inputs is not None:
+                gen_advantages = _compute_advantages(gen_local_rewards, "gen")
+            else:
+                gen_advantages = None
+            if und_inputs is not None:
+                und_advantages = _compute_advantages(und_local_rewards, "und")
+            else:
+                und_advantages = None
 
         for k, v in _timings.items():
             self._metrics[mode][f"time_profile/{k}"].append(v)
+        # In unified mode, the unified scoring + advantages live on the
+        # ``gen`` slot (the gen-modality code path runs the unified forward);
+        # ``und`` is None so _compute_loss skips the second _grpo_loss call.
         return {
-            "gen": [gen_scoring, gen_advantages, old_gen_logps, ref_gen_logps] if gen_inputs is not None else None,
-            "und": [und_scoring, und_advantages, old_und_logps, ref_und_logps] if und_inputs is not None else None,
+            "gen": [gen_scoring, gen_advantages, old_gen_logps, ref_gen_logps]
+                if (gen_inputs is not None or unified_mode) else None,
+            "und": [und_scoring, und_advantages, old_und_logps, ref_und_logps]
+                if (und_inputs is not None and not unified_mode) else None,
             "mask_seeds": mask_seed_list,
             "cached_gen_samples": cached_gen_samples,
             "cached_und_samples": cached_und_samples,
