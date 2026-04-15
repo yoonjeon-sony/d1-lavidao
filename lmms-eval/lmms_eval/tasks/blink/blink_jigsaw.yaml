@@ -1,5 +1,0 @@
-dataset_name: "Jigsaw"
-tag: "blink_groups"
-task: "blink_jigsaw"
-test_split: val
-include: _default_template_yaml

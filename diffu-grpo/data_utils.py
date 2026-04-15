@@ -520,31 +520,14 @@ def _normalize_arxivqa_label(raw_label) -> str:
         raise ValueError(f"ArxivQA sample has invalid label: {raw_label!r}")
     return raw_label.strip()
 
-
+ARXIVQA_DEFAULT_DATASET_PATH = "/scratch2/yoonjeon.kim/data/arxivqa_select_10k"
 def download_process_arxivqa(data_root: str = "./data"):
     dataset = load_dataset("MMInstruction/ArxivQA", split="train")
-    dataset.select(range(10000)).save_to_disk(os.path.join(data_root, "arxivqa_select_10k.jsonl"))
-    new_dataset = Dataset.from_list([])
-    for data in dataset:
-        question = data["question"]
-        options = data["options"]
-        label = data["label"]
-        image = data["image"]
-        image_path = os.path.join(data_root, f"{data['id']}.png")
-        image.save(image_path)
-        new_dataset.append(
-            {
-                "question": question,
-                "options": options,
-                "image": image_path,
-                "label": label,
-            }
-        )
-    return new_dataset
+    dataset.select(range(10000)).save_to_disk(ARXIVQA_DEFAULT_DATASET_PATH)
+    
 
 
 
-ARXIVQA_DEFAULT_DATASET_PATH = "/scratch2/yoonjeon.kim/data/arxivqa_select_10k"
 
 
 
@@ -679,3 +662,6 @@ def get_arxivqa_interleave_questions(
         desc="ArxivQA → und rows",
     )
     return gen_ds, und_ds
+
+if __name__ == "__main__":
+    download_process_arxivqa()

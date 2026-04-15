@@ -2348,7 +2348,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
             # ---- Text (und) rollouts ----
             if und_inputs is not None:
                 answer_contexts: list[Optional[dict]] = [None] * len(und_inputs)
-                text_batch_size = 4
+                text_batch_size = 2
                 prefix_lm = bool(getattr(self.args, "prefix_lm", True))
                 generation_kwargs = {
                     "max_new_tokens": int(self.args.max_completion_length),

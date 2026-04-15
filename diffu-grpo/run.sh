@@ -18,11 +18,12 @@ DEBUG="${DEBUG:-0}"
 
 mkdir -p "$TRITON_CACHE_DIR"
 chmod 700 "$TRITON_CACHE_DIR"
-DATASET="thinkmorph_interleave" # thinkmorph_interleave thinkmorph_answer thinkmorph_edit
+DATASET="thinkmorph_answer" # thinkmorph_interleave thinkmorph_answer thinkmorph_edit
 RUN_NAME=${DATASET}-LavidaO
-MODEL_PATH="/scratch2/yoonjeon.kim/sft_LaViDa-O-thinkmorph_zebracot-step9000"
-OUTPUT_DIR=/scratch2/yoonjeon.kim/rl-lavidao-thinkmorph/$RUN_NAME
-# OUTPUT_DIR="/group2/dgm/yoonjeon/ckpts/rl-lavidao-thinkmorph/$RUN_NAME"
+# MODEL_PATH="/scratch2/yoonjeon.kim/sft_LaViDa-O-thinkmorph_zebracot-step9000"
+# OUTPUT_DIR=/scratch2/yoonjeon.kim/rl-lavidao-thinkmorph/$RUN_NAME
+MODEL_PATH="/group2/dgm/yoonjeon/ckpts/sft_LaViDa-O-thinkmorph_zebracot/checkpoint-9000"
+OUTPUT_DIR="/group2/dgm/yoonjeon/ckpts/rl-lavidao-thinkmorph/$RUN_NAME"
 
 # ----------------------------
 # Model initialization configs
@@ -105,8 +106,8 @@ if [[ "${DEBUG}" == "1" || "${DEBUG,,}" == "true" ]]; then
     export DIFFU_GRPO_DEBUG=1
     export DIFFU_GRPO_STEP0_ASSERT=1
     export DIFFU_GRPO_STEP0_STRICT=1
-    BATCH_SIZE=8
-    NUM_PROCESSES=4
+    BATCH_SIZE=16
+    NUM_PROCESSES=8
     NUM_GENERATIONS=2
     PER_DEVICE_BATCH_SIZE=1
     MAX_STEPS=20
@@ -143,7 +144,7 @@ GRAD_ACCUM_STEPS=$(
   ))
 )
 
-python -m accelerate.commands.launch \
+/home/yoonjeon.kim/dLLM-RL/train_sft/.venv/bin/python -m accelerate.commands.launch \
     --config_file ./diffu-grpo/accelerate.yaml \
     --num_processes $NUM_PROCESSES \
     --num_machines 1 \
