@@ -495,6 +495,15 @@ class Llava_Llada(lmms):
             question_input = []
             # import ipdb; ipdb.set_trace()
 
+            # Accumulate per-sample visual data so batched generation has one entry per
+            # <image> token across the entire batch. Previously image_tensor was overwritten
+            # each iteration, which only worked when batch_size == 1.
+            # A single sample can itself carry multiple images; each contributes one entry
+            # (possibly a multi-patch tensor) to flat_images.
+            flat_images = []          # list of per-image tensors, flattened across batch
+            flat_image_sizes = []     # [(w, h), ...] aligned with flat_images (image task only)
+            task_type = "text"
+
             for visual, context in zip(batched_visuals, batched_contexts):
                 t0 = time.time()
                 if origin_image_aspect_ratio is not None and self._config.image_aspect_ratio != origin_image_aspect_ratio:
@@ -552,6 +561,31 @@ class Llava_Llada(lmms):
 
                         task_type = "video"
                         placeholder_count = len(frames) if self.token_strategy == "multiple" else 1
+
+                # Flatten this sample's image_tensor into per-image entries so the batched
+                # prepare_inputs_labels_for_multimodal sees exactly one entry per <image> token.
+                # The number of <image> tokens this sample will emit equals placeholder_count.
+                if image_tensor is None or (isinstance(image_tensor, list) and len(image_tensor) == 0):
+                    sample_entries = []
+                elif isinstance(image_tensor, list):
+                    sample_entries = list(image_tensor)
+                elif torch.is_tensor(image_tensor):
+                    if image_tensor.ndim == 5:
+                        sample_entries = [image_tensor[i] for i in range(image_tensor.shape[0])]
+                    elif image_tensor.ndim == 4:
+                        if task_type == "video" and placeholder_count == 1:
+                            # All frames collapse into a single <image> token
+                            sample_entries = [image_tensor]
+                        else:
+                            sample_entries = [image_tensor[i:i+1] for i in range(image_tensor.shape[0])]
+                    else:
+                        sample_entries = [image_tensor]
+                else:
+                    sample_entries = [image_tensor]
+                flat_images.extend(sample_entries)
+
+                if task_type == "image" and visual is not None:
+                    flat_image_sizes.extend([v.size for v in visual])
 
                 if image_tensor is not None and len(image_tensor) != 0 and DEFAULT_IMAGE_TOKEN not in context:
                     """
@@ -627,7 +661,7 @@ class Llava_Llada(lmms):
             attention_masks = input_ids.ne(pad_token_ids).to(self.device)
 
             if task_type == "image":
-                gen_kwargs["image_sizes"] = [batched_visuals[0][idx].size for idx in range(len(batched_visuals[0]))]
+                gen_kwargs["image_sizes"] = flat_image_sizes
             elif task_type == "video":
                 stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
                 keywords = [stop_str]
@@ -642,10 +676,13 @@ class Llava_Llada(lmms):
             # breakpoint()
             if "image_aspect_ratio" in gen_kwargs.keys():
                 gen_kwargs.pop("image_aspect_ratio")
+            # Pass the batch-flattened image list (None if no visuals at all) so that
+            # len(images) == total <image> tokens across the batch.
+            images_arg = flat_images if len(flat_images) > 0 else None
             try:
                 with torch.inference_mode():
-                    cont = self.model.generate(input_ids, attention_mask=attention_masks, pad_token_id=pad_token_ids, images=image_tensor, use_cache=self.use_cache, **gen_kwargs)
-                    # cont = self.model.generate(qwen_input_ids, pad_token_id=pad_token_ids, images=image_tensor, use_cache=self.use_cache, **gen_kwargs)
+                    cont = self.model.generate(input_ids, attention_mask=attention_masks, pad_token_id=pad_token_ids, images=images_arg, use_cache=self.use_cache, **gen_kwargs)
+                    # cont = self.model.generate(qwen_input_ids, pad_token_id=pad_token_ids, images=images_arg, use_cache=self.use_cache, **gen_kwargs)
                 if gen_kwargs.get('use_fast_dlm'):
                     cont = cont[0]
                 text_outputs = self.tokenizer.batch_decode(cont, skip_special_tokens=True)
@@ -669,7 +706,10 @@ class Llava_Llada(lmms):
 
             text_outputs = [response.strip() for response in text_outputs]
             res.extend(text_outputs)
-            self.cache_hook.add_partial("generate_until", (context, gen_kwargs), text_outputs)
+            # Cache per-sample: the previous single add_partial used the last sample's
+            # context for the whole batch output, which is incorrect when batch_size > 1.
+            for _ctx, _out in zip(batched_contexts, text_outputs):
+                self.cache_hook.add_partial("generate_until", (_ctx, gen_kwargs), _out)
             pbar.update(1)
             # reorder this group of results back to original unsorted form
         res = re_ords.get_original(res)
