@@ -125,6 +125,10 @@ def forward_process(bsz,seq_len,device, eps=1e-3,policy='uniform',policy_args=No
     
     return masked_indices, p_mask
 
+import os
+LOG_BATCH_LENGTH = os.environ.get('LOG_BATCH_LENGTH', False)
+DEBUG_PRINT_IMAGE_RES = os.environ.get("DEBUG_PRINT_IMAGE_RES", False)
+
 SKIP_COMPLEMENTARY_MASKING = os.environ.get("SKIP_COMPLEMENTARY_MASKING", False)
 
 class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
@@ -399,60 +403,33 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
             if images_gen is not None:
                 gen_latents_masked = gen_latents.clone()
                 if mask_seed is not None:
-                    # Scoring mode: deterministic masking using the SAME
-                    # logic as ``masked_indices`` (torch.rand < mask_prob),
-                    # but with a SEPARATE seeded generator so the gen mask
-                    # is purely a function of (mask_seed, gen_latents.shape)
-                    # — independent of the text draw's consumption of the
-                    # shared generator.
-                    #
-                    # Why this matters: the previous implementation reused
-                    # the ``generator`` already advanced by the text draw at
-                    # line 316 above, so the gen mask implicitly depended on
-                    # ``text_seq_len``.  Any drift in text_seq_len between
-                    # two forwards (padding differences, collator corners,
-                    # adapter-dependent sequence reshaping under
-                    # disable_adapter()) would land the gen torch.rand call
-                    # on different generator state, producing a handful of
-                    # mismatched positions in ``masked_indices_gen`` across
-                    # old / ref / current passes.  That's what drove the
-                    # debug-log KL "ref zero-padded at N positions where
-                    # old_ptl is real" warning on the gen modality.
-                    #
-                    # Deriving a second generator from ``mask_seed`` (offset
-                    # by a constant to decorrelate from the text stream)
-                    # decouples the gen mask from text_seq_len entirely.
-                    GEN_SEED_OFFSET = 0x5F3759DF  # arbitrary constant
-                    gen_generator = torch.Generator(device=labels_mask.device)
-                    gen_generator.manual_seed(int(mask_seed) ^ GEN_SEED_OFFSET)
+                    # Scoring mode: deterministic masking with the same seeded generator
+                    # used for text masking (continues its random sequence).
                     N_gen = gen_latents_masked.shape[0]
                     if is_unitok_submask:
                         raw_len = gen_latents.shape[-1] * 8
                         masked_indices_gen = (torch.rand(
                             (N_gen, raw_len),
                             device=raw_inputs_ids.device,
-                            generator=gen_generator,
+                            generator=generator,
                         ) < mask_prob)
                         masked_indices_gen = masked_indices_gen.view(-1, 8, gen_latents.shape[-1])
                     else:
                         masked_indices_gen = (torch.rand(
                             (N_gen, gen_latents.shape[-1]),
                             device=raw_inputs_ids.device,
-                            generator=gen_generator,
+                            generator=generator,
                         ) < mask_prob)
                         if is_unitok:
                             masked_indices_gen = masked_indices_gen.unsqueeze(1).repeat(1, 8, 1)
                 elif is_unitok_submask:
-                    # Non-scoring path (regular SFT forward).  forward_process
-                    # does NOT accept a ``mask_seeds`` kwarg — passing it here
-                    # used to be a latent crash for any caller that reached
-                    # this branch with mask_seeds set.  Strip it.
                     masked_indices_gen, p_mask = forward_process(
                         gen_latents_masked.shape[0],
                         gen_latents.shape[-1] * 8,
                         raw_inputs_ids.device,
                         policy=policy,
                         policy_args=policy_args,
+                        mask_seeds=mask_seeds,
                     )
                     masked_indices_gen = masked_indices_gen.view(-1,8,gen_latents.shape[-1])
                 else:
@@ -462,6 +439,7 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
                         raw_inputs_ids.device,
                         policy=policy,
                         policy_args=policy_args,
+                        mask_seeds=mask_seeds,
                     )
                     if is_unitok:
                         masked_indices_gen = masked_indices_gen.unsqueeze(1).repeat(1,8,1) # N 8
@@ -510,6 +488,8 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
                 final_masked_indices = torch.cat([final_masked_indices,final_masked_indices_inv])
             seq_len = labels.shape[-1]
             # print(seq_len)
+            if LOG_BATCH_LENGTH:
+                print("Batch Length",seq_len)
             CUFOFF=30720
             if seq_len > CUFOFF:
                 print(seq_len,labels.shape)
@@ -603,16 +583,6 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
                     gen_logits = gen_logits.permute(0,2,1,3) # B 8 4096 2064
                     _loss_mask = gen_latents_comp_labels_is_mask.flatten()
                     gen_loss = torch.nn.functional.cross_entropy(gen_logits.flatten(0,2)[_loss_mask],gen_latents_comp_labels.flatten()[_loss_mask])
-                    # per_token_ce: true model log-probs (no temperature).
-                    # Temperature is a rollout sampling parameter; scoring
-                    # log-probs for GRPO must use the unscaled logits (T=1)
-                    # so that per_token_logps = -CE reflects the actual model
-                    # distribution.  Previously ``/ temperature`` was applied
-                    # here, which sharpened the softmax so much (T=0.1 → ×10)
-                    # that high-confidence tokens saturated to CE=0 in bf16,
-                    # producing spurious zeros in gen_loss_none_reduction that
-                    # the trainer's ``(old_ptl != 0)`` sentinel misclassified
-                    # as padding, blowing up the KL term.
                     per_token_ce = torch.nn.functional.cross_entropy(
                         gen_logits.flatten(0, 2)[_loss_mask_flat].float(),
                         gen_latents_comp_labels.flatten()[_loss_mask_flat],
@@ -629,7 +599,7 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
                         loss_weight = loss_weight.flatten()[_loss_mask].to(gen_loss.dtype)
                         gen_loss = (gen_loss * loss_weight).mean()
                         per_token_ce = torch.nn.functional.cross_entropy(
-                            gen_logits[_loss_mask_flat].float(),
+                            gen_logits[_loss_mask_flat].float() / temperature,
                             gen_latents_comp_labels.flatten()[_loss_mask_flat],
                             reduction='none',
                         )
@@ -637,7 +607,7 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
                         _loss_mask = gen_latents_comp_labels_is_mask.flatten()
                         gen_loss = torch.nn.functional.cross_entropy(gen_logits[_loss_mask].float(),gen_targets.flatten()[_loss_mask])
                         per_token_ce = torch.nn.functional.cross_entropy(
-                            gen_logits[_loss_mask_flat].float(),
+                            gen_logits[_loss_mask_flat].float() / temperature,
                             gen_targets.flatten()[_loss_mask_flat],
                             reduction='none',
                         )

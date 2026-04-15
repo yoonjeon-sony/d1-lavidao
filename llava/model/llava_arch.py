@@ -358,8 +358,10 @@ class LlavaMetaModel:
             rank0_print(f"Loaded mm projector weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
             incompatible_keys = self.vision_resampler.load_state_dict(get_w(mm_projector_weights, "vision_resampler"), strict=False)
             rank0_print(f"Loaded vision resampler weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
+
 import os
-NOT_ALWASY_DO_2DPOOL = os.environ.get("NOT_ALWASY_DO_2DPOOL", True)
+DEBUG_PRINT_IMAGE_RES = os.environ.get("DEBUG_PRINT_IMAGE_RES", False)
+NOT_ALWASY_DO_2DPOOL = os.environ.get("NOT_ALWASY_DO_2DPOOL", False)
 ALWASY_DO_2DPOOL = not NOT_ALWASY_DO_2DPOOL
 # ALWASY_DO_2DPOOL = True
 # breakpoint()
@@ -587,7 +589,8 @@ class LlavaMetaForCausalLM(ABC):
             image_aspect_ratio = getattr(self.config, "image_aspect_ratio", "square")
             mm_newline_position = getattr(self.config, "mm_newline_position", "one_token")
             # mm_patch_merge_type = 'spatial_unpad'
-            
+            if DEBUG_PRINT_IMAGE_RES:
+                print(f"DEBUG_PRINT_IMAGE_RES: {image_aspect_ratio,mm_patch_merge_type,mm_newline_position}")
             if mm_patch_merge_type == "flat":
                 image_features = [x.flatten(0, 1) for x in image_features]
                 # print(len(image_features))
@@ -824,7 +827,6 @@ class LlavaMetaForCausalLM(ABC):
         new_labels_padded = torch.full((batch_size, max_len), IGNORE_INDEX, dtype=new_labels[0].dtype, device=new_labels[0].device)
         new_input_ids_padded = torch.full((batch_size, max_len), IGNORE_INDEX, dtype=new_labels[0].dtype, device=new_labels[0].device)
         attention_mask = torch.zeros((batch_size, max_len), dtype=attention_mask.dtype, device=attention_mask.device)
-        position_ids = torch.zeros((batch_size, max_len), dtype=position_ids.dtype, device=position_ids.device)
         # rank0_print("Prepare pos id")
         # try:
         #     assert len(new_input_embeds) > 0
@@ -845,14 +847,19 @@ class LlavaMetaForCausalLM(ABC):
                     new_labels_padded[i, -cur_len:] = cur_new_labels
                     new_input_ids_padded[i, -cur_len:] = curr_new_input_ids
                     attention_mask[i, -cur_len:] = True
-                    position_ids[i, -cur_len:] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
             else:
                 new_input_embeds_padded.append(torch.cat((cur_new_embed, torch.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype, device=cur_new_embed.device)), dim=0))
                 if cur_len > 0:
                     new_labels_padded[i, :cur_len] = cur_new_labels
                     new_input_ids_padded[i, :cur_len] = curr_new_input_ids
                     attention_mask[i, :cur_len] = True
-                    position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
+
+        # Build position_ids from attention_mask so left/right padded samples in a batch
+        # get correct per-sample positions (canonical HF approach, works for batched inference).
+        position_ids = attention_mask.long().cumsum(-1) - 1
+        position_ids = position_ids.masked_fill(attention_mask == 0, 1)
+        if past_key_values is not None:
+            position_ids = position_ids[:, -1].unsqueeze(-1)
         try:
             new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
         except:
@@ -870,8 +877,6 @@ class LlavaMetaForCausalLM(ABC):
         else:
             attention_mask = attention_mask.to(dtype=_attention_mask.dtype)
 
-        if _position_ids is None:
-            position_ids = None
         if getattr(self.config, "use_pos_skipping", False) and self.training:
             position_ids = torch.arange(new_input_embeds.size(1), device=new_input_embeds.device).unsqueeze(0).to(new_input_embeds.device)
             split_position = random.randint(0, new_input_embeds.size(1))

@@ -146,11 +146,11 @@ def logit_normal_schedule(shift,sigmas):
     return sigmas
 
 INT_MAX = 1_000_000
-def get_logits(model,input_emnbeddings,modality_indices=None,t2i_inference=False,past_key_values=None,gen_shape=None,timesteps=None,input_modality_indices=None):
+def get_logits(model,input_emnbeddings,modality_indices=None,t2i_inference=False,past_key_values=None,gen_shape=None,timesteps=None,input_modality_indices=None,attention_mask=None):
     if t2i_inference:
         if input_modality_indices is None:
             input_modality_indices =modality_indices
-        output = model(None,input_embeddings=input_emnbeddings,modality_indices=input_modality_indices,output_hidden_states=True,past_key_values=past_key_values)
+        output = model(None,input_embeddings=input_emnbeddings,modality_indices=input_modality_indices,output_hidden_states=True,past_key_values=past_key_values,attention_mask=attention_mask)
         hidden_states = output.hidden_states[-1]
         gen_hidden_states = hidden_states[modality_indices]
         gen_hidden_states = maybe_truncate_last_dim(gen_hidden_states,model.config.d_model_gen)
@@ -182,7 +182,7 @@ def get_logits(model,input_emnbeddings,modality_indices=None,t2i_inference=False
         return logits
     else:
         modality_indices = torch.zeros(input_emnbeddings.shape[:-1],device=input_emnbeddings.device,dtype=torch.bool)
-        logits = model(None,input_embeddings=input_emnbeddings,modality_indices=modality_indices,past_key_values=past_key_values).logits
+        logits = model(None,input_embeddings=input_emnbeddings,modality_indices=modality_indices,past_key_values=past_key_values,attention_mask=attention_mask).logits
     return logits
 
 def wte(model,x,t2i_inference=False,gen_shape=None,x_gen=None,inputs_embeds_curr=None,new_token_mask=None):
@@ -250,18 +250,29 @@ def generate(model, prompt=None, steps=None, max_new_tokens=128, block_length=12
     # if step_ratio:
     #     steps = int(max_new_tokens*step_ratio)
     gen_length = max_new_tokens
-    assert position_ids is None
     if prompt is None:
         assert inputs_embeds is not None
         bsz, seq_len = inputs_embeds.shape[:2]
         prompt = torch.full((bsz, seq_len), 0, dtype=torch.long).to(model.device)
     else:
         bsz = prompt.shape[0]
+
+    # Prefix-side attention_mask (B, prefix_len). If none provided, treat all positions as valid.
+    prefix_len = inputs_embeds.shape[1] if inputs_embeds is not None else prompt.shape[1]
+    if attention_mask is None:
+        attention_mask = torch.ones((bsz, prefix_len), dtype=torch.long, device=model.device)
+    else:
+        attention_mask = attention_mask.to(device=model.device, dtype=torch.long)
+    # Mask over the appended mask-token region: all valid (these positions will be generated).
+    gen_mask = torch.ones((bsz, gen_length), dtype=torch.long, device=model.device)
+    # Combined mask used for forwards that see both cached prefix and current tokens.
+    full_attention_mask = torch.cat([attention_mask, gen_mask], dim=-1)
+
     past_key_values = None
     if prefix_lm:
         if input_modality_indices is None and t2i_inference:
             input_modality_indices = torch.zeros(inputs_embeds.shape[:-1], dtype=torch.bool, device=inputs_embeds.device)
-        past_key_values = model(None,input_embeddings=inputs_embeds,use_cache=True,modality_indices=input_modality_indices).attn_key_values
+        past_key_values = model(None,input_embeddings=inputs_embeds,use_cache=True,modality_indices=input_modality_indices,attention_mask=attention_mask).attn_key_values
         x = torch.full((bsz, gen_length), mask_id, dtype=torch.long).to(model.device)
         prompt = torch.full((bsz, 0), 0, dtype=torch.long).to(model.device)
         # x[:, :prompt.shape[1]] = prompt.clone()
@@ -327,7 +338,7 @@ def generate(model, prompt=None, steps=None, max_new_tokens=128, block_length=12
                     un_inputs_embeds_curr[:,:inputs_embeds.shape[1]] = inputs_embeds
                     un_inputs_embeds_curr[prompt_index] = noise_embeddings
                     inputs_embeds_curr_cat = torch.cat([un_inputs_embeds_curr, inputs_embeds_curr], dim=0)
-                    logits = get_logits(model,inputs_embeds_curr_cat,new_token_mask.repeat(2,1),t2i_inference)
+                    logits = get_logits(model,inputs_embeds_curr_cat,new_token_mask.repeat(2,1),t2i_inference,attention_mask=full_attention_mask.repeat(2,1))
                 logits, un_logits = torch.chunk(logits, 2, dim=0)
                 logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
             else:
@@ -335,11 +346,11 @@ def generate(model, prompt=None, steps=None, max_new_tokens=128, block_length=12
                     # print("HH")
                     # breakpoint()
                     #logits = model(None,input_embeddings=inputs_embeds_curr,past_key_values=past_key_values).logits
-                    logits = get_logits(model,inputs_embeds_curr,new_token_mask,t2i_inference,past_key_values=past_key_values)
+                    logits = get_logits(model,inputs_embeds_curr,new_token_mask,t2i_inference,past_key_values=past_key_values,attention_mask=full_attention_mask)
                 else:
                     if inputs_embeds is not None:
                         inputs_embeds_curr[:,:inputs_embeds.shape[1]] = inputs_embeds
-                    logits = get_logits(model,inputs_embeds_curr,new_token_mask,t2i_inference)
+                    logits = get_logits(model,inputs_embeds_curr,new_token_mask,t2i_inference,attention_mask=full_attention_mask)
             # logits = logits.cpu()
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
             # breakpoint()

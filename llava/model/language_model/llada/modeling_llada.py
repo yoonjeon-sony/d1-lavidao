@@ -1476,6 +1476,17 @@ class LLaDAModel(nn.Module):
         self.__cache["alibi_attention_bias"] = alibi_bias
         return alibi_bias
 
+    def get_bidirectional_attention_bias(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        if (bidir := self.__cache.get("bidirectional_attention_bias")) is not None and bidir.shape[-1] >= seq_len:
+            if bidir.device != device:
+                bidir = bidir.to(device)
+                self.__cache["bidirectional_attention_bias"] = bidir
+            return bidir
+        with torch.autocast(device.type, enabled=False):
+            bidir = torch.zeros((1, 1, seq_len, seq_len), device=device, dtype=torch.float)
+        self.__cache["bidirectional_attention_bias"] = bidir
+        return bidir
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -1574,7 +1585,7 @@ class LLaDAModel(nn.Module):
                     self.__cache, past_length + seq_len, x.device
                 ) + self.get_alibi_attention_bias(past_length + seq_len, x.device)
             elif attention_bias is None:
-                attention_bias = get_causal_attention_bias(self.__cache, past_length + seq_len, x.device)
+                attention_bias = self.get_bidirectional_attention_bias(past_length + seq_len, x.device)
             elif attention_bias.dtype in (torch.int8, torch.bool):
                 attention_bias = attention_bias.to(dtype=torch.float)
                 attention_bias.masked_fill_(attention_bias == 0.0, torch.finfo(attention_bias.dtype).min)
