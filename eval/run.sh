@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --partition=dgm
+#SBATCH --partition=sharedp
 #SBATCH --account=dgm
 #SBATCH --job-name=lmms-eval
 #SBATCH --nodes=1

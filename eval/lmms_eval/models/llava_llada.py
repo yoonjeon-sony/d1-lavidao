@@ -660,13 +660,17 @@ class Llava_Llada(lmms):
             input_ids = self.pad_sequence(input_ids_list, batch_first=True, padding_value=pad_token_ids).to(self.device)
             attention_masks = input_ids.ne(pad_token_ids).to(self.device)
 
+            # prepare_inputs_labels_for_multimodal zips embeds with modalities, so the
+            # modalities list must have one entry per batch sample (not per <image> token),
+            # otherwise zip silently truncates the batch.
             if task_type == "image":
                 gen_kwargs["image_sizes"] = flat_image_sizes
+                gen_kwargs["modalities"] = ["image"] * len(batched_contexts)
             elif task_type == "video":
                 stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
                 keywords = [stop_str]
                 stopping_criteria = KeywordsStoppingCriteria(keywords, self.tokenizer, input_ids)
-                gen_kwargs["modalities"] = ["video"]
+                gen_kwargs["modalities"] = ["video"] * len(batched_contexts)
                 gen_kwargs["stopping_criteria"] = [stopping_criteria]
                 self._config.mm_spatial_pool_stride = self.mm_spatial_pool_stride
                 self._config.mm_spatial_pool_mode = self.mm_spatial_pool_mode
@@ -684,9 +688,19 @@ class Llava_Llada(lmms):
                     cont = self.model.generate(input_ids, attention_mask=attention_masks, pad_token_id=pad_token_ids, images=images_arg, use_cache=self.use_cache, **gen_kwargs)
                     # cont = self.model.generate(qwen_input_ids, pad_token_id=pad_token_ids, images=images_arg, use_cache=self.use_cache, **gen_kwargs)
                 if gen_kwargs.get('use_fast_dlm'):
+                    # generate_with_dual_cache returns (x, nfe); also it hardcodes bsz=1
+                    # internally, so batched inference is not supported on this path.
+                    assert cont[0].shape[0] == len(batched_contexts), (
+                        f"use_fast_dlm is hardcoded to bsz=1 but got batch={len(batched_contexts)}. "
+                        f"Either disable use_fast_dlm or patch generate_with_dual_cache to use bsz."
+                    )
                     cont = cont[0]
                 text_outputs = self.tokenizer.batch_decode(cont, skip_special_tokens=True)
                 text_outputs = [text_output.lstrip('!') for text_output in text_outputs]
+                assert len(text_outputs) == len(batched_contexts), (
+                    f"Decoded {len(text_outputs)} outputs for batch of {len(batched_contexts)}. "
+                    f"cont shape={tuple(cont.shape) if torch.is_tensor(cont) else type(cont)}."
+                )
             except Exception as e:
                 raise e
             # with open('/data1/jacklishufan/lmms-eval.pt', 'wb') as f:
