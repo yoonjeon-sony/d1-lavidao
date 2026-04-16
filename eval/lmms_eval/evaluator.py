@@ -544,6 +544,12 @@ def evaluate(
                         "prompt_hash": hash_string(requests[0].arguments[0]),
                         "target_hash": hash_string(str(target)),
                     }
+                    # Attach generated image paths if the model produced them.
+                    if hasattr(lm, "_image_resps") and lm._image_resps:
+                        task_name = task_output.task_name
+                        img_path = lm._image_resps.get((task_name, doc_id))
+                        if img_path is not None:
+                            example["image_resps"] = img_path
                     example.update(metrics)
                     task_output.logged_samples.append(example)
                 for metric, value in metrics.items():

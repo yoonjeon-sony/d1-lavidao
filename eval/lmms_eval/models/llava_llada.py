@@ -202,6 +202,8 @@ class Llava_Llada(lmms):
         self.conv_template = conv_template
         self.use_cache = use_cache
         self.truncate_context = truncate_context
+        # Stores generated image paths keyed by (task, doc_id) for log output.
+        self._image_resps = {}
 
         if accelerator.num_processes > 1:
             assert accelerator.distributed_type in [DistributedType.FSDP, DistributedType.MULTI_GPU, DistributedType.DEEPSPEED], "Unsupported distributed type provided. Only DDP and FSDP are supported."
@@ -1225,6 +1227,20 @@ class Llava_Llada(lmms):
                 print('--------End---------')
 
             text_outputs = [response.strip() for response in text_outputs]
+
+            # Save generated images to disk and record paths for logging.
+            if do_image_rollout:
+                rollout_save_dir = Path(os.environ.get(
+                    "IMAGE_ROLLOUT_SAVE_DIR", "/tmp/image_rollout_outputs"
+                ))
+                rollout_save_dir.mkdir(parents=True, exist_ok=True)
+                for s_idx, (doc_id, gen_img) in enumerate(zip(batched_doc_id, generated_images)):
+                    if gen_img is not None and hasattr(gen_img, "save"):
+                        safe_id = str(doc_id).replace("/", "_").replace(os.sep, "_").replace(" ", "_")
+                        img_path = rollout_save_dir / f"{task}_{safe_id}_{os.getpid()}.png"
+                        gen_img.save(img_path)
+                        self._image_resps[(task, doc_id)] = str(img_path)
+
             res.extend(text_outputs)
             # Cache per-sample: the previous single add_partial used the last sample's
             # context for the whole batch output, which is incorrect when batch_size > 1.
