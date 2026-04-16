@@ -11,13 +11,18 @@
 #SBATCH --error=/home/yoonjeon.kim/dLLM-RL/train_sft/slurm-logs/error.%j.log
 
 # CKPT=/group2/dgm/yoonjeon/LaViDa-O
-CKPT="/group2/dgm/yoonjeon/ckpts/sft_LaViDa-O-thinkmorph_zebracot/checkpoint-9000"
-# CKPT="/scratch2/yoonjeon.kim/sft_LaViDa-O-thinkmorph_zebracot-step9000"
+# CKPT="/group2/dgm/yoonjeon/ckpts/sft_LaViDa-O-thinkmorph_zebracot/checkpoint-9000"
+CKPT="/scratch2/yoonjeon.kim/sft_LaViDa-O-thinkmorph_zebracot-step9000"
 # CKPT="/scratch2/yoonjeon.kim/LaViDa-O"
 LLADA_VISION_ENCODER="google/siglip-so400m-patch14-384"
 set -x
-LIMIT=32
-BATCH_SIZE=32
+LIMIT=${LIMIT:-}
+EXTRA_ARGS=()
+
+if [ -n "$LIMIT" ]; then
+    EXTRA_ARGS+=(--limit "$LIMIT")
+fi
+BATCH_SIZE=${BATCH_SIZE:-32}
 export TASKS=${TASKS:-"mmvet"}
 # ,mmmu_val,mmbench_en_dev,textvqa_val,docvqa_val,chartqa,infovqa_val,scienceqa_full,ai2d,mathverse_testmini_vision_dominant,mathvista_testmini_format
 export NOT_ALWASY_DO_2DPOOL=1
@@ -28,10 +33,14 @@ MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
 BLOCK_LENGTH=${BLOCK_LENGTH:-128}
 STEP_PER_BLOCK=${STEP_PER_BLOCK:-64}
 TEMPERATURE=${TEMPERATURE:-0}
+DO_IMAGE_ROLLOUT=${DO_IMAGE_ROLLOUT:-false}
 
 MODEL_NAME=$(basename "$(dirname "$CKPT")")-$(basename "$CKPT")
 BASE_DIR="TEST"
 OUTPUT_DIR="${BASE_DIR}/tok${MAX_NEW_TOKENS}_blk${BLOCK_LENGTH}_step${STEP_PER_BLOCK}_t${TEMPERATURE}/${MODEL_NAME}"
+if [ "$DO_IMAGE_ROLLOUT" = "true" ]; then
+    OUTPUT_DIR="${OUTPUT_DIR}_image"
+fi
 
 run_eval() {
     local bs=$1
@@ -45,11 +54,12 @@ run_eval() {
         --tasks $TASKS \
         --batch_size $bs \
         --limit $LIMIT \
-        --gen_kwargs prefix_lm=True,max_new_tokens=${MAX_NEW_TOKENS},block_length=${BLOCK_LENGTH},step_per_block=${STEP_PER_BLOCK},temperature=${TEMPERATURE} \
+        --gen_kwargs prefix_lm=True,max_new_tokens=${MAX_NEW_TOKENS},block_length=${BLOCK_LENGTH},step_per_block=${STEP_PER_BLOCK},temperature=${TEMPERATURE},do_image_rollout=${DO_IMAGE_ROLLOUT} \
         --log_samples \
         --log_samples_suffix llava_llada \
         --output_path "$out_dir" --verbosity=DEBUG \
         --wandb_args=project=lmms-eval,job_type=eval \
+        "${EXTRA_ARGS[@]}" \
         "${@:3}"
 }
 
