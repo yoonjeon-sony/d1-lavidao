@@ -510,7 +510,7 @@ class Llava_Llada(lmms):
 
     def _get_default_image_edit_config(self, gen_kwargs: dict) -> dict:
         """Build image-edit generation config from gen_kwargs with defaults."""
-        resolution = int(gen_kwargs.get("image_edit_resolution", 512))
+        resolution = int(gen_kwargs.get("image_edit_resolution", 1024))
         latent_token_map = {256: 256, 512: 1024, 1024: 4096}
         prompt_token_map = {256: 64, 512: 256, 1024: 1024}
         n_tokens = latent_token_map.get(resolution, 1024)
@@ -523,23 +523,23 @@ class Llava_Llada(lmms):
             "guidance_scale": float(gen_kwargs.get("image_edit_guidance_scale", 0.0)),
             "guidance_scale_image": float(gen_kwargs.get("image_edit_guidance_scale_image", 0.0)),
             "schedule": gen_kwargs.get("image_edit_schedule", "shift"),
-            "shift": int(gen_kwargs.get("image_edit_shift", 3)),
-            "alg_temp": float(gen_kwargs.get("image_edit_alg_temp", 0.1)),
+            "shift": int(gen_kwargs.get("image_edit_shift", 5)),
+            "alg_temp": float(gen_kwargs.get("image_edit_alg_temp", 5.0)),
             "dynamic_temperature": bool(gen_kwargs.get("image_edit_dynamic_temperature", True)),
             "dynamic_temperature_samp": bool(gen_kwargs.get("image_edit_dynamic_temperature_samp", False)),
-            "sample_policy": gen_kwargs.get("image_edit_sample_policy", "argmax"),
-            "confidence_policy": gen_kwargs.get("image_edit_confidence_policy", "mmada"),
+            "sample_policy": gen_kwargs.get("image_edit_sample_policy", "multinomial"),
+            "confidence_policy": gen_kwargs.get("image_edit_confidence_policy", "stratified"),
             "temperature": float(gen_kwargs.get("image_edit_temperature", 0.8)),
-            "schedule_temp": gen_kwargs.get("image_edit_schedule_temp", "shift"),
-            "min_temperature": float(gen_kwargs.get("image_edit_min_temperature", 0.0)),
-            "schedule_temp_samp": gen_kwargs.get("image_edit_schedule_temp_samp", "shift"),
-            "min_temperature_samp": float(gen_kwargs.get("image_edit_min_temperature_samp", 0.0)),
+            "schedule_temp": gen_kwargs.get("image_edit_schedule_temp", "cosine2"),
+            "min_temperature": float(gen_kwargs.get("image_edit_min_temperature", 0.5)),
+            "schedule_temp_samp": gen_kwargs.get("image_edit_schedule_temp_samp", "linear"),
+            "min_temperature_samp": float(gen_kwargs.get("image_edit_min_temperature_samp", 1.0)),
             "cfg_interval": [
                 float(gen_kwargs.get("image_edit_cfg_interval_start", 0.0)),
                 float(gen_kwargs.get("image_edit_cfg_interval_end", 1.0)),
             ],
-            "edit_mode": int(gen_kwargs.get("image_edit_edit_mode", 1)),
-            "order_cutoff": float(gen_kwargs.get("image_edit_order_cutoff", 0.5)),
+            "edit_mode": int(gen_kwargs.get("image_edit_edit_mode", 0)),
+            "order_cutoff": float(gen_kwargs.get("image_edit_order_cutoff", 1.0)),
             "remask_ratio": float(gen_kwargs.get("image_edit_remask_ratio", 0.01)),
         }
 
