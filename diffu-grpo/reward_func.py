@@ -11,32 +11,7 @@ import shutil
 
 import torch
 import torch.nn.functional as F
-import lpips
 from math500_utils import remove_boxed, last_boxed_only_string, is_equiv, boxed_in_answer
-
-_LPIPS_LOSS_FN = None
-
-def _get_lpips_loss_fn(device: torch.device = None):
-    """Return a cached LPIPS module, placed on ``device`` if given.
-
-    The module is constructed lazily on first use, its parameters are frozen
-    (``requires_grad_(False)``) so the LPIPS forward does not allocate grad
-    bookkeeping, and it is moved onto the requested device on the first call
-    that specifies one.  Subsequent calls with a different device migrate the
-    cached module in-place.
-    """
-    global _LPIPS_LOSS_FN
-    if _LPIPS_LOSS_FN is None:
-        import lpips
-
-        _LPIPS_LOSS_FN = lpips.LPIPS(net='vgg').eval()
-        for p in _LPIPS_LOSS_FN.parameters():
-            p.requires_grad_(False)
-    if device is not None:
-        current_device = next(_LPIPS_LOSS_FN.parameters()).device
-        if current_device != device:
-            _LPIPS_LOSS_FN = _LPIPS_LOSS_FN.to(device)
-    return _LPIPS_LOSS_FN
 
 def extract_xml_answer(text: str) -> str:
     answer = text.split("<answer>")[-1]
@@ -127,131 +102,156 @@ def correct_grounding_reward_func(prompts, completions, ground_gt, step=None, ru
     )
     return rewards
 
-def perceptual_score_reward_func(prompts, completions, image_gt, step=None, run_name=None, **kwargs) -> list[float]:
-    """
-    Computes perceptual similarity score between generated image and ground truth image.
-    Higher is better.
-    """
+_CLIP_MODEL = None
+_CLIP_PROCESSOR = None
 
-    # Run LPIPS on the local-rank CUDA device when available. accelerate /
-    # deepspeed set torch.cuda.current_device() per rank, so this picks the
-    # correct GPU for this process without any extra plumbing.
+
+def _get_clip(device: torch.device = None):
+    """Return a cached frozen CLIP image encoder + processor.
+
+    Lazily loads on first use, freezes parameters, and migrates to ``device``
+    on demand. Matches the LPIPS-cache pattern that lived here before. Model
+    id is read from ``CLIP_REWARD_MODEL`` (default ``openai/clip-vit-base-patch32``).
+    """
+    global _CLIP_MODEL, _CLIP_PROCESSOR
+    if _CLIP_MODEL is None:
+        from transformers import CLIPModel, CLIPProcessor
+
+        model_id = os.environ.get("CLIP_REWARD_MODEL", "openai/clip-vit-base-patch32")
+        _CLIP_MODEL = CLIPModel.from_pretrained(model_id).eval()
+        _CLIP_PROCESSOR = CLIPProcessor.from_pretrained(model_id)
+        for p in _CLIP_MODEL.parameters():
+            p.requires_grad_(False)
+    if device is not None:
+        cur = next(_CLIP_MODEL.parameters()).device
+        if cur != device:
+            _CLIP_MODEL = _CLIP_MODEL.to(device)
+    return _CLIP_MODEL, _CLIP_PROCESSOR
+
+
+def perceptual_score_reward_func(
+    prompts,
+    completions,
+    image_gt,
+    step=None,
+    run_name=None,
+    **kwargs,
+) -> list[float]:
+    """CLIP-image cosine similarity between generated image and ground truth.
+
+    Inputs:
+      * ``completions[i]``: PIL.Image — the rollout-decoded generated image.
+      * ``image_gt[i]``:    string path or PIL.Image — the ground-truth image.
+
+    For each pair we encode both images with a frozen CLIP image tower,
+    L2-normalize, and take cosine similarity in [-1, 1]. The similarity is
+    then linearly remapped to a reward in [0, 1] via::
+
+        reward = max(0, (sim - threshold) / (1 - threshold))
+
+    With the default ``CLIP_REWARD_THRESHOLD=0.5``:
+      * sim = 1.0 (identical images)        -> reward = 1.0
+      * sim = 0.75 (visually similar)       -> reward = 0.5
+      * sim <= threshold (unrelated/poor)   -> reward = 0.0
+
+    Lower the threshold (env var) for a more forgiving curve, raise it to
+    only reward near-perfect matches. Set ``DIFFU_GRPO_DEBUG=1`` to log the
+    raw similarity for sample 0.
+    """
+    from PIL import Image as _PILImage
+
+    threshold = float(os.environ.get("CLIP_REWARD_THRESHOLD", "0.5"))
+    debug = os.environ.get("DIFFU_GRPO_DEBUG") == "1"
+
     if torch.cuda.is_available():
-        lpips_device = torch.device("cuda", torch.cuda.current_device())
+        device = torch.device("cuda", torch.cuda.current_device())
     else:
-        lpips_device = torch.device("cpu")
-    loss_fn = _get_lpips_loss_fn(lpips_device)
+        device = torch.device("cpu")
 
-    def _to_tensor(img):
-        """
-        Convert PIL / numpy / tensor → torch.Tensor [C, H, W]
-        """
-        from PIL import Image
-        import numpy as np
+    try:
+        clip_model, clip_proc = _get_clip(device)
+    except Exception as e:
+        print(f"[clip_reward] CLIP load failed: {type(e).__name__}: {e}", flush=True)
+        return [float("nan") for _ in completions]
 
-        if isinstance(img, str):
-            with Image.open(img) as pil_img:
-                img = torch.from_numpy(np.array(pil_img.convert("RGB")))
+    def _to_pil(x):
+        if x is None:
+            return None
+        if isinstance(x, _PILImage.Image):
+            return x.convert("RGB")
+        if isinstance(x, str):
+            return _PILImage.open(x).convert("RGB")
+        # numpy / torch fall-through
+        try:
+            import numpy as _np
+            if isinstance(x, _np.ndarray):
+                return _PILImage.fromarray(x).convert("RGB")
+        except Exception:
+            pass
+        if isinstance(x, torch.Tensor):
+            arr = x.detach().cpu()
+            if arr.ndim == 3 and arr.shape[0] in (1, 3):
+                arr = arr.permute(1, 2, 0)
+            arr = arr.clamp(0, 1).mul(255).to(torch.uint8).numpy()
+            return _PILImage.fromarray(arr).convert("RGB")
+        return None
 
-        if isinstance(img, dict):
-            if img.get("bytes") is not None:
-                with Image.open(io.BytesIO(img["bytes"])) as pil_img:
-                    img = torch.from_numpy(np.array(pil_img.convert("RGB")))
-            elif img.get("path"):
-                with Image.open(img["path"]) as pil_img:
-                    img = torch.from_numpy(np.array(pil_img.convert("RGB")))
+    rewards: list[float] = []
+    sims: list[float] = []
+    for i, (pred_img, gt_img) in enumerate(zip(completions, image_gt)):
+        try:
+            pred_pil = _to_pil(pred_img)
+            gt_pil = _to_pil(gt_img)
+            if pred_pil is None or gt_pil is None:
+                if debug:
+                    print(
+                        f"[clip_reward] sample {i} NaN (missing image): "
+                        f"pred={pred_pil is not None} gt={gt_pil is not None}",
+                        flush=True,
+                    )
+                rewards.append(float("nan"))
+                sims.append(float("nan"))
+                continue
 
-        if isinstance(img, Image.Image):
-            img = torch.from_numpy(np.array(img))  # [H, W, C]
+            inputs = clip_proc(images=[pred_pil, gt_pil], return_tensors="pt")
+            inputs = {k: v.to(device, non_blocking=True) for k, v in inputs.items()}
+            with torch.inference_mode():
+                feats = clip_model.get_image_features(**inputs)  # (2, D)
+            feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
+            sim = float((feats[0] * feats[1]).sum().item())
+            r = max(0.0, (sim - threshold) / max(1.0 - threshold, 1e-8))
+            if not np.isfinite(r):
+                r = float("nan")
+            rewards.append(r)
+            sims.append(sim)
+        except Exception as e:
+            import traceback
+            print(
+                f"[clip_reward] sample {i} failed: {type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()}",
+                flush=True,
+            )
+            rewards.append(float("nan"))
+            sims.append(float("nan"))
 
-        if isinstance(img, np.ndarray):
-            img = torch.from_numpy(img)
-
-        if isinstance(img, torch.Tensor):
-            # Ensure float
-            img = img.float()
-
-            # If [H, W, C] → [C, H, W]
-            if img.ndim == 3 and img.shape[-1] in [1, 3]:
-                img = img.permute(2, 0, 1)
-
-            # If grayscale [H, W] → [1, H, W]
-            if img.ndim == 2:
-                img = img.unsqueeze(0)
-
-            return img
-
-        raise TypeError(f"Unsupported image type: {type(img)}")
-
-    def _normalize(img: torch.Tensor):
-        """
-        Normalize image to [-1, 1] for LPIPS or flatten for cosine.
-        """
-        img = _to_tensor(img)
-        if img.max() > 1:
-            img = img / 255.0
-
-        img = img * 2.0 - 1.0  # [0,1] → [-1,1]
-        return img
-
-    def _pad_to_square(img: torch.Tensor, size: int) -> torch.Tensor:
-        """
-        Pad BCHW tensor (values in [-1, 1]) to a ``size x size`` square with
-        black padding (-1).  No resizing — preserves every original pixel.
-        """
-        _, _, h, w = img.shape
-        pad_h = size - h
-        pad_w = size - w
-        pad_top = pad_h // 2
-        pad_bottom = pad_h - pad_top
-        pad_left = pad_w // 2
-        pad_right = pad_w - pad_left
-        return F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), value=-1.0)
-
-    def _lpips_score(img1, img2):
-        img1 = _normalize(img1).unsqueeze(0)
-        img2 = _normalize(img2).unsqueeze(0)
-        # Pass full-resolution images to LPIPS: pad both to a common square
-        # equal to the max side across both images, so neither is downscaled.
-        # LPIPS requires matching (B, C, H, W); padding with -1 (black in
-        # the [-1, 1] normalization) contributes nothing to perceptual distance
-        # since both images are padded identically on the background regions.
-        max_side = max(
-            img1.shape[-2], img1.shape[-1], img2.shape[-2], img2.shape[-1]
-        )
-        img1 = _pad_to_square(img1, max_side)
-        img2 = _pad_to_square(img2, max_side)
-        # Move inputs onto the same device as the (cached) LPIPS module and
-        # disable autograd tracking — LPIPS is called purely for its scalar
-        # output, so building a graph would waste GPU memory and time.
-        img1 = img1.to(lpips_device, non_blocking=True)
-        img2 = img2.to(lpips_device, non_blocking=True)
-        with torch.inference_mode():
-            d = loss_fn(img1, img2).item()
-        # Cap LPIPS distance at 1.0 so the returned score stays in [0, 1].
-        # LPIPS is unbounded above and can exceed 1.0 on very dissimilar
-        # images, which would otherwise produce a negative reward.
-        d = min(d, 1.0)
-        return 1.0 - d  # higher is better
-
-    rewards = []
-    for pred_img, gt_img in zip(completions, image_gt):
-        
-        score = _lpips_score(pred_img, gt_img)
-        rewards.append(score)
-
-    # ANSI colors
+    # ANSI colors for the per-batch banner
     RED = "\033[91m"
     YELLOW = "\033[93m"
     RESET = "\033[0m"
-    prompt = prompts[0].replace("<|reserved_token_6|>", "*").replace("<|reserved_token_5|>", ".")
-    print(
-        "-" * 20,
-        f"\n{RED}Prompt:{RESET}\n{prompt}\n",
-        "-" * 20,
-        f"\n{YELLOW}Perceptual Score:{RESET}\n{rewards[0]}\n",
-    )
-
+    if prompts and rewards:
+        prompt0 = prompts[0] if prompts[0] is not None else ""
+        prompt0 = prompt0.replace("<|reserved_token_5|>", "*").replace(
+            "<|reserved_token_6|>", "-"
+        )
+        sim0 = sims[0] if sims else float("nan")
+        print(
+            "-" * 20,
+            f"\n{RED}Prompt:{RESET}\n{prompt0}\n",
+            "-" * 20,
+            f"\n{YELLOW}CLIP Similarity:{RESET} {sim0:.4f}  "
+            f"(threshold={threshold:.3f})  reward={rewards[0]:.4f}\n",
+            flush=True,
+        )
     return rewards
 
 def int_reward_func(completions, **kwargs) -> list[float]:
@@ -261,17 +261,14 @@ def int_reward_func(completions, **kwargs) -> list[float]:
 
 
 def strict_format_reward_func(completions, **kwargs) -> list[float]:
-    pattern = r"^<reasoning>\n.*?\n</reasoning>\n<answer>\n.*?\n</answer>\n$"
+    # <answer>...</answer> can appear anywhere in the response, possibly
+    # spanning multiple lines. Use re.search + re.DOTALL so the pattern is
+    # not anchored to the start of the string.
+    pattern = r"<answer>(.*?)</answer>"
     responses = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, r) for r in responses]
+    matches = [re.search(pattern, r, flags=re.DOTALL) for r in responses]
     return [0.5 if match else 0.0 for match in matches]
 
-
-def soft_format_reward_func(completions, **kwargs) -> list[float]:
-    pattern = r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>"
-    responses = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, r) for r in responses]
-    return [0.5 if match else 0.0 for match in matches]
 
 
 def count_xml(text) -> float:

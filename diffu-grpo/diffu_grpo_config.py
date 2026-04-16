@@ -575,7 +575,7 @@ class DiffuGRPOConfig(TrainingArguments):
     )
     # Image editing rollout defaults (LaVida-O eval_img baseline)
     image_edit_sample_policy: str = field(default="multinomial")
-    image_edit_confidence_policy: str = field(default="halton")
+    image_edit_confidence_policy: str = field(default="stratified")
     image_edit_guidance_scale: float = field(default=0.0)
     image_edit_batch_size: int = field(default=1)
     image_edit_resolution: int = field(default=1024)
@@ -593,7 +593,7 @@ class DiffuGRPOConfig(TrainingArguments):
     image_edit_min_temperature_samp: float = field(default=1.0)
     image_edit_cfg_interval_start: float = field(default=0.0)
     image_edit_cfg_interval_end: float = field(default=1.0)
-    image_edit_guidance_scale_image: float = field(default=5.0)
+    image_edit_guidance_scale_image: float = field(default=0.0)
     image_edit_edit_mode: int = field(default=0)
     image_edit_order_cutoff: float = field(default=1.0)
 
@@ -609,6 +609,19 @@ class DiffuGRPOConfig(TrainingArguments):
         metadata={"help": "Optional step_per_block override for text rollout."},
     )
     text_rollout_do_sample: bool = field(default=False)
+    text_rollout_use_gen_image: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, the image produced by the gen-side image-edit rollout "
+                "is forwarded as a second image into the corresponding und-side "
+                "text rollout (under the key 'gen_image'). Required for "
+                "thinkmorph_interleave so the model can answer questions using "
+                "its own generated auxiliary image. Requires gen_inputs and "
+                "und_inputs to be aligned 1-to-1 by index / sample_id."
+            ),
+        },
+    )
 
     # LaVida model/data arguments.
     version: str = field(default="llada")

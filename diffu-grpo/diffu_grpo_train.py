@@ -30,7 +30,11 @@ from llava import conversation as conversation_lib
 from llava.model.language_model.llava_llada import LlavaLladaForMaskedDiffusion
 
 # Custom imports
+import numpy as np
+from datasets import concatenate_datasets
+
 from data_utils import (
+    get_arxivqa_interleave_questions,
     get_code_questions,
     get_countdown_questions,
     get_image_answer_placeholder_questions,
@@ -52,7 +56,6 @@ from reward_func import (
     countdown_reward_func,
     int_reward_func,
     perceptual_score_reward_func,
-    soft_format_reward_func,
     strict_format_reward_func,
     sudoku_reward_func,
     xmlcount_reward_func,
@@ -354,11 +357,16 @@ def _validate_reward_dataset_compatibility(dataset_name: str, dataset, reward_fu
 def main(grpo_config, model_config):
     set_random_seed(grpo_config.seed)
 
+    # ``modality`` controls whether train_dataset drives the gen-side
+    # (image-edit rollout) or the und-side (text rollout). Default "gen"
+    # matches every legacy dataset path. ``thinkmorph_answer`` is text-only
+    # and flips this to "und" so the image rollout is bypassed entirely.
+    modality = "gen"
+
     if grpo_config.dataset == "gsm8k":
         dataset = get_gsm8k_questions("train")
         reward_functions = [
             xmlcount_reward_func,
-            soft_format_reward_func,
             strict_format_reward_func,
             int_reward_func,
             correctness_reward_func,
@@ -379,39 +387,64 @@ def main(grpo_config, model_config):
         dataset = get_code_questions()
         reward_functions = [xmlcount_reward_func, coding_reward_func]
     elif grpo_config.dataset == "thinkmorph_edit":
-        dataset = get_image_edit_placeholder_questions("train")
+        # Gen-only flow: train_dataset carries the image-edit rows and
+        # drives the image rollout. und_dataset is None so the trainer
+        # automatically skips the text rollout / text loss.
+        dataset = get_image_edit_placeholder_questions()
         reward_functions = [perceptual_score_reward_func]
+        modality = "gen"
     elif grpo_config.dataset == "thinkmorph_answer":
-        dataset = get_image_answer_placeholder_questions("train")
+        # Und-only flow: train_dataset carries the text-QA rows and drives
+        # the text rollout. modality="und" tells the trainer to treat
+        # train_dataset as und-side inputs and bypass the image rollout
+        # entirely. und_dataset MUST stay None.
+        dataset = get_image_answer_placeholder_questions()
         reward_functions = [
-            soft_format_reward_func,
             strict_format_reward_func,
             correctness_reward_func,
         ]
+        modality = "und"
     elif grpo_config.dataset == "thinkmorph_interleave":
-        # Load gen (image-edit) and und (text-answer) as two independent datasets
-        # so each gets its own RepeatSampler + DistributedSampler — no paired
-        # striding issues and each rank always has a balanced modality mix.
-        dataset = get_image_edit_placeholder_questions("train")
-        und_dataset = get_image_answer_placeholder_questions("train")
+        tm_gen, tm_und = get_thinkmorph_interleave_questions()
+        ax_gen, ax_und = get_arxivqa_interleave_questions()
+
+        # Concatenate gen and und sides. Each loader emits its gen and und rows
+        # in the same order, so within each sub-dataset row i refers to the same
+        # source sample on both sides; concatenation preserves this index alignment.
+        dataset = concatenate_datasets([tm_gen, ax_gen])
+        und_dataset = concatenate_datasets([tm_und, ax_und])
+        if len(dataset) != len(und_dataset):
+            raise ValueError(
+                f"thinkmorph_interleave gen/und length mismatch after concat: "
+                f"{len(dataset)} vs {len(und_dataset)}"
+            )
+
+        # Joint shuffle: draw one permutation and apply it to both datasets so
+        # that row i continues to refer to the same sample_id on both sides.
+        # The trainer enforces this alignment with a runtime sample_id assert.
+        rng = np.random.default_rng(grpo_config.seed)
+        perm = rng.permutation(len(dataset)).tolist()
+        dataset = dataset.select(perm)
+        und_dataset = und_dataset.select(perm)
+
         reward_functions = [
             perceptual_score_reward_func,
             strict_format_reward_func,
             correctness_reward_func,
         ]
-    elif grpo_config.dataset == "mixed_placeholder":
-        dataset = get_mixed_placeholder_questions("train")
-        reward_functions = [neutral_reward_func]
     else:
         raise ValueError(f"Unsupported dataset: {grpo_config.dataset}")
 
     # _validate_reward_dataset_compatibility(grpo_config.dataset, dataset, reward_functions)
 
-    dataset = dataset.shuffle(seed=grpo_config.seed)
-    # For interleave, also shuffle the und dataset independently.
+    # thinkmorph_interleave already applied a joint permutation above; re-shuffling
+    # here independently would break the gen/und sample_id alignment.
+    if grpo_config.dataset != "thinkmorph_interleave":
+        dataset = dataset.shuffle(seed=grpo_config.seed)
     und_train_set = None
     if "und_dataset" in locals():
-        und_dataset = und_dataset.shuffle(seed=grpo_config.seed)
+        if grpo_config.dataset != "thinkmorph_interleave":
+            und_dataset = und_dataset.shuffle(seed=grpo_config.seed)
         und_train_set = und_dataset
     if grpo_config.dataset in ["countdown", "sudoku"] and len(dataset) > 500:
         train_set = dataset.select(range(0, len(dataset) - 500))
@@ -431,6 +464,7 @@ def main(grpo_config, model_config):
         train_dataset=train_set,
         train_dataset_und=und_train_set,
         optimizers=(optimizer, None),
+        modality=modality,
     )
 
     if grpo_config.save_steps % grpo_config.num_iterations != 0:
