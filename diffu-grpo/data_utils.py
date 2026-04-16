@@ -1,8 +1,10 @@
-from datasets import load_dataset, load_from_disk, Dataset, Features, Value, concatenate_datasets
+from datasets import load_dataset, load_from_disk, Dataset, Features, Sequence, Value, concatenate_datasets
 import json
 import os
 import random
 import re
+
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -159,7 +161,15 @@ def get_code_questions(split="train"):
     return data
 
 
-def get_image_edit_placeholder_questions() -> Dataset:
+def get_image_edit_placeholder_questions(
+    region_edit: bool = False,
+) -> tuple[Dataset, Optional[Dataset]]:
+    """Return (gen_ds, ground_ds) for `thinkmorph_edit`.
+
+    ``ground_ds`` is None when ``region_edit`` is False. When True, a
+    per-sample grounding row is emitted sharing ``sample_id`` with the gen
+    row so the trainer can align grounding → image rollout by index.
+    """
     data_root = DATA_ROOT
     image_root = DATA_ROOT
     train_data_paths = [os.path.join(data_root, name) for name in THINKMORPH_LOCAL_JSONL_FILES]
@@ -170,6 +180,7 @@ def get_image_edit_placeholder_questions() -> Dataset:
         raise FileNotFoundError(f"ThinkMorph jsonl file(s) not found: {missing_str}")
 
     rows: list[dict] = []
+    ground_rows: list[dict] = []
     for data_path in train_data_paths:
         with open(data_path, "r", encoding="utf-8") as f:
             for idx, line in enumerate(
@@ -208,6 +219,7 @@ def get_image_edit_placeholder_questions() -> Dataset:
                 rows.append(
                     {
                         "task_type": "image_edit",
+                        "sample_id": sample_id,
                         "prompt": [
                             {
                                 "role": "user",
@@ -222,8 +234,27 @@ def get_image_edit_placeholder_questions() -> Dataset:
                         "answer": answer,
                     }
                 )
+                if region_edit:
+                    raw_box = example.get("transformed_box")
+                    ground_gt = raw_box if isinstance(raw_box, (list, tuple)) and len(raw_box) == 4 else None
+                    ground_rows.append(
+                        {
+                            "task_type": "text",
+                            "dataset_type": "image_answer",
+                            "sample_id": sample_id,
+                            "prompt": _build_grounding_prompt(question.strip()),
+                            "image": image_input,
+                            "ground_gt": list(ground_gt) if ground_gt is not None else None,
+                        }
+                    )
 
-    return Dataset.from_list(rows)
+    gen_ds = Dataset.from_list(rows)
+    ground_ds = (
+        Dataset.from_list(ground_rows, features=INTERLEAVE_GROUND_FEATURES)
+        if region_edit
+        else None
+    )
+    return gen_ds, ground_ds
 
 
 def get_image_answer_placeholder_questions() -> Dataset:
@@ -317,14 +348,34 @@ INTERLEAVE_UND_FEATURES = Features(
         "answer_gt": Value("string"),
     }
 )
+# Grounding side: one row per source sample, aligned with gen_ds / und_ds by
+# index + sample_id. The "prompt" is a fully-templated LLaDA text prompt
+# (built via _build_grounding_prompt) rather than a chat-style list, because
+# the grounding rollout tokenizes it directly with tokenizer_image_token.
+# ``ground_gt`` is a 4-int bbox when the source dataset carries a
+# ``transformed_box`` (ThinkMorph), otherwise None (ArxivQA, image_edit
+# placeholder with no GT box).
+INTERLEAVE_GROUND_FEATURES = Features(
+    {
+        "task_type": Value("string"),
+        "dataset_type": Value("string"),
+        "sample_id": Value("string"),
+        "prompt": Value("string"),
+        "image": Value("string"),
+        "ground_gt": Sequence(Value("int64")),
+    }
+)
 
 
-def get_thinkmorph_interleave_questions() -> tuple[Dataset, Dataset]:
-    """Build paired (gen_ds, und_ds) ThinkMorph datasets for `thinkmorph_interleave`.
+def get_thinkmorph_interleave_questions(
+    region_edit: bool = False,
+) -> tuple[Dataset, Dataset, Optional[Dataset]]:
+    """Build paired (gen_ds, und_ds, ground_ds) ThinkMorph datasets.
 
-    Each source jsonl sample contributes one row to gen_ds and one row to und_ds
-    at the same index, sharing a `sample_id` so the trainer can assert alignment.
-    Both rows are tagged ``dataset_type="image_answer"``.
+    Each source jsonl sample contributes one row per dataset at the same index,
+    sharing a `sample_id` so the trainer can assert alignment. All rows are
+    tagged ``dataset_type="image_answer"``. When ``region_edit`` is False,
+    ground_ds is returned as None (no grounding rollout will be performed).
     """
     data_root = DATA_ROOT
     image_root = DATA_ROOT
@@ -336,6 +387,7 @@ def get_thinkmorph_interleave_questions() -> tuple[Dataset, Dataset]:
 
     gen_rows: list[dict] = []
     und_rows: list[dict] = []
+    ground_rows: list[dict] = []
     for data_path in train_data_paths:
         basename = os.path.basename(data_path)
         with open(data_path, "r", encoding="utf-8") as f:
@@ -395,10 +447,28 @@ def get_thinkmorph_interleave_questions() -> tuple[Dataset, Dataset]:
                         "answer_gt": answer.strip(),
                     }
                 )
+                if region_edit:
+                    raw_box = example.get("transformed_box")
+                    ground_gt = raw_box if isinstance(raw_box, (list, tuple)) and len(raw_box) == 4 else None
+                    ground_rows.append(
+                        {
+                            "task_type": "text",
+                            "dataset_type": "image_answer",
+                            "sample_id": sample_id,
+                            "prompt": _build_grounding_prompt(question.strip()),
+                            "image": image_input,
+                            "ground_gt": list(ground_gt) if ground_gt is not None else None,
+                        }
+                    )
 
     gen_ds = Dataset.from_list(gen_rows, features=INTERLEAVE_GEN_FEATURES)
     und_ds = Dataset.from_list(und_rows, features=INTERLEAVE_UND_FEATURES)
-    return gen_ds, und_ds
+    ground_ds = (
+        Dataset.from_list(ground_rows, features=INTERLEAVE_GROUND_FEATURES)
+        if region_edit
+        else None
+    )
+    return gen_ds, und_ds, ground_ds
 
 
 def get_mixed_placeholder_questions(split: str = "train") -> Dataset:
@@ -578,7 +648,8 @@ def get_arxivqa_interleave_questions(
     split: str = "train",
     dataset_path: str | None = None,
     image_cache_dir: str | None = None,
-) -> tuple[Dataset, Dataset]:
+    region_edit: bool = False,
+) -> tuple[Dataset, Dataset, Optional[Dataset]]:
     """Build paired (gen_ds, und_ds) ArxivQA datasets for `thinkmorph_interleave`.
 
     Loads the source dataset from ``dataset_path`` (an HF Dataset saved via
@@ -664,6 +735,21 @@ def get_arxivqa_interleave_questions(
             "answer_gt": answer_gt,
         }
 
+    def _to_ground(example: dict, idx: int) -> dict:
+        sample_id = f"arxivqa:{idx}"
+        question_text = example.get("question") or ""
+        image_path = os.path.join(DATA_ROOT, "arxivqa", example.get("image"))
+        raw_box = example.get("transformed_box")
+        ground_gt = raw_box if isinstance(raw_box, (list, tuple)) and len(raw_box) == 4 else None
+        return {
+            "task_type": "text",
+            "dataset_type": "answer_only",
+            "sample_id": sample_id,
+            "prompt": _build_grounding_prompt(question_text.strip()),
+            "image": image_path,
+            "ground_gt": list(ground_gt) if ground_gt is not None else None,
+        }
+
     gen_ds = raw.map(
         _to_gen,
         with_indices=True,
@@ -678,4 +764,16 @@ def get_arxivqa_interleave_questions(
         features=INTERLEAVE_UND_FEATURES,
         desc="ArxivQA → und rows",
     )
-    return gen_ds, und_ds
+    ground_ds = None
+    if region_edit:
+        ground_ds = raw.map(
+            _to_ground,
+            with_indices=True,
+            remove_columns=raw.column_names,
+            features=INTERLEAVE_GROUND_FEATURES,
+            desc="ArxivQA → ground rows",
+        )
+    return gen_ds, und_ds, ground_ds
+
+if __name__ == "__main__":
+    download_process_arxivqa()
