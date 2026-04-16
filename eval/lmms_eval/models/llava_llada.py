@@ -1196,12 +1196,13 @@ class Llava_Llada(lmms):
             # Pass the batch-flattened image list (None if no visuals at all) so that
             # len(images) == total <image> tokens across the batch.
             images_arg = flat_images if len(flat_images) > 0 else None
-            # image_sizes is a named param on model.generate(), not **kwargs,
-            # so extract it to pass explicitly.
+            # image_sizes and modalities are named params on model.generate(),
+            # not captured by **kwargs, so extract them to pass explicitly.
             image_sizes_arg = gen_kwargs.pop("image_sizes", None)
+            modalities_arg = gen_kwargs.pop("modalities", None)
             try:
                 with torch.inference_mode():
-                    cont = self.model.generate(input_ids, attention_mask=attention_masks, pad_token_id=pad_token_ids, images=images_arg, image_sizes=image_sizes_arg, use_cache=self.use_cache, **gen_kwargs)
+                    cont = self.model.generate(input_ids, attention_mask=attention_masks, pad_token_id=pad_token_ids, images=images_arg, image_sizes=image_sizes_arg, modalities=modalities_arg, use_cache=self.use_cache, **gen_kwargs)
                     # cont = self.model.generate(qwen_input_ids, pad_token_id=pad_token_ids, images=images_arg, use_cache=self.use_cache, **gen_kwargs)
                 if gen_kwargs.get('use_fast_dlm'):
                     # generate_with_dual_cache returns (x, nfe); also it hardcodes bsz=1
