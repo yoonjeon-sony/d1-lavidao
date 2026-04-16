@@ -956,7 +956,8 @@ class Llava_Llada(lmms):
 
             question_input = []
 
-            do_image_rollout = gen_kwargs.get("do_image_rollout", False)
+            _raw = gen_kwargs.get("do_image_rollout", False)
+            do_image_rollout = str(_raw).lower() in ("true", "1", "yes") if isinstance(_raw, str) else bool(_raw)
 
             # Accumulate per-sample visual data so batched generation has one entry per
             # <image> token across the entire batch. Previously image_tensor was overwritten
@@ -1099,6 +1100,16 @@ class Llava_Llada(lmms):
                     image_tokens = [DEFAULT_IMAGE_TOKEN] * placeholder_count
                     image_tokens = " ".join(image_tokens)
                     question = image_tokens + "\n" + context
+                elif image_tensor is not None and len(image_tensor) != 0 and DEFAULT_IMAGE_TOKEN in context and gen_img is not None:
+                    # Context already has <image> for the original image;
+                    # inject an additional <image> for the generated image,
+                    # mirroring _build_llada_prompt(has_gen_image=True) in
+                    # the GRPO trainer.
+                    question = context.replace(
+                        DEFAULT_IMAGE_TOKEN + "\n",
+                        DEFAULT_IMAGE_TOKEN + "\n" + DEFAULT_IMAGE_TOKEN + "\n",
+                        1,
+                    )
                 else:
                     question = context
 
