@@ -661,7 +661,8 @@ class Llava_Llada(lmms):
         is_gen = raw_input_ids == reserve_id
         is_gen_enc = raw_input_ids == reserve_id2
 
-        noise_embed = base_model.transformer.wte(torch.tensor([self._config.mask_id], device=device))
+        mask_id = getattr(self._config, "mask_id", 126336)
+        noise_embed = base_model.transformer.wte(torch.tensor([mask_id], device=device))
         inputs_embeds_uncond = inputs_embeds.clone()
         inputs_embeds_uncond[is_prompt] = noise_embed
 
