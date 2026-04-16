@@ -1031,6 +1031,12 @@ class Llava_Llada(lmms):
                         gen_img = generated_images[sample_idx] if do_image_rollout else None
                         if gen_img is not None:
                             visual = list(visual) + [gen_img]
+                            # With >1 image, force "pad" aspect ratio so all
+                            # images produce tensors of the same shape (avoids
+                            # anyres grid-shape mismatches in
+                            # prepare_inputs_labels_for_multimodal).
+                            if len(visual) > 1:
+                                self._config.image_aspect_ratio = "pad"
 
                         image_tensor = process_images(visual, self._image_processor, self._config)
                         if type(image_tensor) is list:
