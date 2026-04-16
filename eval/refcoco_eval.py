@@ -203,27 +203,14 @@ def evaluate_chat_model():
         outputs = []
         for _, (pixel_values, questions, bboxes, hws,image_sizes) in enumerate(tqdm(dataloader)):
             pixel_values = pixel_values.to(torch.bfloat16).cuda()
-            # generation_config = dict(
-            #     num_beams=args.num_beams,
-            #     max_new_tokens=100,
-            #     min_new_tokens=1,
-            #     do_sample=True if args.temperature > 0 else False,
-            #     temperature=args.temperature,
-            # )
+            
             conv = copy.deepcopy(conv_templates[conv_template])
             conv.append_message(conv.roles[0], prompt)
             conv.append_message(conv.roles[1], None)
             prompt_question = conv.get_prompt()
 
             input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to('cuda')
-            # pred = model.chat(
-            #     tokenizer=tokenizer,
-            #     pixel_values=pixel_values,
-            #     question=questions[0],
-            #     generation_config=generation_config,
-            #     verbose=True
-            # )
-            # breakpoint()
+
             pred = model.generate(
                 input_ids,
                 images=pixel_values,

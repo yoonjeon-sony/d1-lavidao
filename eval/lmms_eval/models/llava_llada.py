@@ -175,6 +175,12 @@ class Llava_Llada(lmms):
         #     self._tokenizer, self._model, self._image_processor, self._max_length = load_pretrained_model(pretrained, None, model_name, device_map=self.device_map, **llava_model_args)
 
         self._config = self._model.config
+        # Force left-padding at inference. prepare_inputs_labels_for_multimodal re-pads
+        # per-sample sequences using config.tokenizer_padding_side after inserting image
+        # embeddings; with right-padding, gen tokens for short-prefix samples end up
+        # separated from their valid prefix by zero padding, which shifts RoPE relative
+        # positions and makes batched (bs>1) decoding diverge from bs=1.
+        self._config.tokenizer_padding_side = "left"
         self.model.eval()
         self.model.model.set_activation_checkpointing(None)
         self.model.requires_grad_(False)

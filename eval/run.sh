@@ -4,28 +4,29 @@
 #SBATCH --job-name=lmms-eval
 #SBATCH --nodes=1
 #SBATCH --ntasks=1                    # 1 task per GPU
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #SBATCH --time=24:00:00               # Max time
 #SBATCH --requeue                     # allow requeue if preempted
 #SBATCH --output=/home/yoonjeon.kim/dLLM-RL/train_sft/slurm-logs/output.%j.log
 #SBATCH --error=/home/yoonjeon.kim/dLLM-RL/train_sft/slurm-logs/error.%j.log
 
-CKPT=/group2/dgm/yoonjeon/LaViDa-O
+# CKPT=/group2/dgm/yoonjeon/LaViDa-O
+CKPT="/group2/dgm/yoonjeon/ckpts/sft_LaViDa-O-thinkmorph_zebracot/checkpoint-9000"
 # CKPT="/scratch2/yoonjeon.kim/sft_LaViDa-O-thinkmorph_zebracot-step9000"
 # CKPT="/scratch2/yoonjeon.kim/LaViDa-O"
 LLADA_VISION_ENCODER="google/siglip-so400m-patch14-384"
 set -x
-LIMIT=8
-
-export TASKS=${TASKS:-"mme"}
+LIMIT=32
+BATCH_SIZE=32
+export TASKS=${TASKS:-"mmvet"}
 # ,mmmu_val,mmbench_en_dev,textvqa_val,docvqa_val,chartqa,infovqa_val,scienceqa_full,ai2d,mathverse_testmini_vision_dominant,mathvista_testmini_format
 export NOT_ALWASY_DO_2DPOOL=1
 export DEBUG_PRINT_IMAGE_RES=1
 export DEBUG_FIX_PADDING=1 # new runs must have this !!!!!!!!!!!!
 export NCCL_P2P_DISABLE=1
-MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-512}
-BLOCK_LENGTH=${BLOCK_LENGTH:-256}
-STEP_PER_BLOCK=${STEP_PER_BLOCK:-${BLOCK_LENGTH}}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
+BLOCK_LENGTH=${BLOCK_LENGTH:-128}
+STEP_PER_BLOCK=${STEP_PER_BLOCK:-64}
 TEMPERATURE=${TEMPERATURE:-0}
 
 MODEL_NAME=$(basename "$(dirname "$CKPT")")-$(basename "$CKPT")
@@ -35,10 +36,11 @@ OUTPUT_DIR="${BASE_DIR}/tok${MAX_NEW_TOKENS}_blk${BLOCK_LENGTH}_step${STEP_PER_B
 run_eval() {
     local bs=$1
     local out_dir=$2
-    accelerate launch --num_processes=2 \
+    accelerate launch --num_processes=1 \
         --num_machines=1 \
         -m lmms_eval \
         --model llava_llada \
+        --system_instruction "Think step-by-step and answer the question. " \
         --model_args pretrained=$CKPT,conv_template=llada,model_name=llava_llada \
         --tasks $TASKS \
         --batch_size $bs \
@@ -90,5 +92,5 @@ print(f"[PARITY] OVERALL {'PASS' if all_match else 'FAIL'}")
 sys.exit(0 if all_match else 1)
 PY
 else
-    run_eval 1 "$OUTPUT_DIR" "${@:2}"
+    run_eval $BATCH_SIZE "$OUTPUT_DIR" "${@:2}"
 fi
