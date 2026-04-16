@@ -17,11 +17,13 @@ import math
 import re
 import warnings
 from datetime import timedelta
-from typing import List, Optional, Tuple, Union
+from pathlib import Path
+from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import os
 import PIL
+from PIL import Image
 import torch
 import accelerate
 import transformers
@@ -65,6 +67,17 @@ try:
         tokenizer_image_token,
     )
     from llava.model.builder import load_pretrained_model
+    from llava.model.language_model.llada.generate import (
+        generate as llada_generate,
+        get_logits as llada_get_logits,
+        get_num_transfer_tokens_sch,
+        wte as llada_wte,
+        cosine_schedule_2,
+        exp_schedule,
+        logit_normal_schedule,
+    )
+    from llava.model.utils import pad_along_last_dim
+    from llava.mm_utils import pad_to_square_and_resize
 except ImportError as e:
     eval_logger.debug(f"LLaVA is not installed. Please install LLaVA to use this model.\nError: {e}")
 
@@ -448,6 +461,446 @@ class Llava_Llada(lmms):
         spare_frames = vr.get_batch(frame_idx).asnumpy()
         return spare_frames  # (frames, height, width, channels)
 
+    # ------------------------------------------------------------------
+    # Image rollout helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _image_edit_gumbel_noise(tensor: torch.Tensor) -> torch.Tensor:
+        noise = torch.zeros_like(tensor, dtype=torch.float32).uniform_(0, 1)
+        return -torch.log(-torch.log(noise))
+
+    @staticmethod
+    def _build_image_edit_temperature_schedule(
+        n_steps: int,
+        schedule_name: str,
+        min_temperature: float,
+        shift: int,
+    ) -> torch.Tensor:
+        temperatures = torch.linspace(0, 1, n_steps, device="cpu").numpy()
+        if schedule_name == "linear":
+            temperatures = (1 - temperatures) * (1 - min_temperature) + min_temperature
+        elif schedule_name == "cosine2":
+            temperatures = cosine_schedule_2(1 - temperatures) * (1 - min_temperature) + min_temperature
+        elif schedule_name == "shift":
+            temperatures = logit_normal_schedule(shift, 1 - temperatures) * (1 - min_temperature) + min_temperature
+        elif schedule_name == "exp":
+            temperatures = exp_schedule(1 - temperatures) * (1 - min_temperature) + min_temperature
+        else:
+            raise NotImplementedError(f"Unknown image-edit temperature schedule: {schedule_name}")
+        return torch.tensor(temperatures, dtype=torch.float32)
+
+    @staticmethod
+    def _left_pad_2d(
+        tensors: List[torch.Tensor],
+        pad_value: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        max_len = max(t.shape[1] for t in tensors)
+        padded = []
+        for t in tensors:
+            pad_len = max_len - t.shape[1]
+            if pad_len > 0:
+                pad_t = torch.full((1, pad_len), pad_value, dtype=dtype, device=t.device)
+                t = torch.cat([pad_t, t], dim=1)
+            padded.append(t)
+        return torch.cat(padded, dim=0)
+
+    def _get_default_image_edit_config(self, gen_kwargs: dict) -> dict:
+        """Build image-edit generation config from gen_kwargs with defaults."""
+        resolution = int(gen_kwargs.get("image_edit_resolution", 512))
+        latent_token_map = {256: 256, 512: 1024, 1024: 4096}
+        prompt_token_map = {256: 64, 512: 256, 1024: 1024}
+        n_tokens = latent_token_map.get(resolution, 1024)
+        prompt_n_tokens = prompt_token_map.get(resolution, max(1, n_tokens // 4))
+        return {
+            "image_resolution": resolution,
+            "n_tokens": n_tokens,
+            "prompt_n_tokens": prompt_n_tokens,
+            "n_steps": int(gen_kwargs.get("image_edit_n_steps", 64)),
+            "guidance_scale": float(gen_kwargs.get("image_edit_guidance_scale", 0.0)),
+            "guidance_scale_image": float(gen_kwargs.get("image_edit_guidance_scale_image", 0.0)),
+            "schedule": gen_kwargs.get("image_edit_schedule", "shift"),
+            "shift": int(gen_kwargs.get("image_edit_shift", 3)),
+            "alg_temp": float(gen_kwargs.get("image_edit_alg_temp", 0.1)),
+            "dynamic_temperature": bool(gen_kwargs.get("image_edit_dynamic_temperature", True)),
+            "dynamic_temperature_samp": bool(gen_kwargs.get("image_edit_dynamic_temperature_samp", False)),
+            "sample_policy": gen_kwargs.get("image_edit_sample_policy", "argmax"),
+            "confidence_policy": gen_kwargs.get("image_edit_confidence_policy", "mmada"),
+            "temperature": float(gen_kwargs.get("image_edit_temperature", 0.8)),
+            "schedule_temp": gen_kwargs.get("image_edit_schedule_temp", "shift"),
+            "min_temperature": float(gen_kwargs.get("image_edit_min_temperature", 0.0)),
+            "schedule_temp_samp": gen_kwargs.get("image_edit_schedule_temp_samp", "shift"),
+            "min_temperature_samp": float(gen_kwargs.get("image_edit_min_temperature_samp", 0.0)),
+            "cfg_interval": [
+                float(gen_kwargs.get("image_edit_cfg_interval_start", 0.0)),
+                float(gen_kwargs.get("image_edit_cfg_interval_end", 1.0)),
+            ],
+            "edit_mode": int(gen_kwargs.get("image_edit_edit_mode", 1)),
+            "order_cutoff": float(gen_kwargs.get("image_edit_order_cutoff", 0.5)),
+            "remask_ratio": float(gen_kwargs.get("image_edit_remask_ratio", 0.01)),
+        }
+
+    def _rollout_image_edit(
+        self,
+        visuals: List[PIL.Image.Image],
+        instructions: List[str],
+        gen_kwargs: dict,
+    ) -> List[PIL.Image.Image]:
+        """Run image-edit diffusion rollout and return generated PIL images.
+
+        Mirrors the core logic of ``_rollout_image_edit_latents`` from the
+        GRPO trainer but is self-contained for eval.
+        """
+        model = self.model
+        device = self.device
+        gen_cfg = self._get_default_image_edit_config(gen_kwargs)
+        batch_size = len(visuals)
+
+        reserve_id = 126089
+        reserve_id2 = 126090
+        img_mask_id = 8193
+        reserve_token = "<|reserved_token_5|>"
+        reserve_token_2 = "<|reserved_token_6|>"
+
+        base_model = model.get_model() if hasattr(model, "get_model") else model
+
+        gen_shape_map = {1024: (64, 64), 512: (32, 32), 256: (16, 16)}
+        gen_shape = gen_shape_map.get(gen_cfg["image_resolution"], (32, 32))
+        is_unitok = "unitok" in getattr(base_model.config, "mm_vqvae", "")
+        latent_shape = (8, gen_cfg["n_tokens"]) if is_unitok else (gen_cfg["n_tokens"],)
+
+        # Bail out if model lacks image-gen capabilities
+        if (
+            not hasattr(model, "encode_image_gen")
+            or not hasattr(base_model, "call_gen_embedding")
+            or not hasattr(base_model, "image_processor_gen")
+        ):
+            eval_logger.warning("Model lacks image generation capabilities; skipping image rollout.")
+            return [None] * batch_size
+
+        conv_version = self.conv_template
+        if conv_version not in conv_templates:
+            conv_version = "llada"
+
+        all_input_ids = []
+        all_edit_images = []
+        image_sizes = []
+        all_enc_embeddings = []
+        vq_latents = []
+
+        for batch_idx in range(batch_size):
+            edit_image = visuals[batch_idx]
+            instruction = instructions[batch_idx]
+            image_sizes.append(edit_image.size)
+            all_edit_images.append(edit_image)
+
+            image_resized = pad_to_square_and_resize(edit_image.convert("RGB"), gen_cfg["image_resolution"])
+            vq_latent = base_model.image_processor_gen.preprocess(image_resized).to(device, dtype=model.dtype)
+            vq_latents.append(vq_latent)
+
+            enc_latents, enc_shape = model.encode_image_gen(vq_latent, enc=True)
+            enc_embeddings = base_model.call_gen_embedding(enc_latents, enc_shape, enc=True)
+            all_enc_embeddings.append(enc_embeddings)
+
+            conv = copy.deepcopy(conv_templates[conv_version])
+            conv.append_message(
+                conv.roles[0],
+                f"<image> {reserve_token_2 * enc_embeddings.shape[1]}\n {instruction} ",
+            )
+            conv.append_message(conv.roles[1], reserve_token * gen_cfg["prompt_n_tokens"])
+            prompt_question = conv.get_prompt()
+            prompt_question = prompt_question.removesuffix(
+                "<|start_header_id|>assistant<|end_header_id|>\n\n"
+            )
+
+            input_ids = tokenizer_image_token(
+                prompt_question,
+                self.tokenizer,
+                IMAGE_TOKEN_INDEX,
+                return_tensors="pt",
+            ).unsqueeze(0).to(device)
+            all_input_ids.append(input_ids)
+
+        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+        all_input_ids = self._left_pad_2d(all_input_ids, pad_token_id, torch.long)
+        attention_mask = (all_input_ids != pad_token_id).long()
+        image_tensor = process_images(all_edit_images, self._image_processor, self._config)
+        if type(image_tensor) is list:
+            image_tensor = [t.to(dtype=torch.bfloat16, device=device) for t in image_tensor]
+        else:
+            image_tensor = image_tensor.to(dtype=torch.bfloat16, device=device)
+
+        inputs = model.prepare_inputs_labels_for_multimodal(
+            input_ids=all_input_ids,
+            position_ids=None,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            labels=None,
+            images=image_tensor,
+            modalities=["image"] * all_input_ids.shape[0],
+            image_sizes=image_sizes,
+            return_inputs=True,
+        )
+        _, _, attention_mask, _, inputs_embeds, _, raw_input_ids = inputs
+
+        init_latents, _ = model.encode_image_gen(torch.cat(vq_latents, dim=0))
+        enc_embeddings = pad_along_last_dim(torch.cat(all_enc_embeddings, dim=0), size=inputs_embeds.shape[-1])
+        inputs_embeds = inputs_embeds.to(dtype=enc_embeddings.dtype)
+        inputs_embeds[raw_input_ids == reserve_id2] = 0
+        inputs_embeds[raw_input_ids == reserve_id2] = enc_embeddings.flatten(0, 1)
+
+        is_prompt = torch.zeros_like(raw_input_ids, dtype=torch.bool)
+        for row_idx in range(raw_input_ids.shape[0]):
+            row_eot = torch.where(raw_input_ids[row_idx] == 126348)[0]
+            if row_eot.numel() >= 2:
+                prompt_cutoff = int(row_eot[1].item())
+                is_prompt[row_idx, : prompt_cutoff + 1] = True
+        is_gen = raw_input_ids == reserve_id
+        is_gen_enc = raw_input_ids == reserve_id2
+
+        noise_embed = base_model.transformer.wte(torch.tensor([self._config.mask_id], device=device))
+        inputs_embeds_uncond = inputs_embeds.clone()
+        inputs_embeds_uncond[is_prompt] = noise_embed
+
+        inputs_embeds_uncond_enc = inputs_embeds.clone()
+        edit_mode = gen_cfg["edit_mode"]
+        if edit_mode == 0:
+            inputs_embeds_uncond_enc[~is_gen_enc] = noise_embed
+            is_gen_enc_ccc = is_gen_enc
+        elif edit_mode == 1:
+            inputs_embeds_uncond_enc[is_gen_enc] = noise_embed
+            is_gen_enc_ccc = torch.zeros_like(is_gen_enc, dtype=torch.bool)
+        elif edit_mode == 2:
+            inputs_embeds_uncond_enc[is_gen_enc | (raw_input_ids < 0)] = noise_embed
+            is_gen_enc_ccc = torch.zeros_like(is_gen_enc, dtype=torch.bool)
+        elif edit_mode == 3:
+            inputs_embeds_uncond_enc[(~is_gen_enc) & (raw_input_ids > 0)] = noise_embed
+            is_gen_enc_ccc = is_gen_enc
+        else:
+            raise ValueError(f"Unsupported edit_mode: {edit_mode}")
+        is_gen_enc_null = torch.zeros_like(is_gen_enc, dtype=torch.bool)
+
+        n_tokens = gen_cfg["n_tokens"]
+        n_steps_total = int(gen_cfg["n_steps"])
+
+        # Initialize xt with mask tokens, optionally seeded from init_latents
+        if is_unitok:
+            xt = torch.full((batch_size, 8, n_tokens), img_mask_id, dtype=torch.long, device=device)
+        else:
+            xt = torch.full((batch_size, n_tokens), img_mask_id, dtype=torch.long, device=device)
+
+        remask_ratio = gen_cfg.get("remask_ratio", 0.01)
+        n_mask_remask = max(int(n_tokens * remask_ratio), 1)
+        indices = np.arange(n_tokens)
+        np.random.shuffle(indices)
+        init_mask_indices = indices[:n_mask_remask]
+        if is_unitok:
+            xt[:, :, init_mask_indices] = init_latents[:, :, init_mask_indices]
+        else:
+            xt[:, init_mask_indices] = init_latents[:, init_mask_indices]
+
+        mask_idx_sched = xt == img_mask_id
+        if is_unitok:
+            mask_idx_sched = mask_idx_sched[:, 0, :]
+        n_mask_per_sample = mask_idx_sched.sum(dim=1)
+        max_n_mask = int(n_mask_per_sample.max().item())
+        max_step = max(1, int(n_steps_total * max_n_mask / n_tokens))
+        n_steps_per_sample = (
+            (n_mask_per_sample.float() * n_steps_total / float(n_tokens))
+            .to(torch.int64)
+            .clamp(min=0, max=max_step)
+        )
+        has_mask = n_mask_per_sample > 0
+        n_steps_per_sample = torch.where(
+            has_mask & (n_steps_per_sample == 0),
+            torch.ones_like(n_steps_per_sample),
+            n_steps_per_sample,
+        )
+
+        schedule_name = gen_cfg["schedule"]
+        num_transfer_tokens = torch.zeros(batch_size, max_step, dtype=torch.int64, device=device)
+        for b in range(batch_size):
+            n_s = int(n_steps_per_sample[b].item())
+            n_m = int(n_mask_per_sample[b].item())
+            if n_s == 0 or n_m == 0:
+                continue
+            ntt = get_num_transfer_tokens_sch(
+                mask_idx_sched[b:b+1], n_s,
+                schedule=schedule_name,
+                schedule_kwargs={"shift": gen_cfg["shift"]},
+            )
+            ntt_len = min(int(ntt.shape[1]), max_step)
+            num_transfer_tokens[b, :ntt_len] = ntt[0, :ntt_len]
+
+        confidence_policy = gen_cfg["confidence_policy"]
+
+        # Temperature schedules
+        sch_temperatures = torch.zeros(batch_size, max_step, device=device, dtype=torch.float32)
+        sch_temperatures_samp = torch.zeros(batch_size, max_step, device=device, dtype=torch.float32)
+        for b in range(batch_size):
+            n_s = int(n_steps_per_sample[b].item())
+            if n_s == 0:
+                continue
+            t_b = self._build_image_edit_temperature_schedule(
+                n_s, gen_cfg["schedule_temp"], gen_cfg["min_temperature"], gen_cfg["shift"],
+            ).to(device=device)
+            t_b_samp = self._build_image_edit_temperature_schedule(
+                n_s, gen_cfg["schedule_temp_samp"], gen_cfg["min_temperature_samp"], gen_cfg["shift"],
+            ).to(device=device)
+            sch_temperatures[b, :n_s] = t_b
+            sch_temperatures_samp[b, :n_s] = t_b_samp
+
+        cfg_start = int(gen_cfg["cfg_interval"][0] * max_step)
+        cfg_end = int(gen_cfg["cfg_interval"][1] * max_step)
+
+        x0 = xt.clone()
+        active_steps = torch.nonzero(num_transfer_tokens.sum(dim=0) > 0, as_tuple=False).squeeze(-1)
+        for step_idx, step_col in enumerate(active_steps, start=1):
+            col_idx = min(step_idx - 1, max_step - 1)
+            local_temp = sch_temperatures[:, col_idx]
+            local_temp_samp = sch_temperatures_samp[:, col_idx]
+            step_confidence_policy = confidence_policy
+            if step_idx / max(max_step, 1) > gen_cfg["order_cutoff"]:
+                step_confidence_policy = "mmada"
+
+            mask_idx = xt == img_mask_id
+            if is_unitok:
+                mask_idx = mask_idx[:, 0, :]
+            n_mask_per_sample = mask_idx.sum(dim=1)
+            if n_mask_per_sample.max().item() == 0:
+                break
+
+            timesteps = n_mask_per_sample.float() / mask_idx.shape[1]
+            do_cfg = gen_cfg["guidance_scale"] > 0 and (cfg_start <= step_idx <= cfg_end)
+
+            if do_cfg:
+                embed_input = torch.cat([inputs_embeds_uncond, inputs_embeds_uncond_enc, inputs_embeds], dim=0)
+                xt_input = torch.cat([xt, xt, xt], dim=0)
+                new_token_mask = is_gen.repeat(3, 1)
+                is_gen_enc_mask = torch.cat([is_gen_enc_null, is_gen_enc_ccc, is_gen_enc], dim=0)
+                timesteps_input = timesteps.repeat(3)
+            else:
+                embed_input = inputs_embeds
+                xt_input = xt
+                new_token_mask = is_gen
+                is_gen_enc_mask = is_gen_enc
+                timesteps_input = timesteps
+
+            if getattr(base_model.config, "enc_use_image_branch", False):
+                modality_indices = new_token_mask | is_gen_enc_mask
+            else:
+                modality_indices = new_token_mask
+
+            all_input_embeddings, new_token_mask = llada_wte(
+                base_model, None, True,
+                x_gen=xt_input, gen_shape=gen_shape,
+                inputs_embeds_curr=embed_input.clone(),
+                new_token_mask=new_token_mask,
+            )
+            logits = llada_get_logits(
+                base_model, all_input_embeddings, new_token_mask, True,
+                gen_shape=gen_shape,
+                input_modality_indices=modality_indices,
+                timesteps=timesteps_input,
+            )
+            if is_unitok:
+                logits[..., 4096:] = float("-inf")
+            if do_cfg:
+                _, _, new_token_mask = new_token_mask.chunk(3)
+                logits_un, logits_un_enc, logits = logits.chunk(3)
+                logits_is_ninf = logits == -np.inf
+                if edit_mode in [0, 3]:
+                    logits_cond = (1 + gen_cfg["guidance_scale_image"]) * logits - (
+                        gen_cfg["guidance_scale_image"] * logits_un_enc
+                    )
+                elif edit_mode in [1, 2]:
+                    logits_cond = (logits + gen_cfg["guidance_scale_image"] * logits_un_enc) / (
+                        1 + gen_cfg["guidance_scale_image"]
+                    )
+                else:
+                    raise ValueError(f"Unsupported edit_mode: {edit_mode}")
+                logits = (1 + gen_cfg["guidance_scale"]) * logits_cond - gen_cfg["guidance_scale"] * logits_un
+                logits[logits_is_ninf] = -np.inf
+
+            safe_logits = torch.nan_to_num(logits.to(torch.float32), nan=-1e9, posinf=1e9, neginf=-1e9)
+            probs = safe_logits.softmax(-1)
+            if gen_cfg["sample_policy"] == "argmax":
+                x0 = safe_logits.argmax(-1)
+            else:
+                base_temperature = float(gen_cfg.get("temperature", 0.8))
+                if gen_cfg["dynamic_temperature_samp"]:
+                    temperature_vec = base_temperature * local_temp_samp
+                    temperature_vec = torch.clamp(temperature_vec, min=1e-6)
+                    logits_for_sample = safe_logits / temperature_vec.view(-1, 1, 1)
+                    x0 = torch.distributions.Categorical(logits=logits_for_sample).sample()
+                else:
+                    if base_temperature <= 0:
+                        x0 = safe_logits.argmax(-1)
+                    else:
+                        x0 = torch.distributions.Categorical(logits=safe_logits / base_temperature).sample()
+            x0_p = torch.gather(probs, -1, x0.long()[..., None]).squeeze(-1)
+            transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+
+            if is_unitok:
+                x0 = x0.permute(0, 2, 1)
+                x0 = torch.where(mask_idx.unsqueeze(1).repeat(1, 8, 1), x0, xt)
+                x0_p = x0_p.permute(0, 2, 1).max(dim=1)[0]
+            else:
+                x0 = torch.where(mask_idx, x0, xt)
+
+            for b_idx in range(batch_size):
+                b_mask = mask_idx[b_idx]
+                b_n_mask = int(b_mask.sum().item())
+                if b_n_mask == 0:
+                    continue
+                k = min(int(num_transfer_tokens[b_idx, step_col].item()), b_n_mask)
+                if k <= 0:
+                    continue
+                local_temp_b = float(local_temp[b_idx].item())
+                if step_confidence_policy == "mask_git":
+                    alg_t = gen_cfg["alg_temp"] * local_temp_b if gen_cfg["dynamic_temperature"] else gen_cfg["alg_temp"]
+                    confidence = x0_p[b_idx] / max(alg_t, 1e-6)
+                    confidence = torch.where(b_mask, confidence, -np.inf)
+                    confidence = torch.softmax(confidence, dim=-1)
+                    select_index = torch.multinomial(confidence, num_samples=k)
+                else:
+                    alg_t = gen_cfg["alg_temp"] * local_temp_b if gen_cfg["dynamic_temperature"] else gen_cfg["alg_temp"]
+                    confidence = torch.log(x0_p[b_idx].clamp(1e-20)) + alg_t * self._image_edit_gumbel_noise(x0_p[b_idx])
+                    confidence = torch.where(b_mask, confidence, -np.inf)
+                    _, select_index = torch.topk(confidence, k=k)
+
+                if is_unitok:
+                    transfer_index[b_idx, :, select_index] = True
+                else:
+                    transfer_index[b_idx, select_index] = True
+            xt[transfer_index] = x0[transfer_index]
+
+        xt[xt == img_mask_id] = x0[xt == img_mask_id]
+
+        # Decode VQ latents to images
+        decoded_images = model.decode_image_gen(
+            xt, gen_cfg["image_resolution"], gen_cfg["image_resolution"],
+        )
+        result = []
+        for batch_idx, decoded_image in enumerate(decoded_images):
+            if torch.is_tensor(decoded_image):
+                image_array = decoded_image.detach().cpu()
+                if image_array.ndim == 3 and image_array.shape[0] in (1, 3):
+                    image_array = image_array.permute(1, 2, 0)
+                image_array = image_array.clamp(0, 1).mul(255).to(torch.uint8).numpy()
+                if image_array.ndim == 3 and image_array.shape[-1] == 1:
+                    image_array = image_array[..., 0]
+                result.append(Image.fromarray(image_array))
+            elif isinstance(decoded_image, np.ndarray):
+                image_array = np.clip(decoded_image, 0, 255).astype(np.uint8)
+                if image_array.ndim == 3 and image_array.shape[-1] == 1:
+                    image_array = image_array[..., 0]
+                result.append(Image.fromarray(image_array))
+            else:
+                result.append(decoded_image)
+        return result
+
     def generate_until(self, requests: List[Instance]) -> List[str]:
         res = []
 
@@ -499,7 +952,8 @@ class Llava_Llada(lmms):
                 gen_kwargs.pop("until")
 
             question_input = []
-            # import ipdb; ipdb.set_trace()
+
+            do_image_rollout = gen_kwargs.get("do_image_rollout", False)
 
             # Accumulate per-sample visual data so batched generation has one entry per
             # <image> token across the entire batch. Previously image_tensor was overwritten
@@ -510,7 +964,31 @@ class Llava_Llada(lmms):
             flat_image_sizes = []     # [(w, h), ...] aligned with flat_images (image task only)
             task_type = "text"
 
-            for visual, context in zip(batched_visuals, batched_contexts):
+            # ------------------------------------------------------------------
+            # Image rollout: generate edited images before text generation.
+            # When do_image_rollout is True, we run _rollout_image_edit on
+            # each sample's first image + context (as edit instruction), then
+            # inject the generated image as a second <image> for text gen.
+            # ------------------------------------------------------------------
+            generated_images = [None] * len(batched_visuals)  # per-sample generated PIL images
+            if do_image_rollout:
+                rollout_visuals = []
+                rollout_instructions = []
+                rollout_indices = []  # which batch indices have images to roll out
+                for sample_idx, (visual, context) in enumerate(zip(batched_visuals, batched_contexts)):
+                    if visual is not None and len(visual) > 0 and isinstance(visual[0], PIL.Image.Image):
+                        rollout_visuals.append(visual[0])
+                        rollout_instructions.append(context)
+                        rollout_indices.append(sample_idx)
+                if rollout_visuals:
+                    with torch.inference_mode():
+                        gen_images = self._rollout_image_edit(
+                            rollout_visuals, rollout_instructions, gen_kwargs,
+                        )
+                    for ri, gi in zip(rollout_indices, gen_images):
+                        generated_images[ri] = gi
+
+            for sample_idx, (visual, context) in enumerate(zip(batched_visuals, batched_contexts)):
                 t0 = time.time()
                 if origin_image_aspect_ratio is not None and self._config.image_aspect_ratio != origin_image_aspect_ratio:
                     self._config.image_aspect_ratio = origin_image_aspect_ratio
@@ -593,6 +1071,24 @@ class Llava_Llada(lmms):
                 if task_type == "image" and visual is not None:
                     flat_image_sizes.extend([v.size for v in visual])
 
+                # If image rollout produced a generated image for this sample,
+                # process it and append as an additional <image> entry.
+                gen_img = generated_images[sample_idx]
+                if gen_img is not None and task_type == "image":
+                    gen_img_resized = pad_to_square_and_resize(
+                        gen_img.convert("RGB"),
+                        int(gen_kwargs.get("image_edit_resolution", 512)),
+                    )
+                    gen_img_tensor = process_images([gen_img_resized], self._image_processor, self._config)
+                    if type(gen_img_tensor) is list:
+                        gen_img_tensor = [t.to(dtype=torch.bfloat16, device=self.device) for t in gen_img_tensor]
+                        flat_images.extend(gen_img_tensor)
+                    else:
+                        gen_img_tensor = gen_img_tensor.to(dtype=torch.bfloat16, device=self.device)
+                        flat_images.append(gen_img_tensor)
+                    flat_image_sizes.append(gen_img_resized.size)
+                    placeholder_count += 1
+
                 if image_tensor is not None and len(image_tensor) != 0 and DEFAULT_IMAGE_TOKEN not in context:
                     """
                     Three senarios:
@@ -601,10 +1097,6 @@ class Llava_Llada(lmms):
                     3. image token is not specified in the context and there is image inputs, so we need to add it. In this case, we add the image token at the beginning of the context and add a new line.
                     4. For video tasks, we could add a <image> token or multiple <image> tokens for each frame in the context. This depends on the training strategy and should balance in test to decide which is better
                     """
-                    # if task_type == "image": # indeed in multi-image case, not the video in frames.
-                    #     image_tokens = [DEFAULT_IMAGE_TOKEN] * placeholder_count if isinstance(visual, list) else [DEFAULT_IMAGE_TOKEN]
-                    # elif task_type == "video":
-                    # image_tokens = [DEFAULT_IMAGE_TOKEN] * placeholder_count if self.token_strategy == "multiple" else [DEFAULT_IMAGE_TOKEN]
                     image_tokens = [DEFAULT_IMAGE_TOKEN] * placeholder_count
                     image_tokens = " ".join(image_tokens)
                     question = image_tokens + "\n" + context
@@ -686,12 +1178,20 @@ class Llava_Llada(lmms):
             # breakpoint()
             if "image_aspect_ratio" in gen_kwargs.keys():
                 gen_kwargs.pop("image_aspect_ratio")
+            # Strip image-edit rollout keys — they are not valid model.generate args.
+            gen_kwargs.pop("do_image_rollout", None)
+            for key in list(gen_kwargs.keys()):
+                if key.startswith("image_edit_"):
+                    gen_kwargs.pop(key)
             # Pass the batch-flattened image list (None if no visuals at all) so that
             # len(images) == total <image> tokens across the batch.
             images_arg = flat_images if len(flat_images) > 0 else None
+            # image_sizes is a named param on model.generate(), not **kwargs,
+            # so extract it to pass explicitly.
+            image_sizes_arg = gen_kwargs.pop("image_sizes", None)
             try:
                 with torch.inference_mode():
-                    cont = self.model.generate(input_ids, attention_mask=attention_masks, pad_token_id=pad_token_ids, images=images_arg, use_cache=self.use_cache, **gen_kwargs)
+                    cont = self.model.generate(input_ids, attention_mask=attention_masks, pad_token_id=pad_token_ids, images=images_arg, image_sizes=image_sizes_arg, use_cache=self.use_cache, **gen_kwargs)
                     # cont = self.model.generate(qwen_input_ids, pad_token_id=pad_token_ids, images=images_arg, use_cache=self.use_cache, **gen_kwargs)
                 if gen_kwargs.get('use_fast_dlm'):
                     # generate_with_dual_cache returns (x, nfe); also it hardcodes bsz=1
