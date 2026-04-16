@@ -1024,6 +1024,14 @@ class Llava_Llada(lmms):
                         placeholder_count = 1
 
                     elif type(visual[0]) == PIL.Image.Image:  # For image, multi-image tasks
+                        # If image rollout produced a generated image for this
+                        # sample, append it to the visual list so that all
+                        # images are processed together by process_images
+                        # (guaranteeing consistent tensor dimensions).
+                        gen_img = generated_images[sample_idx] if do_image_rollout else None
+                        if gen_img is not None:
+                            visual = list(visual) + [gen_img]
+
                         image_tensor = process_images(visual, self._image_processor, self._config)
                         if type(image_tensor) is list:
                             image_tensor = [_image.to(dtype=torch.bfloat16, device=self.device) for _image in image_tensor]
@@ -1073,24 +1081,6 @@ class Llava_Llada(lmms):
 
                 if task_type == "image" and visual is not None:
                     flat_image_sizes.extend([v.size for v in visual])
-
-                # If image rollout produced a generated image for this sample,
-                # process it and append as an additional <image> entry.
-                gen_img = generated_images[sample_idx]
-                if gen_img is not None and task_type == "image":
-                    gen_img_resized = pad_to_square_and_resize(
-                        gen_img.convert("RGB"),
-                        int(gen_kwargs.get("image_edit_resolution", 512)),
-                    )
-                    gen_img_tensor = process_images([gen_img_resized], self._image_processor, self._config)
-                    if type(gen_img_tensor) is list:
-                        gen_img_tensor = [t.to(dtype=torch.bfloat16, device=self.device) for t in gen_img_tensor]
-                        flat_images.extend(gen_img_tensor)
-                    else:
-                        gen_img_tensor = gen_img_tensor.to(dtype=torch.bfloat16, device=self.device)
-                        flat_images.append(gen_img_tensor)
-                    flat_image_sizes.append(gen_img_resized.size)
-                    placeholder_count += 1
 
                 if image_tensor is not None and len(image_tensor) != 0 and DEFAULT_IMAGE_TOKEN not in context:
                     """
