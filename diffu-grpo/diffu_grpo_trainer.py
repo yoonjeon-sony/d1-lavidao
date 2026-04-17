@@ -1489,6 +1489,30 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     image_array = image_array[..., 0]
                 decoded_image_obj = Image.fromarray(image_array)
 
+            if DIFFU_GRPO_DEBUG and predicted_bbox is not None:
+                bbox = predicted_bbox[batch_idx]
+                if bbox is not None and not (
+                    float(bbox[0]) == 0.0 and float(bbox[1]) == 0.0
+                    and float(bbox[2]) == 0.0 and float(bbox[3]) == 0.0
+                ):
+                    from PIL import ImageDraw
+                    if decoded_image_obj.mode != "RGB":
+                        decoded_image_obj = decoded_image_obj.convert("RGB")
+                    W, H = image_sizes[batch_idx]
+                    x0, y0, x1, y1 = [float(v) for v in bbox[:4]]
+                    # LOC-space (0-1024) → original pixel coords → padded square → resized.
+                    square_size = float(max(W, H))
+                    pad_x = (square_size - W) / 2.0
+                    pad_y = (square_size - H) / 2.0
+                    scale = image_resolution / square_size
+                    x0_r = (x0 * W / 1024.0 + pad_x) * scale
+                    y0_r = (y0 * H / 1024.0 + pad_y) * scale
+                    x1_r = (x1 * W / 1024.0 + pad_x) * scale
+                    y1_r = (y1 * H / 1024.0 + pad_y) * scale
+                    ImageDraw.Draw(decoded_image_obj).rectangle(
+                        [x0_r, y0_r, x1_r, y1_r], outline=(255, 0, 0), width=4
+                    )
+
             decoded_image_path = rollout_dir / f"{safe_sample_id}_{os.getpid()}_{batch_idx}.png"
             if hasattr(decoded_image_obj, "save"):
                 decoded_image_obj.save(decoded_image_path)
@@ -1518,6 +1542,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     "prompt": prompt,
                     "prompt_len_tokens": per_row_prompt_lens[batch_idx],
                     "completion_len_tokens": row_completion_len,
+                    "n_steps_per_sample": int(n_steps_per_sample[batch_idx].item()),
                     "payload": {
                         "id": sample_id,
                         "image_gen": str(decoded_image_path),
@@ -2625,6 +2650,8 @@ class DiffuGRPOTrainer(GRPOTrainer):
                         batch_bboxes = self._rollout_grounding(
                             unwrapped_model, batch_examples, image_processor,
                         )
+                        if DIFFU_GRPO_DEBUG:
+                            _debug_log(f"batch_bboxes [{start_idx}:{start_idx + len(batch_examples)}] = {batch_bboxes}")
                         for offset, bbox in enumerate(batch_bboxes):
                             predicted_bboxes[start_idx + offset] = bbox
 
@@ -2745,6 +2772,18 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     "gen/completion",
                     [ctx.get("completion_len_tokens", 0) for ctx in image_contexts if ctx is not None],
                 )
+                if gen_inputs is not None and ground_inputs is not None:
+                    n_steps_vals = [
+                        ctx.get("n_steps_per_sample", 0)
+                        for ctx in image_contexts
+                        if ctx is not None and ctx.get("n_steps_per_sample") is not None
+                    ]
+                    if n_steps_vals:
+                        local_n_steps = torch.tensor(n_steps_vals, dtype=torch.float32, device=device)
+                        gathered_n_steps = self.accelerator.gather(local_n_steps)
+                        self._metrics[mode]["gen/completion/n_steps_per_sample"].append(
+                            gathered_n_steps.mean().item()
+                        )
             if answer_contexts is not None:
                 _log_length_metric(
                     "und/prompt",
