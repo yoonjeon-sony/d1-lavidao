@@ -390,7 +390,9 @@ def main(grpo_config, model_config):
         # Gen-only flow: train_dataset carries the image-edit rows and
         # drives the image rollout. und_dataset is None so the trainer
         # automatically skips the text rollout / text loss.
-        dataset = get_image_edit_placeholder_questions()
+        dataset, ground_dataset = get_image_edit_placeholder_questions(
+            region_edit=bool(getattr(grpo_config, "region_edit", False)),
+        )
         reward_functions = [perceptual_score_reward_func]
         modality = "gen"
     elif grpo_config.dataset == "thinkmorph_answer":
@@ -405,8 +407,9 @@ def main(grpo_config, model_config):
         ]
         modality = "und"
     elif grpo_config.dataset == "thinkmorph_interleave":
-        tm_gen, tm_und = get_thinkmorph_interleave_questions()
-        ax_gen, ax_und = get_arxivqa_interleave_questions()
+        region_edit = bool(getattr(grpo_config, "region_edit", False))
+        tm_gen, tm_und, tm_ground = get_thinkmorph_interleave_questions(region_edit=region_edit)
+        ax_gen, ax_und, ax_ground = get_arxivqa_interleave_questions(region_edit=region_edit)
 
         # Concatenate gen and und sides. Each loader emits its gen and und rows
         # in the same order, so within each sub-dataset row i refers to the same
@@ -418,6 +421,14 @@ def main(grpo_config, model_config):
                 f"thinkmorph_interleave gen/und length mismatch after concat: "
                 f"{len(dataset)} vs {len(und_dataset)}"
             )
+        ground_dataset = None
+        if region_edit:
+            ground_dataset = concatenate_datasets([tm_ground, ax_ground])
+            if len(dataset) != len(ground_dataset):
+                raise ValueError(
+                    f"thinkmorph_interleave gen/ground length mismatch after concat: "
+                    f"{len(dataset)} vs {len(ground_dataset)}"
+                )
 
         # Joint shuffle: draw one permutation and apply it to both datasets so
         # that row i continues to refer to the same sample_id on both sides.
@@ -426,6 +437,8 @@ def main(grpo_config, model_config):
         perm = rng.permutation(len(dataset)).tolist()
         dataset = dataset.select(perm)
         und_dataset = und_dataset.select(perm)
+        if ground_dataset is not None:
+            ground_dataset = ground_dataset.select(perm)
 
         reward_functions = [
             perceptual_score_reward_func,
@@ -446,6 +459,12 @@ def main(grpo_config, model_config):
         if grpo_config.dataset != "thinkmorph_interleave":
             und_dataset = und_dataset.shuffle(seed=grpo_config.seed)
         und_train_set = und_dataset
+    ground_train_set = None
+    if "ground_dataset" in locals() and ground_dataset is not None:
+        # Ground is paired to gen by sample_id, so the trainer resolves it via
+        # a {sample_id -> row} map (no second dataloader). Shuffling here is
+        # safe because lookup is by key, not by index.
+        ground_train_set = ground_dataset
     if grpo_config.dataset in ["countdown", "sudoku"] and len(dataset) > 500:
         train_set = dataset.select(range(0, len(dataset) - 500))
     else:
@@ -463,6 +482,7 @@ def main(grpo_config, model_config):
         reward_funcs=reward_functions,
         train_dataset=train_set,
         train_dataset_und=und_train_set,
+        train_dataset_ground=ground_train_set,
         optimizers=(optimizer, None),
         modality=modality,
     )

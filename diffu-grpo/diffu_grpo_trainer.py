@@ -2,6 +2,7 @@ import copy
 import inspect
 import os
 import random
+import re
 import sys
 import time
 import warnings
@@ -311,6 +312,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
         args: Optional[GRPOConfig] = None,
         train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
         train_dataset_und: Optional[Union[Dataset, IterableDataset]] = None,
+        train_dataset_ground: Optional[Union[Dataset, IterableDataset]] = None,
         eval_dataset: Optional[
             Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]
         ] = None,
@@ -428,6 +430,27 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     f"train_dataset_und has duplicate sample_ids: "
                     f"{len(train_dataset_und)} rows but only "
                     f"{len(self._und_by_sample_id)} unique sample_ids."
+                )
+
+        # Grounding side: paired with gen rows by sample_id (same pattern as
+        # und). Populated only when ``region_edit`` is enabled upstream and a
+        # ground_ds was constructed by the data loader.
+        self._ground_by_sample_id = None
+        if train_dataset_ground is not None:
+            if "sample_id" not in train_dataset_ground.column_names:
+                raise ValueError(
+                    "train_dataset_ground must carry a 'sample_id' column for "
+                    "gen/ground pairing. Got columns: "
+                    f"{train_dataset_ground.column_names}"
+                )
+            self._ground_by_sample_id = {
+                row["sample_id"]: row for row in train_dataset_ground
+            }
+            if len(self._ground_by_sample_id) != len(train_dataset_ground):
+                raise ValueError(
+                    f"train_dataset_ground has duplicate sample_ids: "
+                    f"{len(train_dataset_ground)} rows but only "
+                    f"{len(self._ground_by_sample_id)} unique sample_ids."
                 )
 
 
@@ -769,6 +792,112 @@ class DiffuGRPOTrainer(GRPOTrainer):
         return completion_ids.detach(), image_contexts
 
 
+    # Matches "[[x0,y0,x1,y1]]" or "[x0,y0,x1,y1]" variants from LaVida-O grounding outputs.
+    _GROUNDING_BBOX_PATTERN = re.compile(r'\[*\[(.*?),(.*?),(.*?),(.*?)\]\]*')
+
+    def _rollout_grounding(
+        self,
+        model,
+        examples: list[dict[str, Any]],
+        image_processor,
+    ) -> list[tuple[float, float, float, float]]:
+        """Run per-batch grounding generation and return predicted bboxes.
+
+        Each row of ``examples`` is a ground_ds row: ``prompt`` is a fully
+        templated LLaDA string (built by ``_build_grounding_prompt``),
+        ``image`` is a path, and ``ground_gt`` is either a 4-int list or
+        None. Batched inference follows the same structure as
+        ``_rollout_multimodal_text_gen`` (left-pad token ids, batched
+        process_images, one forward) but dispatches to ``model.generate``
+        (argmax decoding) rather than ``llada_generate``. The returned list
+        is 1-to-1 with ``examples`` in order.
+        """
+        if isinstance(examples, dict):
+            examples = [examples]
+        if image_processor is None:
+            raise ValueError("Grounding rollout requires an image processor.")
+
+        device = model.device
+        resolution = int(self.args.image_edit_resolution)
+        all_input_ids: list[torch.Tensor] = []
+        all_images = []
+        image_sizes: list[tuple[int, int]] = []
+
+        for example in examples:
+            prompt_text = example.get("prompt")
+            if not isinstance(prompt_text, str) or not prompt_text:
+                sample_id = example.get("sample_id", "unknown")
+                raise ValueError(
+                    f"Grounding rollout example has no string 'prompt': sample_id={sample_id}"
+                )
+            image = self._load_image(example.get("image"))
+            if image is None:
+                sample_id = example.get("sample_id", "unknown")
+                raise ValueError(
+                    f"Grounding rollout example is missing an image: sample_id={sample_id}"
+                )
+            processed_image = pad_to_square_and_resize(image.convert("RGB"), resolution)
+            all_images.append(processed_image)
+            image_sizes.append(processed_image.size)
+
+            prompt_ids = tokenizer_image_token(
+                prompt_text,
+                self.processing_class,
+                IMAGE_TOKEN_INDEX,
+                return_tensors="pt",
+            ).to(device)
+            if self.max_prompt_length is not None:
+                prompt_ids = prompt_ids[-self.max_prompt_length :]
+            all_input_ids.append(prompt_ids.unsqueeze(0))
+
+        input_ids = self._left_pad_2d(
+            all_input_ids,
+            self.processing_class.pad_token_id,
+            torch.long,
+        ).to(device)
+        prompt_mask = (input_ids != self.processing_class.pad_token_id).long()
+
+        image_tensor = process_images(all_images, image_processor, model.config)
+        image_tensor = self._normalize_mm_image_payload(
+            image_tensor,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+
+        # NOTE: per user request, the grounding rollout uses model.generate
+        # (not llada_generate). We pass the batched prompt_mask so padded
+        # positions do not attend.
+        with torch.no_grad():
+            pred = model.generate(
+                input_ids,
+                attention_mask=prompt_mask,
+                images=image_tensor,
+                image_sizes=image_sizes,
+                do_sample=False,
+                temperature=0,
+                max_new_tokens=64,
+                block_length=64,
+                step_ratio=1.0,  # 32 steps
+                tokenizer=self.processing_class,
+                prefix_lm=True,
+            )
+
+        answers = self.processing_class.batch_decode(pred, skip_special_tokens=True)
+        predicted_bboxes: list[tuple[float, float, float, float]] = []
+        for answer in answers:
+            matches = re.findall(self._GROUNDING_BBOX_PATTERN, answer)
+            try:
+                predict_bbox = (
+                    float(matches[0][0]),
+                    float(matches[0][1]),
+                    float(matches[0][2]),
+                    float(matches[0][3]),
+                )
+            except Exception:
+                predict_bbox = (0.0, 0.0, 0.0, 0.0)
+            predicted_bboxes.append(predict_bbox)
+        return predicted_bboxes
+
     def _normalize_mm_image_payload(self, image_tensor: Any, *, dtype: torch.dtype, device: torch.device) -> list[torch.Tensor]:
         if isinstance(image_tensor, list):
             return [_x.to(dtype=dtype, device=device) for _x in image_tensor]
@@ -853,9 +982,24 @@ class DiffuGRPOTrainer(GRPOTrainer):
         model,
         examples: list[dict[str, Any]],
         init_image=None,
+        predicted_bbox: Optional[list[tuple[float, float, float, float]]] = None,
     ) -> tuple[torch.Tensor, list[dict[str, Any]]]:
         if isinstance(examples, dict):
             examples = [examples]
+        # ``predicted_bbox`` is aligned with ``examples`` by index: bbox[i]
+        # corresponds to examples[i] (both ultimately rooted in the same
+        # gen_inputs sample_id). Stored on each example under ``predicted_bbox``
+        # so downstream consumers (region-aware editing, logging) can pick it
+        # up without threading another argument through every helper.
+        if predicted_bbox is not None:
+            if len(predicted_bbox) != len(examples):
+                raise ValueError(
+                    f"predicted_bbox length ({len(predicted_bbox)}) does not match "
+                    f"examples length ({len(examples)})"
+                )
+            examples = [dict(ex) for ex in examples]
+            for ex, bbox in zip(examples, predicted_bbox):
+                ex["predicted_bbox"] = bbox
         gen_cfg = self._get_image_edit_gen_dict()
         device = model.device
         batch_size = len(examples)
@@ -989,38 +1133,139 @@ class DiffuGRPOTrainer(GRPOTrainer):
         is_gen_enc_null = torch.zeros_like(is_gen_enc, dtype=torch.bool)
 
         n_tokens = gen_cfg["n_tokens"]
-        image_gen_latents_offset = torch.zeros(batch_size, n_tokens, dtype=torch.long, device=device)
-        if is_unitok:
-            image_gen_latents_offset = image_gen_latents_offset.unsqueeze(1).repeat(1, 8, 1)
-        image_gen_latents_offset[:] = img_mask_id
-
-        xt = image_gen_latents_offset.clone()
-        if init_image is not None:
-            remask_ratio = gen_cfg.get("remask_ratio", 0.01)
-            n_mask_remask = max(int(n_tokens * remask_ratio), 1)
-            indices = np.arange(n_tokens)
-            np.random.shuffle(indices)
-            init_mask_indices = indices[:n_mask_remask]
-            xt[:, init_mask_indices] = init_latents[:, init_mask_indices]
-
+        n_steps_total = int(gen_cfg["n_steps"])
         use_3d = False
+
+        # ------------------------------------------------------------------
+        # Region-gated xt initialization.
+        # When ``predicted_bbox`` is provided (from the grounding rollout),
+        # only the tokens inside each bbox start masked; the rest are
+        # initialized from the encoded init_latents so they're preserved
+        # through the diffusion loop. When predicted_bbox is None we fall
+        # back to the original full-mask initialization.
+        # ------------------------------------------------------------------
+        image_resolution = int(gen_cfg["image_resolution"])
+        grid_h, grid_w = gen_shape
+        grid_tokens = grid_h * grid_w
+        mask_idx_2d = torch.zeros(batch_size, grid_tokens, dtype=torch.bool, device=device)
+        region_mode = predicted_bbox is not None
+        if region_mode:
+            for b, bbox in enumerate(predicted_bbox):
+                W, H = image_sizes[b]
+                # Skip / full-mask when grounding returned the zero-bbox
+                # fallback — nothing to localize, behave like no-bbox mode.
+                if bbox is None or (float(bbox[0]) == 0.0 and float(bbox[1]) == 0.0
+                                    and float(bbox[2]) == 0.0 and float(bbox[3]) == 0.0):
+                    mask_idx_2d[b] = True
+                    continue
+                x0, y0, x1, y1 = [float(v) for v in bbox[:4]]
+                # Step 1: normalize LOC-space (0-1024) to original pixel coords
+                #         (``original_{h,w} / 1024`` scaling).
+                x0_o = x0 * W / 1024.0
+                y0_o = y0 * H / 1024.0
+                x1_o = x1 * W / 1024.0
+                y1_o = y1 * H / 1024.0
+                # The encoder path applies pad_to_square_and_resize, so the
+                # original bbox maps to the square via a centered pad, then
+                # to image_resolution via a uniform resize.
+                square_size = float(max(W, H))
+                pad_x = (square_size - W) / 2.0
+                pad_y = (square_size - H) / 2.0
+                scale = image_resolution / square_size
+                x0_r = (x0_o + pad_x) * scale
+                y0_r = (y0_o + pad_y) * scale
+                x1_r = (x1_o + pad_x) * scale
+                y1_r = (y1_o + pad_y) * scale
+                if x1_r <= x0_r:
+                    x1_r = min(float(image_resolution), x0_r + 1.0)
+                if y1_r <= y0_r:
+                    y1_r = min(float(image_resolution), y0_r + 1.0)
+                # Map pixel coords to the latent grid (grid_h x grid_w).
+                gx0 = int(math.floor(x0_r * grid_w / image_resolution))
+                gy0 = int(math.floor(y0_r * grid_h / image_resolution))
+                gx1 = int(math.ceil(x1_r * grid_w / image_resolution))
+                gy1 = int(math.ceil(y1_r * grid_h / image_resolution))
+                gx0 = min(max(gx0, 0), grid_w - 1)
+                gy0 = min(max(gy0, 0), grid_h - 1)
+                gx1 = min(max(gx1, gx0 + 1), grid_w)
+                gy1 = min(max(gy1, gy0 + 1), grid_h)
+                rows = torch.arange(gy0, gy1, device=device, dtype=torch.long)
+                cols = torch.arange(gx0, gx1, device=device, dtype=torch.long)
+                tokens = (rows[:, None] * grid_w + cols[None, :]).reshape(-1)
+                mask_idx_2d[b, tokens] = True
+        else:
+            mask_idx_2d[:] = True
+
+        # Step 2: initialize xt from init_latents and inject img_mask_id only
+        # at positions inside the bbox (or everywhere, in non-region mode).
+        if region_mode:
+            xt = init_latents.clone()
+            if is_unitok:
+                for b in range(batch_size):
+                    xt[b, :, mask_idx_2d[b]] = img_mask_id
+            else:
+                xt[mask_idx_2d] = img_mask_id
+        else:
+            image_gen_latents_offset = torch.zeros(batch_size, n_tokens, dtype=torch.long, device=device)
+            if is_unitok:
+                image_gen_latents_offset = image_gen_latents_offset.unsqueeze(1).repeat(1, 8, 1)
+            image_gen_latents_offset[:] = img_mask_id
+            xt = image_gen_latents_offset.clone()
+            if init_image is not None:
+                remask_ratio = gen_cfg.get("remask_ratio", 0.01)
+                n_mask_remask = max(int(n_tokens * remask_ratio), 1)
+                indices = np.arange(n_tokens)
+                np.random.shuffle(indices)
+                init_mask_indices = indices[:n_mask_remask]
+                xt[:, init_mask_indices] = init_latents[:, init_mask_indices]
+
+        # Step 3: count masked tokens per sample (shape (B,)).
         mask_idx_sched = xt == img_mask_id
         if is_unitok and not use_3d:
             mask_idx_sched = mask_idx_sched[:, 0, :]
-        if gen_cfg["schedule"] == "shift":
-            num_transfer_tokens = get_num_transfer_tokens_sch(
-                mask_idx_sched,
-                gen_cfg["n_steps"],
-                schedule="shift",
+        n_mask_per_sample = mask_idx_sched.sum(dim=1)  # (B,)
+        max_n_mask = int(n_mask_per_sample.max().item())
+
+        # Step 4: per-sample n_steps ∝ n_mask / n_tokens * n_steps_total.
+        # max_step = max(1, int(n_steps_total * max_n_mask / n_tokens)) bounds
+        # the (B, max_step) schedule tensors below.
+        max_step = max(1, int(n_steps_total * max_n_mask / n_tokens))
+        n_steps_per_sample = (
+            (n_mask_per_sample.float() * n_steps_total / float(n_tokens))
+            .to(torch.int64)
+            .clamp(min=0, max=max_step)
+        )
+        # Clamp at least to 1 for samples that actually have masked tokens.
+        has_mask = n_mask_per_sample > 0
+        n_steps_per_sample = torch.where(
+            has_mask & (n_steps_per_sample == 0),
+            torch.ones_like(n_steps_per_sample),
+            n_steps_per_sample,
+        )
+
+        # Step 5: get_num_transfer_tokens_sch expects a scalar ``steps`` (see
+        # llava/model/language_model/llada/generate.py) — internally it
+        # clamps against ``mask_num[0]`` and is NOT batched over per-sample
+        # n_steps. So we call it per sample and right-pad the resulting
+        # (1, n_s) rows with zeros into (B, max_step). Zero-padded columns
+        # are automatically skipped by the ``active_steps`` selector below.
+        schedule_name = gen_cfg["schedule"] if gen_cfg["schedule"] == "shift" else gen_cfg["schedule"]
+        num_transfer_tokens = torch.zeros(
+            batch_size, max_step, dtype=torch.int64, device=device
+        )
+        for b in range(batch_size):
+            n_s = int(n_steps_per_sample[b].item())
+            n_m = int(n_mask_per_sample[b].item())
+            if n_s == 0 or n_m == 0:
+                continue
+            ntt = get_num_transfer_tokens_sch(
+                mask_idx_sched[b : b + 1],
+                n_s,
+                schedule=schedule_name,
                 schedule_kwargs={"shift": gen_cfg["shift"]},
             )
-        else:
-            num_transfer_tokens = get_num_transfer_tokens_sch(
-                mask_idx_sched,
-                gen_cfg["n_steps"],
-                schedule=gen_cfg["schedule"],
-                schedule_kwargs={"shift": gen_cfg["shift"]},
-            )
+            ntt_len = min(int(ntt.shape[1]), max_step)
+            num_transfer_tokens[b, :ntt_len] = ntt[0, :ntt_len]
 
         confidence_policy = gen_cfg["confidence_policy"]
         if confidence_policy == "halton":
@@ -1029,28 +1274,47 @@ class DiffuGRPOTrainer(GRPOTrainer):
         if confidence_policy == "stratified":
             unmask_order = stratified_random(n=int(np.sqrt(gen_cfg["n_tokens"])), seed=42, shuffle_blocks=True)
 
-        sch_temperatures = self._build_image_edit_temperature_schedule(
-            gen_cfg["n_steps"],
-            gen_cfg["schedule_temp"],
-            gen_cfg["min_temperature"],
-            gen_cfg["shift"],
-        ).to(device=device)
-        sch_temperatures_samp = self._build_image_edit_temperature_schedule(
-            gen_cfg["n_steps"],
-            gen_cfg["schedule_temp_samp"],
-            gen_cfg["min_temperature_samp"],
-            gen_cfg["shift"],
-        ).to(device=device)
-        cfg_start = int(gen_cfg["cfg_interval"][0] * gen_cfg["n_steps"])
-        cfg_end = int(gen_cfg["cfg_interval"][1] * gen_cfg["n_steps"])
+        # Per-sample temperature schedules of shape (B, max_step). Columns
+        # beyond each row's n_steps_per_sample[b] stay at 0; they're never
+        # read since num_transfer_tokens is 0 there.
+        sch_temperatures = torch.zeros(
+            batch_size, max_step, device=device, dtype=torch.float32
+        )
+        sch_temperatures_samp = torch.zeros(
+            batch_size, max_step, device=device, dtype=torch.float32
+        )
+        for b in range(batch_size):
+            n_s = int(n_steps_per_sample[b].item())
+            if n_s == 0:
+                continue
+            t_b = self._build_image_edit_temperature_schedule(
+                n_s,
+                gen_cfg["schedule_temp"],
+                gen_cfg["min_temperature"],
+                gen_cfg["shift"],
+            ).to(device=device)
+            t_b_samp = self._build_image_edit_temperature_schedule(
+                n_s,
+                gen_cfg["schedule_temp_samp"],
+                gen_cfg["min_temperature_samp"],
+                gen_cfg["shift"],
+            ).to(device=device)
+            sch_temperatures[b, :n_s] = t_b
+            sch_temperatures_samp[b, :n_s] = t_b_samp
+
+        cfg_start = int(gen_cfg["cfg_interval"][0] * max_step)
+        cfg_end = int(gen_cfg["cfg_interval"][1] * max_step)
 
         x0 = xt.clone()
         active_steps = torch.nonzero(num_transfer_tokens.sum(dim=0) > 0, as_tuple=False).squeeze(-1)
         for step_idx, step_col in enumerate(active_steps, start=1):
-            local_temp = sch_temperatures[min(step_idx - 1, sch_temperatures.numel() - 1)]
-            local_temp_samp = sch_temperatures_samp[min(step_idx - 1, sch_temperatures_samp.numel() - 1)]
+            col_idx = min(step_idx - 1, max_step - 1)
+            # Per-sample temperatures: shape (B,). Indexed per batch_idx in
+            # the confidence / sampling blocks below.
+            local_temp = sch_temperatures[:, col_idx]
+            local_temp_samp = sch_temperatures_samp[:, col_idx]
             step_confidence_policy = confidence_policy
-            if step_idx / max(gen_cfg["n_steps"], 1) > gen_cfg["order_cutoff"]:
+            if step_idx / max(max_step, 1) > gen_cfg["order_cutoff"]:
                 step_confidence_policy = "mmada"
             mask_idx = xt == img_mask_id
             if is_unitok and not use_3d:
@@ -1126,13 +1390,25 @@ class DiffuGRPOTrainer(GRPOTrainer):
             if gen_cfg["sample_policy"] == "argmax":
                 x0 = safe_logits.argmax(-1)
             else:
-                temperature = gen_cfg.get("temperature", 0.8)
+                base_temperature = float(gen_cfg.get("temperature", 0.8))
                 if gen_cfg["dynamic_temperature_samp"]:
-                    temperature = temperature * float(local_temp_samp)
-                if temperature <= 0:
-                    x0 = safe_logits.argmax(-1)
+                    # Per-sample scalar temperatures (B,). Broadcast over
+                    # (L, V). CFG mode tripled the batch dim above, so
+                    # replicate the per-sample schedule 3x along dim 0.
+                    temperature_vec = base_temperature * local_temp_samp  # (B,)
+                    if do_cfg:
+                        temperature_vec = temperature_vec.repeat(3)
+                    # Avoid divide-by-zero: rows with temperature<=0 fall
+                    # back to argmax locally.
+                    temperature_vec = torch.clamp(temperature_vec, min=1e-6)
+                    # Shape to (B, 1, 1) to broadcast across L,V.
+                    logits_for_sample = safe_logits / temperature_vec.view(-1, 1, 1)
+                    x0 = torch.distributions.Categorical(logits=logits_for_sample).sample()
                 else:
-                    x0 = torch.distributions.Categorical(logits=safe_logits / temperature).sample()
+                    if base_temperature <= 0:
+                        x0 = safe_logits.argmax(-1)
+                    else:
+                        x0 = torch.distributions.Categorical(logits=safe_logits / base_temperature).sample()
             x0_p = torch.gather(probs, -1, x0.long()[..., None]).squeeze(-1)
             transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
 
@@ -1156,8 +1432,11 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 if k <= 0:
                     continue
 
+                # ``local_temp`` is now a per-sample tensor (B,); pick the
+                # row's scalar for this batch_idx.
+                local_temp_b = float(local_temp[batch_idx].item())
                 if step_confidence_policy == "mask_git":
-                    alg_temp = gen_cfg["alg_temp"] * float(local_temp) if gen_cfg["dynamic_temperature"] else gen_cfg["alg_temp"]
+                    alg_temp = gen_cfg["alg_temp"] * local_temp_b if gen_cfg["dynamic_temperature"] else gen_cfg["alg_temp"]
                     confidence = x0_p[batch_idx] / max(alg_temp, 1e-6)
                     confidence = torch.where(b_mask, confidence, -np.inf)
                     confidence = torch.softmax(confidence, dim=-1)
@@ -1166,7 +1445,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     start = gen_cfg["n_tokens"] - b_n_mask
                     select_index = torch.tensor(unmask_order[start : start + k], device=device, dtype=torch.long)
                 else:
-                    alg_temp = gen_cfg["alg_temp"] * float(local_temp) if gen_cfg["dynamic_temperature"] else gen_cfg["alg_temp"]
+                    alg_temp = gen_cfg["alg_temp"] * local_temp_b if gen_cfg["dynamic_temperature"] else gen_cfg["alg_temp"]
                     confidence = torch.log(x0_p[batch_idx].clamp(1e-20)) + alg_temp * self._image_edit_gumbel_noise(x0_p[batch_idx])
                     confidence = torch.where(b_mask, confidence, -np.inf)
                     _, select_index = torch.topk(confidence, k=k)
@@ -2171,6 +2450,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 if self.modality == "und":
                     gen_inputs = None
                     und_inputs = inputs
+                    ground_inputs = None
                 else:
                     gen_inputs = inputs
                     # Resolve the paired und batch by sample_id (NOT by a
@@ -2199,9 +2479,30 @@ class DiffuGRPOTrainer(GRPOTrainer):
                                     f"source than train_dataset_und?"
                                 )
                             und_inputs.append(u)
+                    # Same pattern for grounding: resolve by sample_id so
+                    # ``ground_inputs[i]`` is always the grounding row for
+                    # ``gen_inputs[i]``.
+                    ground_inputs = None
+                    if self._ground_by_sample_id is not None:
+                        ground_inputs = []
+                        for i, g in enumerate(gen_inputs):
+                            sid = g.get("sample_id") if hasattr(g, "get") else None
+                            if sid is None:
+                                raise ValueError(
+                                    f"gen row {i} is missing 'sample_id' — "
+                                    f"cannot pair with ground row."
+                                )
+                            gr = self._ground_by_sample_id.get(sid)
+                            if gr is None:
+                                raise KeyError(
+                                    f"gen row {i} has sample_id={sid!r} but "
+                                    f"no matching ground row exists."
+                                )
+                            ground_inputs.append(gr)
 
                 gen_and_score = self._generate_and_score_completions(
                     gen_inputs=gen_inputs, und_inputs=und_inputs,
+                    ground_inputs=ground_inputs,
                 )
                 # gen_and_score = {
                 #   "gen": [gen_scoring, gen_advantages, old_gen_logps, ref_gen_logps] or None,
@@ -2263,7 +2564,10 @@ class DiffuGRPOTrainer(GRPOTrainer):
             }
 
     def _generate_and_score_completions(
-        self, gen_inputs: dict[str, Union[torch.Tensor, Any]] = None, und_inputs: dict[str, Union[torch.Tensor, Any]] = None
+        self,
+        gen_inputs: dict[str, Union[torch.Tensor, Any]] = None,
+        und_inputs: dict[str, Union[torch.Tensor, Any]] = None,
+        ground_inputs: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Union[torch.Tensor, Any]]:
 
         device = self.accelerator.device
@@ -2287,9 +2591,42 @@ class DiffuGRPOTrainer(GRPOTrainer):
                         f"gen/und alignment broken at row {i}: "
                         f"gen sample_id={g_id!r} vs und sample_id={u_id!r}"
                     )
+        # Same check for grounding: grounding → image rollout alignment must
+        # hold by sample_id so that predicted_bbox[i] corresponds to
+        # gen_inputs[i].
+        if gen_inputs is not None and ground_inputs is not None:
+            if len(gen_inputs) != len(ground_inputs):
+                raise ValueError(
+                    f"gen/ground length mismatch: {len(gen_inputs)} vs {len(ground_inputs)}"
+                )
+            for i, (g, gr) in enumerate(zip(gen_inputs, ground_inputs)):
+                g_id = g.get("sample_id") if hasattr(g, "get") else None
+                gr_id = gr.get("sample_id") if hasattr(gr, "get") else None
+                if g_id is not None and gr_id is not None and g_id != gr_id:
+                    raise ValueError(
+                        f"gen/ground alignment broken at row {i}: "
+                        f"gen sample_id={g_id!r} vs ground sample_id={gr_id!r}"
+                    )
 
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
             image_processor = self._get_image_processor(unwrapped_model)
+
+            # ---- Grounding rollout (optional) ----
+            # Runs BEFORE the image rollout so the predicted bboxes can be
+            # threaded into _rollout_image_edit_latents. ``predicted_bboxes``
+            # is aligned with gen_inputs by sample_id and index.
+            predicted_bboxes: Optional[list[tuple[float, float, float, float]]] = None
+            if gen_inputs is not None and ground_inputs is not None:
+                predicted_bboxes = [None] * len(ground_inputs)
+                ground_batch_size = 8
+                with _timer(_timings, "grounding_rollout"):
+                    for start_idx in trange(0, len(ground_inputs), ground_batch_size, desc="Grounding Rollout"):
+                        batch_examples = ground_inputs[start_idx : start_idx + ground_batch_size]
+                        batch_bboxes = self._rollout_grounding(
+                            unwrapped_model, batch_examples, image_processor,
+                        )
+                        for offset, bbox in enumerate(batch_bboxes):
+                            predicted_bboxes[start_idx + offset] = bbox
 
             if gen_inputs is not None:
                 image_contexts: list[Optional[dict]] = [None] * len(gen_inputs)
@@ -2298,7 +2635,17 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     for start_idx in trange(0, len(gen_inputs), image_edit_batch_size, desc="Image Rollout"):
                         batch_examples = gen_inputs[start_idx : start_idx + image_edit_batch_size]
                         batch_init_images = [ex.get("image") for ex in batch_examples]
-                        _, batch_contexts = self._rollout_image_edit_latents(unwrapped_model, batch_examples, init_image=batch_init_images)
+                        batch_bboxes = (
+                            predicted_bboxes[start_idx : start_idx + image_edit_batch_size]
+                            if predicted_bboxes is not None
+                            else None
+                        )
+                        _, batch_contexts = self._rollout_image_edit_latents(
+                            unwrapped_model,
+                            batch_examples,
+                            init_image=batch_init_images,
+                            predicted_bbox=batch_bboxes,
+                        )
                         for offset, ctx in enumerate(batch_contexts):
                             image_contexts[start_idx + offset] = ctx
             else:

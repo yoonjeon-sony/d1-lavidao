@@ -622,6 +622,20 @@ class DiffuGRPOConfig(TrainingArguments):
             ),
         },
     )
+    region_edit: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, build a grounding dataset (ground_ds) alongside "
+                "gen_ds / und_ds for datasets that involve gen_dataset "
+                "(thinkmorph_interleave, thinkmorph_edit). The trainer will "
+                "run a per-sample grounding generation before the image "
+                "rollout and feed the predicted bbox into "
+                "_rollout_image_edit_latents. When False, ground_ds is None "
+                "and no grounding rollout is performed."
+            ),
+        },
+    )
 
     # LaVida model/data arguments.
     version: str = field(default="llada")
