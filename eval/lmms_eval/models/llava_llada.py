@@ -968,6 +968,24 @@ class Llava_Llada(lmms):
             flat_image_sizes = []     # [(w, h), ...] aligned with flat_images (image task only)
             task_type = "text"
 
+            # If the batch mixes visual and text-only samples (e.g. scienceqa_full,
+            # mathverse where visual can be []), text-only samples still need a dummy
+            # entry in flat_images. prepare_inputs_labels_for_multimodal's
+            # num_images==0 branch reads image_features[cur_image_idx][0:0] as dummy
+            # padding; without an entry, cur_image_idx runs past len(image_features).
+            batch_has_visuals = any(v is not None and len(v) > 0 for v in batched_visuals)
+
+            def _dummy_image_entry():
+                cs = getattr(self._image_processor, "crop_size", None) or getattr(self._image_processor, "size", None)
+                if isinstance(cs, dict):
+                    h = cs.get("height") or cs.get("shortest_edge") or 384
+                    w = cs.get("width") or cs.get("shortest_edge") or h
+                elif cs is not None:
+                    h = w = int(cs)
+                else:
+                    h = w = 384
+                return torch.zeros(1, 3, h, w, dtype=torch.bfloat16, device=self.device)
+
             # ------------------------------------------------------------------
             # Image rollout: generate edited images before text generation.
             # When do_image_rollout is True, we run _rollout_image_edit on
@@ -1068,7 +1086,11 @@ class Llava_Llada(lmms):
                 # prepare_inputs_labels_for_multimodal sees exactly one entry per <image> token.
                 # The number of <image> tokens this sample will emit equals placeholder_count.
                 if image_tensor is None or (isinstance(image_tensor, list) and len(image_tensor) == 0):
-                    sample_entries = []
+                    if batch_has_visuals:
+                        sample_entries = [_dummy_image_entry()]
+                        flat_image_sizes.append((1, 1))
+                    else:
+                        sample_entries = []
                 elif isinstance(image_tensor, list):
                     sample_entries = list(image_tensor)
                 elif torch.is_tensor(image_tensor):
@@ -1171,6 +1193,8 @@ class Llava_Llada(lmms):
             # prepare_inputs_labels_for_multimodal zips embeds with modalities, so the
             # modalities list must have one entry per batch sample (not per <image> token),
             # otherwise zip silently truncates the batch.
+            if batch_has_visuals and task_type != "video":
+                task_type = "image"
             if task_type == "image":
                 gen_kwargs["image_sizes"] = flat_image_sizes
                 gen_kwargs["modalities"] = ["image"] * len(batched_contexts)
