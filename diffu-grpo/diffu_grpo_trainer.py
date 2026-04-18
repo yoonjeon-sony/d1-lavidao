@@ -1187,6 +1187,17 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 y0_r = (y0_o + pad_y) * scale
                 x1_r = (x1_o + pad_x) * scale
                 y1_r = (y1_o + pad_y) * scale
+                # Inflate bbox by ``BBOX_GRID_MARGIN`` (15%) before snapping
+                # so the latent-grid mask covers a ring of cells around the
+                # detected region — gives the diffusion loop room to blend
+                # the edited region into the surrounding image.
+                BBOX_GRID_MARGIN = 0.15
+                mx = (x1_r - x0_r) * BBOX_GRID_MARGIN / 2.0
+                my = (y1_r - y0_r) * BBOX_GRID_MARGIN / 2.0
+                x0_r = max(0.0, x0_r - mx)
+                y0_r = max(0.0, y0_r - my)
+                x1_r = min(float(image_resolution), x1_r + mx)
+                y1_r = min(float(image_resolution), y1_r + my)
                 if x1_r <= x0_r:
                     x1_r = min(float(image_resolution), x0_r + 1.0)
                 if y1_r <= y0_r:
