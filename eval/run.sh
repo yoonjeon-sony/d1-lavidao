@@ -13,6 +13,9 @@
 # CKPT=/group2/dgm/yoonjeon/LaViDa-O
 # CKPT="/group2/dgm/yoonjeon/ckpts/sft_LaViDa-O-thinkmorph_zebracot/checkpoint-9000"
 CKPT="/scratch2/yoonjeon.kim/sft_LaViDa-O-thinkmorph_zebracot-step9000"
+# CKPT="/scratch2/yoonjeon.kim/rl-lavidao-thinkmorph/thinkmorph_interleave-Unified-LavidaO/checkpoint-50"
+# CKPT="/scratch2/yoonjeon.kim/rl-lavidao-thinkmorph/thinkmorph_interleave-LavidaO/checkpoint-50"
+# CKPT="/scratch2/yoonjeon.kim/rl-lavidao-thinkmorph/thinkmorph_answer-LavidaO/checkpoint-50"
 # CKPT="/scratch2/yoonjeon.kim/LaViDa-O"
 LLADA_VISION_ENCODER="google/siglip-so400m-patch14-384"
 set -x
@@ -37,10 +40,14 @@ DO_IMAGE_ROLLOUT=${DO_IMAGE_ROLLOUT:-false}
 
 MODEL_NAME=$(basename "$(dirname "$CKPT")")-$(basename "$CKPT")
 BASE_DIR="TEST"
+IMAGE_ROLLOUT_SAVE_DIR=${IMAGE_ROLLOUT_SAVE_DIR:-${OUTPUT_DIR}}
+export IMAGE_ROLLOUT_SAVE_DIR
 OUTPUT_DIR="${BASE_DIR}/tok${MAX_NEW_TOKENS}_blk${BLOCK_LENGTH}_step${STEP_PER_BLOCK}_t${TEMPERATURE}/${MODEL_NAME}"
+
 if [ "$DO_IMAGE_ROLLOUT" = "true" ]; then
     OUTPUT_DIR="${OUTPUT_DIR}_image"
 fi
+IMAGE_ROLLOUT_SAVE_DIR=${IMAGE_ROLLOUT_SAVE_DIR:-"${OUTPUT_DIR}/gen_images"}
 
 run_eval() {
     local bs=$1
@@ -53,7 +60,6 @@ run_eval() {
         --model_args pretrained=$CKPT,conv_template=llada,model_name=llava_llada \
         --tasks $TASKS \
         --batch_size $bs \
-        --limit $LIMIT \
         --gen_kwargs prefix_lm=True,max_new_tokens=${MAX_NEW_TOKENS},block_length=${BLOCK_LENGTH},step_per_block=${STEP_PER_BLOCK},temperature=${TEMPERATURE},do_image_rollout=${DO_IMAGE_ROLLOUT} \
         --log_samples \
         --log_samples_suffix llava_llada \

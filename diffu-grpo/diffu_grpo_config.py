@@ -637,6 +637,15 @@ class DiffuGRPOConfig(TrainingArguments):
         },
     )
 
+    # Model type selector: "lavida" (default) or "mmada".
+    model_type: str = field(
+        default="lavida",
+        metadata={
+            "help": "Which model family to use. 'lavida' for LaVida-O, 'mmada' for MMaDA. "
+            "Auto-detected from model_path/model_name_or_path when set to 'auto'."
+        },
+    )
+
     # LaVida model/data arguments.
     version: str = field(default="llada")
     load_vlm: bool = field(default=True)

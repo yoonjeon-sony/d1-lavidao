@@ -48,6 +48,7 @@ from data_utils import (
 )
 from diffu_grpo_config import DiffuGRPOConfig
 from diffu_grpo_trainer import DiffuGRPOTrainer
+from mmada_grpo_trainer import MMaDAGRPOTrainer
 from reward_func import (
     boxed_and_answer_tags_format_reward,
     coding_reward_func,
@@ -60,6 +61,20 @@ from reward_func import (
     sudoku_reward_func,
     xmlcount_reward_func,
 )
+
+
+def _resolve_model_type(args: DiffuGRPOConfig, model_config: ModelConfig) -> str:
+    """Return 'lavida' or 'mmada' based on args.model_type or auto-detection from model path."""
+    mt = args.model_type.lower()
+    if mt not in ("lavida", "mmada", "auto"):
+        raise ValueError(f"model_type must be 'lavida', 'mmada', or 'auto', got {mt!r}")
+    if mt != "auto":
+        return mt
+    # Auto-detect from model path
+    path = (model_config.model_name_or_path or args.model_path or "").lower()
+    if "mmada" in path:
+        return "mmada"
+    return "lavida"
 
 
 def _resolve_model_name_or_path(args: DiffuGRPOConfig, model_config: ModelConfig) -> str:
@@ -148,6 +163,69 @@ def init_lavida_model_and_tokenizer(args: DiffuGRPOConfig, model_config: ModelCo
     model.config.mm_vision_tower_lr = args.mm_vision_tower_lr
     model.config.mm_projector_lr = args.mm_projector_lr
     return model, tokenizer
+
+
+def init_mmada_model_and_tokenizer(args: DiffuGRPOConfig, model_config: ModelConfig):
+    """Initialize MMaDA model and tokenizer."""
+    MMADA_ROOT = REPO_ROOT / "MMaDA"
+    if str(MMADA_ROOT) not in sys.path:
+        sys.path.insert(0, str(MMADA_ROOT))
+
+    from models.modeling_mmada import MMadaModelLM
+    from training.prompting_utils import UniversalPrompting
+
+    model_name_or_path = _resolve_model_name_or_path(args, model_config)
+    if not model_name_or_path:
+        raise ValueError("model_name_or_path or model_path is required for MMaDA loading.")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+    uni_prompting = UniversalPrompting(
+        tokenizer,
+        max_prompt_len=args.max_prompt_length,
+        max_gen_length=args.max_completion_length,
+        ignore_id=-100,
+    )
+
+    model = MMadaModelLM.from_pretrained(
+        model_name_or_path,
+        torch_dtype=torch.bfloat16 if args.bf16 else None,
+    )
+    model.config.use_cache = False
+
+    mask_id = tokenizer.encode("<|mdm_mask|>")[0]
+    pad_id = tokenizer.encode("<|endoftext|>")[0]
+
+    # Store MMaDA-specific ids on the config for downstream use.
+    args.mask_id = mask_id
+    model.config.mask_id = mask_id
+    model.config.pad_id = pad_id
+
+    tokenizer.padding_side = "left"
+    return model, tokenizer, uni_prompting
+
+
+def _build_mmada_optimizer(model, args: DiffuGRPOConfig):
+    """Build optimizer for MMaDA with no-decay groups."""
+    no_decay = ["bias", "layer_norm.weight", "mlm_ln.weight", "embeddings.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [
+                p for n, p in model.named_parameters()
+                if p.requires_grad and not any(nd in n for nd in no_decay)
+            ],
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "params": [
+                p for n, p in model.named_parameters()
+                if p.requires_grad and any(nd in n for nd in no_decay)
+            ],
+            "weight_decay": 0.0,
+        },
+    ]
+
+    optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(args)
+    return optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
 
 def _set_trainable_parameters(model, mm_tunable_parts: Optional[str]):
@@ -470,22 +548,41 @@ def main(grpo_config, model_config):
     else:
         train_set = dataset
 
-    model, tokenizer = init_lavida_model_and_tokenizer(grpo_config, model_config)
-    _set_trainable_parameters(model, grpo_config.mm_tunable_parts)
-    _log_trainable_ratio(model)
-    optimizer = _build_optimizer(model, grpo_config)
+    resolved_model_type = _resolve_model_type(grpo_config, model_config)
 
-    trainer = DiffuGRPOTrainer(
-        args=grpo_config,
-        model=model,
-        processing_class=tokenizer,
-        reward_funcs=reward_functions,
-        train_dataset=train_set,
-        train_dataset_und=und_train_set,
-        train_dataset_ground=ground_train_set,
-        optimizers=(optimizer, None),
-        modality=modality,
-    )
+    if resolved_model_type == "mmada":
+        model, tokenizer, uni_prompting = init_mmada_model_and_tokenizer(grpo_config, model_config)
+        _log_trainable_ratio(model)
+        optimizer = _build_mmada_optimizer(model, grpo_config)
+
+        trainer = MMaDAGRPOTrainer(
+            args=grpo_config,
+            model=model,
+            processing_class=tokenizer,
+            reward_funcs=reward_functions,
+            train_dataset=train_set,
+            train_dataset_und=und_train_set,
+            train_dataset_ground=ground_train_set,
+            optimizers=(optimizer, None),
+            modality=modality,
+        )
+    else:
+        model, tokenizer = init_lavida_model_and_tokenizer(grpo_config, model_config)
+        _set_trainable_parameters(model, grpo_config.mm_tunable_parts)
+        _log_trainable_ratio(model)
+        optimizer = _build_optimizer(model, grpo_config)
+
+        trainer = DiffuGRPOTrainer(
+            args=grpo_config,
+            model=model,
+            processing_class=tokenizer,
+            reward_funcs=reward_functions,
+            train_dataset=train_set,
+            train_dataset_und=und_train_set,
+            train_dataset_ground=ground_train_set,
+            optimizers=(optimizer, None),
+            modality=modality,
+        )
 
     if grpo_config.save_steps % grpo_config.num_iterations != 0:
         warnings.warn(
