@@ -1253,9 +1253,9 @@ class DiffuGRPOTrainer(GRPOTrainer):
         # Step 4: per-sample n_steps ∝ n_mask / n_tokens * n_steps_total.
         # max_step = max(1, int(n_steps_total * max_n_mask / n_tokens)) bounds
         # the (B, max_step) schedule tensors below.
-        max_step = max(1, int(n_steps_total * max_n_mask / n_tokens))
+        max_step = max(1, int((n_steps_total - 15) * max_n_mask / n_tokens + 15))
         n_steps_per_sample = (
-            (n_mask_per_sample.float() * n_steps_total / float(n_tokens))
+            (n_mask_per_sample.float() * (n_steps_total - 15) / float(n_tokens) + 15) 
             .to(torch.int64)
             .clamp(min=0, max=max_step)
         )
@@ -1263,7 +1263,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
         has_mask = n_mask_per_sample > 0
         n_steps_per_sample = torch.where(
             has_mask & (n_steps_per_sample == 0),
-            torch.ones_like(n_steps_per_sample),
+            torch.ones_like(n_steps_per_sample) * 15,
             n_steps_per_sample,
         )
 
@@ -1512,30 +1512,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 if image_array.ndim == 3 and image_array.shape[-1] == 1:
                     image_array = image_array[..., 0]
                 decoded_image_obj = Image.fromarray(image_array)
-
-            if DIFFU_GRPO_DEBUG and predicted_bbox is not None:
-                bbox = predicted_bbox[batch_idx]
-                if bbox is not None and not (
-                    float(bbox[0]) == 0.0 and float(bbox[1]) == 0.0
-                    and float(bbox[2]) == 0.0 and float(bbox[3]) == 0.0
-                ):
-                    from PIL import ImageDraw
-                    if decoded_image_obj.mode != "RGB":
-                        decoded_image_obj = decoded_image_obj.convert("RGB")
-                    W, H = image_sizes[batch_idx]
-                    x0, y0, x1, y1 = [float(v) for v in bbox[:4]]
-                    # LOC-space (0-1024) → original pixel coords → padded square → resized.
-                    square_size = float(max(W, H))
-                    pad_x = (square_size - W) / 2.0
-                    pad_y = (square_size - H) / 2.0
-                    scale = image_resolution / square_size
-                    x0_r = (x0 * W / 1024.0 + pad_x) * scale
-                    y0_r = (y0 * H / 1024.0 + pad_y) * scale
-                    x1_r = (x1 * W / 1024.0 + pad_x) * scale
-                    y1_r = (y1 * H / 1024.0 + pad_y) * scale
-                    ImageDraw.Draw(decoded_image_obj).rectangle(
-                        [x0_r, y0_r, x1_r, y1_r], outline=(255, 0, 0), width=4
-                    )
 
             decoded_image_path = rollout_dir / f"{safe_sample_id}_{os.getpid()}_{batch_idx}.png"
             if hasattr(decoded_image_obj, "save"):
