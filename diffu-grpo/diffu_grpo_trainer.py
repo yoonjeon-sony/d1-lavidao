@@ -1235,6 +1235,19 @@ class DiffuGRPOTrainer(GRPOTrainer):
         if is_unitok and not use_3d:
             mask_idx_sched = mask_idx_sched[:, 0, :]
         n_mask_per_sample = mask_idx_sched.sum(dim=1)  # (B,)
+        if DIFFU_GRPO_DEBUG:
+            _debug_log(
+                f"image_edit n_mask_per_sample={n_mask_per_sample.tolist()} "
+                f"(grid_tokens={grid_tokens}, region_mode={region_mode})"
+            )
+        assert (n_mask_per_sample > 0).all(), (
+            f"image_edit rollout: every sample must have at least one masked "
+            f"token, got n_mask_per_sample={n_mask_per_sample.tolist()}"
+        )
+        # Preserved for the debug renderer; ``n_mask_per_sample`` is rebound
+        # inside the diffusion loop as tokens get unmasked, so we snapshot
+        # the post-init count here.
+        init_n_mask_per_sample = n_mask_per_sample.clone()
         max_n_mask = int(n_mask_per_sample.max().item())
 
         # Step 4: per-sample n_steps ∝ n_mask / n_tokens * n_steps_total.
@@ -1554,6 +1567,10 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     "prompt_len_tokens": per_row_prompt_lens[batch_idx],
                     "completion_len_tokens": row_completion_len,
                     "n_steps_per_sample": int(n_steps_per_sample[batch_idx].item()),
+                    "n_mask_init": int(init_n_mask_per_sample[batch_idx].item()),
+                    "mask_idx_2d": mask_idx_2d[batch_idx].view(grid_h, grid_w).detach().cpu(),
+                    "gen_shape": (int(grid_h), int(grid_w)),
+                    "image_resolution": int(image_resolution),
                     "payload": {
                         "id": sample_id,
                         "image_gen": str(decoded_image_path),
@@ -3053,6 +3070,27 @@ class DiffuGRPOTrainer(GRPOTrainer):
                             if not isinstance(gt_img, Image.Image):
                                 gt_img = None
 
+                        # Pull bbox-region mask info attached by the image-edit
+                        # rollout. mask_idx_2d is (grid_h, grid_w) bool on CPU;
+                        # nearest-resize to comp_img.size matches the padded-square
+                        # layout the decoded image lives in, so the latent grid
+                        # cells line up with the image pixels they represent.
+                        ctx = image_contexts[dbg_idx]
+                        mask_idx_2d_dbg = ctx.get("mask_idx_2d")
+                        n_mask_init = ctx.get("n_mask_init", 0)
+                        n_steps_dbg = ctx.get("n_steps_per_sample", 0)
+                        if comp_img is not None and mask_idx_2d_dbg is not None:
+                            mask_np = mask_idx_2d_dbg.numpy().astype("uint8") * 255
+                            mask_pil = Image.fromarray(mask_np, mode="L").resize(
+                                comp_img.size, Image.NEAREST
+                            )
+                            # Semi-transparent green overlay (alpha 90/255 ~35%).
+                            overlay = Image.new("RGBA", comp_img.size, (0, 255, 0, 0))
+                            overlay.putalpha(mask_pil.point(lambda v: 90 if v >= 128 else 0))
+                            comp_img = Image.alpha_composite(
+                                comp_img.convert("RGBA"), overlay
+                            ).convert("RGB")
+
                         if comp_img is not None and gt_img is not None:
                             # Resize both to same height
                             h = max(comp_img.height, gt_img.height)
@@ -3064,7 +3102,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
                             prompt_text = gen_prompts[dbg_idx]
                             prompt_text = prompt_text.replace("<|reserved_token_5|>", "*").replace("<|reserved_token_6|>", "-")
 
-                            font_size = 18
+                            font_size = 28
                             try:
                                 font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
                             except (IOError, OSError):
@@ -3074,12 +3112,14 @@ class DiffuGRPOTrainer(GRPOTrainer):
                             chars_per_line = max(1, concat_w // (font_size * 2 // 3))
                             wrapped_lines = textwrap.wrap(prompt_text, width=chars_per_line)
 
-                            # Reward text
+                            # Reward text + per-sample diffusion stats line
                             reward_val = float(gen_rewards_per_func[dbg_idx, 0].item())
                             reward_text = f"Perceptual Reward: {reward_val:.4f}"
+                            info_text = f"n_mask={n_mask_init}  n_steps={n_steps_dbg}"
 
                             line_height = font_size + 4
-                            text_height = (len(wrapped_lines) + 2) * line_height  # +2 for gap and reward line
+                            # +3 lines: gap, reward line, info line
+                            text_height = (len(wrapped_lines) + 3) * line_height
                             total_h = h + text_height
 
                             canvas = Image.new("RGB", (concat_w, total_h), (255, 255, 255))
@@ -3092,13 +3132,21 @@ class DiffuGRPOTrainer(GRPOTrainer):
                                 draw.text((4, y_pos), line, fill=(0, 0, 0), font=font)
                                 y_pos += line_height
 
-                            # Reward centered at bottom
+                            # Reward centered, then info line directly below
                             try:
                                 rw_bbox = draw.textbbox((0, 0), reward_text, font=font)
                                 rw = rw_bbox[2] - rw_bbox[0]
                             except AttributeError:
                                 rw = len(reward_text) * (font_size * 2 // 3)
-                            draw.text(((concat_w - rw) // 2, y_pos + line_height // 2), reward_text, fill=(0, 0, 200), font=font)
+                            reward_y = y_pos + line_height // 2
+                            draw.text(((concat_w - rw) // 2, reward_y), reward_text, fill=(0, 0, 200), font=font)
+
+                            try:
+                                iw_bbox = draw.textbbox((0, 0), info_text, font=font)
+                                iw = iw_bbox[2] - iw_bbox[0]
+                            except AttributeError:
+                                iw = len(info_text) * (font_size * 2 // 3)
+                            draw.text(((concat_w - iw) // 2, reward_y + line_height), info_text, fill=(0, 0, 200), font=font)
 
                             rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
                             save_path = debug_dir / f"step{self._step}_rank{rank}.png"
