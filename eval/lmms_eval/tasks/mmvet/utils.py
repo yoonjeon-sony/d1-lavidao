@@ -60,7 +60,12 @@ Can you explain this meme? | This meme is poking fun at the fact that the names 
 """
 
 
-def get_chat_response(prompt, model=GPT_EVAL_MODEL_NAME, temperature=0.0, max_tokens=128, patience=3, sleep_time=5):
+def _is_reasoning_model(model: str) -> bool:
+    m = model.lower()
+    return m.startswith(("o1", "o3", "o4", "gpt-5"))
+
+
+def get_chat_response(prompt, model=GPT_EVAL_MODEL_NAME, temperature=0.0, max_tokens=128, patience=8, sleep_time=30):
     headers = {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json",
@@ -73,9 +78,15 @@ def get_chat_response(prompt, model=GPT_EVAL_MODEL_NAME, temperature=0.0, max_to
     payload = {
         "model": model,
         "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
     }
+    if _is_reasoning_model(model):
+        # Reasoning models reject `max_tokens` and non-default temperature; they
+        # also need enough budget to cover hidden reasoning tokens before the
+        # final numeric score, so bump well above the 128-token chat default.
+        payload["max_completion_tokens"] = max(max_tokens, 2048)
+    else:
+        payload["temperature"] = temperature
+        payload["max_tokens"] = max_tokens
 
     if API_TYPE == "azure":
         payload.pop("model")
@@ -87,8 +98,10 @@ def get_chat_response(prompt, model=GPT_EVAL_MODEL_NAME, temperature=0.0, max_to
                 API_URL,
                 headers=headers,
                 json=payload,
-                timeout=60,
+                timeout=120,
             )
+            if not response.ok:
+                eval_logger.error(f"HTTP {response.status_code} body: {response.text[:500]}")
             response.raise_for_status()
             response_data = response.json()
 
@@ -97,10 +110,12 @@ def get_chat_response(prompt, model=GPT_EVAL_MODEL_NAME, temperature=0.0, max_to
                 return content, response_data["model"]
 
         except Exception as e:
-            eval_logger.error(f"Error: {e}")
-            if "Rate limit" in str(e):
-                eval_logger.info("Sleeping due to rate limit...")
+            msg = str(e)
+            eval_logger.error(f"Error: {msg}")
+            if "429" in msg or "Too Many Requests" in msg or "Rate limit" in msg:
+                eval_logger.info(f"Rate-limited; sleeping {sleep_time}s...")
                 time.sleep(sleep_time)
+                sleep_time = min(sleep_time * 2, 300)  # exponential backoff
             eval_logger.info(f"Retrying...Patience left: {patience}")
 
     return "", ""
