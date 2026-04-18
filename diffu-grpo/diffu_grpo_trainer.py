@@ -1215,6 +1215,12 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 cols = torch.arange(gx0, gx1, device=device, dtype=torch.long)
                 tokens = (rows[:, None] * grid_w + cols[None, :]).reshape(-1)
                 mask_idx_2d[b, tokens] = True
+                # Outside the bbox, randomly mask 50% of the remaining tokens
+                # so the diffusion loop can refresh surrounding context while
+                # still anchoring on the localized region.
+                outside = ~mask_idx_2d[b]
+                random_outside = torch.rand(grid_tokens, device=device) < 0.5
+                mask_idx_2d[b] |= outside & random_outside
         else:
             mask_idx_2d[:] = True
 
@@ -1264,9 +1270,9 @@ class DiffuGRPOTrainer(GRPOTrainer):
         # Step 4: per-sample n_steps ∝ n_mask / n_tokens * n_steps_total.
         # max_step = max(1, int(n_steps_total * max_n_mask / n_tokens)) bounds
         # the (B, max_step) schedule tensors below.
-        max_step = max(1, int((n_steps_total - 15) * max_n_mask / n_tokens + 15))
+        max_step = max(1, int((n_steps_total) * max_n_mask / n_tokens))
         n_steps_per_sample = (
-            (n_mask_per_sample.float() * (n_steps_total - 15) / float(n_tokens) + 15) 
+            (n_mask_per_sample.float() * (n_steps_total) / float(n_tokens)) 
             .to(torch.int64)
             .clamp(min=0, max=max_step)
         )
@@ -1274,7 +1280,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
         has_mask = n_mask_per_sample > 0
         n_steps_per_sample = torch.where(
             has_mask & (n_steps_per_sample == 0),
-            torch.ones_like(n_steps_per_sample) * 15,
+            torch.ones_like(n_steps_per_sample),
             n_steps_per_sample,
         )
 
