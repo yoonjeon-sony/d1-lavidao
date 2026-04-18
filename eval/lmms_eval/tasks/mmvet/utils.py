@@ -18,6 +18,7 @@ import pandas as pd
 import requests
 import yaml
 from loguru import logger as eval_logger
+from openai import AzureOpenAI, OpenAI
 
 with open(Path(__file__).parent / "mmvet.yaml", "r") as f:
     raw_data = f.readlines()
@@ -65,57 +66,49 @@ def _is_reasoning_model(model: str) -> bool:
     return m.startswith(("o1", "o3", "o4", "gpt-5"))
 
 
-def get_chat_response(prompt, model=GPT_EVAL_MODEL_NAME, temperature=0.0, max_tokens=128, patience=8, sleep_time=30):
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json",
-    }
+_openai_client = None
 
-    messages = [
-        {"role": "user", "content": prompt},
-    ]
 
-    payload = {
-        "model": model,
-        "messages": messages,
-    }
-    if _is_reasoning_model(model):
-        # Reasoning models reject `max_tokens` and non-default temperature; they
-        # also need enough budget to cover hidden reasoning tokens before the
-        # final numeric score, so bump well above the 128-token chat default.
-        payload["max_completion_tokens"] = max(max_tokens, 2048)
-    else:
-        payload["temperature"] = temperature
-        payload["max_tokens"] = max_tokens
-
+def _get_openai_client():
+    # Lazy init so module import does not fail when keys are absent.
+    global _openai_client
+    if _openai_client is not None:
+        return _openai_client
     if API_TYPE == "azure":
-        payload.pop("model")
+        _openai_client = AzureOpenAI(
+            api_key=API_KEY,
+            azure_endpoint=os.getenv("AZURE_ENDPOINT", API_URL),
+            api_version=os.getenv("AZURE_API_VERSION", "2025-03-01-preview"),
+            max_retries=8,
+        )
+    else:
+        _openai_client = OpenAI(api_key=API_KEY, max_retries=8)
+    return _openai_client
+
+
+def get_chat_response(prompt, model=GPT_EVAL_MODEL_NAME, temperature=0.0, max_tokens=128, patience=5, sleep_time=30):
+    client = _get_openai_client()
+    kwargs = {"model": model, "input": prompt}
+    if _is_reasoning_model(model):
+        # Simple scoring task — skip reasoning to save tokens and latency.
+        kwargs["reasoning"] = {"effort": "none"}
+    else:
+        kwargs["temperature"] = temperature
 
     while patience > 0:
         patience -= 1
         try:
-            response = requests.post(
-                API_URL,
-                headers=headers,
-                json=payload,
-                timeout=120,
-            )
-            if not response.ok:
-                eval_logger.error(f"HTTP {response.status_code} body: {response.text[:500]}")
-            response.raise_for_status()
-            response_data = response.json()
-
-            content = response_data["choices"][0]["message"]["content"].strip()
-            if content != "":
-                return content, response_data["model"]
-
+            response = client.responses.create(**kwargs)
+            content = (response.output_text or "").strip()
+            if content:
+                return content, getattr(response, "model", model)
         except Exception as e:
             msg = str(e)
-            eval_logger.error(f"Error: {msg}")
+            eval_logger.error(f"OpenAI Responses API error: {msg}")
             if "429" in msg or "Too Many Requests" in msg or "Rate limit" in msg:
                 eval_logger.info(f"Rate-limited; sleeping {sleep_time}s...")
                 time.sleep(sleep_time)
-                sleep_time = min(sleep_time * 2, 300)  # exponential backoff
+                sleep_time = min(sleep_time * 2, 300)
             eval_logger.info(f"Retrying...Patience left: {patience}")
 
     return "", ""
