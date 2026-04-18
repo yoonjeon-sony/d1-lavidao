@@ -14,7 +14,7 @@ generation_kwargs:
   num_beams: 1
   factor: 1
   block_length: 16
-  use_fast_dlm: true
+  use_fast_dlm: false
   do_sample: false
 process_results: !function utils.mathvista_process_results
 metric_list:

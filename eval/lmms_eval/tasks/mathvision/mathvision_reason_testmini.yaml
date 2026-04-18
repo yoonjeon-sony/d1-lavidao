@@ -11,7 +11,7 @@ generation_kwargs:
   max_new_tokens: 1024
   block_length: 32
   factor: 1
-  use_fast_dlm: true
+  use_fast_dlm: false
   temperature: 0
   top_p: 1.0
   num_beams: 1

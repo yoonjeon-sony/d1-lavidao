@@ -19,4 +19,4 @@ generation_kwargs:
   do_sample: false
   factor: 1
   block_length: 16
-  use_fast_dlm: true
+  use_fast_dlm: false
