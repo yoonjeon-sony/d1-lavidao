@@ -864,38 +864,49 @@ class DiffuGRPOTrainer(GRPOTrainer):
             device=device,
         )
 
-        # NOTE: per user request, the grounding rollout uses model.generate
-        # (not llada_generate). We pass the batched prompt_mask so padded
-        # positions do not attend.
+        # One-step argmax decode of the 4 <|mdm_mask|> bbox tokens, mirroring
+        # llava/eval/predict_grounding.py: build multimodal embeds, take a
+        # single forward, argmax the mask positions, parse <LOC_xxx> ids.
+        mask_id = 126336
         with torch.no_grad():
-            pred = model.generate(
+            (
+                _,
+                position_ids,
+                attention_mask,
+                _,
+                inputs_embeds,
+                _,
+                raw_input_ids,
+            ) = model.prepare_inputs_labels_for_multimodal(
                 input_ids,
-                attention_mask=prompt_mask,
-                images=image_tensor,
+                None,
+                prompt_mask,
+                None,
+                None,
+                image_tensor,
+                ["image"] * input_ids.shape[0],
                 image_sizes=image_sizes,
-                do_sample=False,
-                temperature=0,
-                max_new_tokens=64,
-                block_length=64,
-                step_ratio=1.0,  # 32 steps
-                tokenizer=self.processing_class,
-                prefix_lm=True,
+                return_inputs=True,
             )
+            logits = llada_get_logits(model.model, inputs_embeds)
+            box_predictions = logits[raw_input_ids == mask_id].argmax(-1).view(-1, 4)
 
-        answers = self.processing_class.batch_decode(pred, skip_special_tokens=True)
+        res = self.processing_class.batch_decode(box_predictions)
+        loc_pat = re.compile(r"<LOC_([0-9]+)>")
         predicted_bboxes: list[tuple[float, float, float, float]] = []
-        for answer in answers:
-            matches = re.findall(self._GROUNDING_BBOX_PATTERN, answer)
-            try:
-                predict_bbox = (
-                    float(matches[0][0]),
-                    float(matches[0][1]),
-                    float(matches[0][2]),
-                    float(matches[0][3]),
+        for row_idx, row in enumerate(res):
+            coords = [int(y) for y in loc_pat.findall(row)]
+            if len(coords) == 4:
+                predicted_bboxes.append(
+                    (float(coords[0]), float(coords[1]), float(coords[2]), float(coords[3]))
                 )
-            except Exception:
-                predict_bbox = (0.0, 0.0, 0.0, 0.0)
-            predicted_bboxes.append(predict_bbox)
+            else:
+                warnings.warn(
+                    f"Grounding rollout: expected 4 <LOC_*> coords, got {len(coords)} "
+                    f"for row {row_idx}; decoded={row!r}. Falling back to (0,0,0,0).",
+                    stacklevel=2,
+                )
+                predicted_bboxes.append((0.0, 0.0, 0.0, 0.0))
         return predicted_bboxes
 
     def _normalize_mm_image_payload(self, image_tensor: Any, *, dtype: torch.dtype, device: torch.device) -> list[torch.Tensor]:
