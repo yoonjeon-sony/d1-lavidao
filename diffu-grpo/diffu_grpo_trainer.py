@@ -3077,9 +3077,8 @@ class DiffuGRPOTrainer(GRPOTrainer):
                             mask_pil = Image.fromarray(mask_np, mode="L").resize(
                                 comp_img.size, Image.NEAREST
                             )
-                            # Semi-transparent green overlay (alpha 90/255 ~35%).
                             overlay = Image.new("RGBA", comp_img.size, (0, 255, 0, 0))
-                            overlay.putalpha(mask_pil.point(lambda v: 90 if v >= 128 else 0))
+                            overlay.putalpha(mask_pil.point(lambda v: 10 if v >= 128 else 0))
                             comp_img = Image.alpha_composite(
                                 comp_img.convert("RGBA"), overlay
                             ).convert("RGB")

@@ -18,12 +18,19 @@ DEBUG="${DEBUG:-0}"
 
 mkdir -p "$TRITON_CACHE_DIR"
 chmod 700 "$TRITON_CACHE_DIR"
-DATASET="thinkmorph_answer" # thinkmorph_interleave thinkmorph_answer thinkmorph_edit
-RUN_NAME=${DATASET}-LavidaO
-# MODEL_PATH="/scratch2/yoonjeon.kim/sft_LaViDa-O-thinkmorph_zebracot-step9000"
-# OUTPUT_DIR=/scratch2/yoonjeon.kim/rl-lavidao-thinkmorph/$RUN_NAME
-MODEL_PATH="/group2/dgm/yoonjeon/ckpts/sft_LaViDa-O-thinkmorph_zebracot/checkpoint-9000"
-OUTPUT_DIR="/group2/dgm/yoonjeon/ckpts/rl-lavidao-thinkmorph/$RUN_NAME"
+DATASET="thinkmorph_interleave" # thinkmorph_interleave thinkmorph_answer thinkmorph_edit
+
+REGION_EDIT=true
+if [ "$REGION_EDIT" = true ]; then
+    DATA_NAME="${DATASET}-region-edit"
+else
+    DATA_NAME="${DATASET}"
+fi
+RUN_NAME=${DATA_NAME}-LavidaO
+MODEL_PATH="/scratch2/yoonjeon.kim/sft_LaViDa-O-thinkmorph_zebracot-step9000"
+OUTPUT_DIR=/scratch2/yoonjeon.kim/rl-lavidao-thinkmorph/$RUN_NAME
+# MODEL_PATH="/group2/dgm/yoonjeon/ckpts/sft_LaViDa-O-thinkmorph_zebracot/checkpoint-9000"
+# OUTPUT_DIR="/group2/dgm/yoonjeon/ckpts/rl-lavidao-thinkmorph/$RUN_NAME"
 
 # ----------------------------
 # Model initialization configs
@@ -113,7 +120,7 @@ if [[ "${DEBUG}" == "1" || "${DEBUG,,}" == "true" ]]; then
     MAX_STEPS=20
     LOGGING_STEPS=1
     SAVE_STEPS=100000
-    IMAGE_EDIT_N_STEPS=4
+    IMAGE_EDIT_N_STEPS=64
     MAX_COMPLETION_LENGTH=128
     DIFFUSION_STEPS=64
     RETURN_DEBUG_ARTIFACTS=true
@@ -144,7 +151,7 @@ GRAD_ACCUM_STEPS=$(
   ))
 )
 
-/home/yoonjeon.kim/dLLM-RL/train_sft/.venv/bin/python -m accelerate.commands.launch \
+python -m accelerate.commands.launch \
     --config_file ./diffu-grpo/accelerate.yaml \
     --num_processes $NUM_PROCESSES \
     --num_machines 1 \
@@ -222,4 +229,5 @@ GRAD_ACCUM_STEPS=$(
     --report_to wandb \
     --save_steps $SAVE_STEPS \
     --logging_steps $LOGGING_STEPS \
+    --region_edit $REGION_EDIT \
     --text_rollout_use_gen_image true
