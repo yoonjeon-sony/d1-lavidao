@@ -6,12 +6,15 @@ import re
 import sys
 import time
 import warnings
-from contextlib import contextmanager
 from pathlib import Path
+from contextlib import contextmanager
+
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 from types import SimpleNamespace
 from tqdm import tqdm, trange
 import numpy as np
+
+import math
 import torch
 import torch.nn.functional as F
 import transformers
@@ -19,7 +22,6 @@ from accelerate.utils import DistributedType, gather, gather_object
 from datasets import Dataset, IterableDataset
 from torch import nn
 from torch.utils.data import DataLoader, Subset, ConcatDataset
-import math
 
 import wandb
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, Trainer, TrainerCallback
