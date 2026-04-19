@@ -12,8 +12,13 @@
 
 # CKPT=/group2/dgm/yoonjeon/LaViDa-O
 # CKPT="/group2/dgm/yoonjeon/ckpts/sft_LaViDa-O-thinkmorph_zebracot/checkpoint-9000"
+CKPT="/scratch2/yoonjeon.kim/LaViDa-O"
 CKPT="/scratch2/yoonjeon.kim/sft_LaViDa-O-thinkmorph_zebracot-step9000"
-# CKPT="/scratch2/yoonjeon.kim/LaViDa-O"
+CKPT="/scratch2/yoonjeon.kim/rl-lavidao-thinkmorph/thinkmorph_interleave-LavidaO/checkpoint-100"
+# CKPT="/scratch2/yoonjeon.kim/rl-lavidao-thinkmorph/thinkmorph_interleave-Unified-LavidaO/checkpoint-100"
+# CKPT="/scratch2/yoonjeon.kim/rl-lavidao-thinkmorph/thinkmorph_answer-LavidaO/checkpoint-100"
+# CKPT="/scratch2/yoonjeon.kim/rl-lavidao-thinkmorph/thinkmorph_edit-LavidaO/checkpoint-100"
+
 LLADA_VISION_ENCODER="google/siglip-so400m-patch14-384"
 set -x
 LIMIT=${LIMIT:-}
@@ -23,8 +28,9 @@ if [ -n "$LIMIT" ]; then
     EXTRA_ARGS+=(--limit "$LIMIT")
 fi
 BATCH_SIZE=${BATCH_SIZE:-32}
-export TASKS=${TASKS:-"mmvet"}
-# ,mmmu_val,mmbench_en_dev,textvqa_val,docvqa_val,chartqa,infovqa_val,scienceqa_full,ai2d,mathverse_testmini_vision_dominant,mathvista_testmini_format
+export TASKS=${TASKS:-"mmmu_val,mmbench_en_dev,textvqa_val,docvqa_val,infovqa_val,scienceqa_full,ai2d,mathvista_testmini_format"}
+# "mmvet,chartqa,mathverse_testmini_vision_dominant"
+# "mmmu_val,mmbench_en_dev,textvqa_val,docvqa_val,,infovqa_val,scienceqa_full,ai2d,mathvista_testmini_format"
 export NOT_ALWASY_DO_2DPOOL=1
 export DEBUG_PRINT_IMAGE_RES=1
 export DEBUG_FIX_PADDING=1 # new runs must have this !!!!!!!!!!!!
@@ -53,7 +59,6 @@ run_eval() {
         --model_args pretrained=$CKPT,conv_template=llada,model_name=llava_llada \
         --tasks $TASKS \
         --batch_size $bs \
-        --limit $LIMIT \
         --gen_kwargs prefix_lm=True,max_new_tokens=${MAX_NEW_TOKENS},block_length=${BLOCK_LENGTH},step_per_block=${STEP_PER_BLOCK},temperature=${TEMPERATURE},do_image_rollout=${DO_IMAGE_ROLLOUT} \
         --log_samples \
         --log_samples_suffix llava_llada \
