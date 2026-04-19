@@ -504,7 +504,7 @@ def main():
     #################################
     global_step = 0
     first_epoch = 0
-    num_train_epochs = math.ceil(config.training.max_train_steps / num_update_steps_per_epoch)
+    num_train_epochs = 1
 
     logger.info(f"num_update_steps_per_epoch: {num_update_steps_per_epoch}")
     logger.info(f"num_train_epochs: {num_train_epochs}")
@@ -564,7 +564,7 @@ def main():
     #     mask_dtype = model.module.showo.model.embed_tokens.weight.dtype
     # else:
     #     mask_dtype = model.showo.model.embed_tokens.weight.dtype  
-    mask_dtype = model.get_input_embeddings().weight.dtype
+    mask_dtype = accelerator.unwrap_model(model).get_input_embeddings().weight.dtype
 
     ##################################
     #             Training          #
@@ -913,13 +913,15 @@ def main():
                         config.training.gradient_accumulation_steps * total_batch_size_per_gpu / batch_time_m.val
                 )
                 logs = {
-                    "step_loss_interleave": avg_loss_interleave.item(),
-                    "step_text_loss": avg_text_loss.item(),
-                    "step_image_loss": avg_image_loss.item(),
-                    "lr": lr_scheduler.get_last_lr()[0],
-                    "samples/sec/gpu": samples_per_second_per_gpu,
-                    "data_time": data_time_m.val,
-                    "batch_time": batch_time_m.val,
+                    "train/loss": avg_loss_interleave.item(),
+                    "train/text_loss": avg_text_loss.item(),
+                    "train/image_loss": avg_image_loss.item(),
+                    "train/lr": lr_scheduler.get_last_lr()[0],
+                    "train/samples_per_sec_per_gpu": samples_per_second_per_gpu,
+                    "train/data_time": data_time_m.val,
+                    "train/batch_time": batch_time_m.val,
+                    "train/epoch": epoch,
+                    "train/global_step": global_step + 1,
                 }
                 accelerator.log(logs, step=global_step + 1)
                 logger.info(
@@ -1125,7 +1127,7 @@ def generate_interleave(
 
     wandb.log({
         "result_table": result_table
-    }, step=global_step)
+    })
 
 
     
@@ -1279,8 +1281,8 @@ def understanding_images(
     # --- 统一记录到 W&B ---
     if wandb_logs:
         try:
-            wandb.log({"Understanding images (multi-turn)": wandb_logs}, step=global_step)
-            logger.info(f"Logged {len(wandb_logs)} understanding image results to W&B for step {global_step}.")
+            wandb.log({"Understanding images (multi-turn)": wandb_logs})
+            
         except Exception as e:
             logger.error(f"Failed to log understanding images to W&B: {e}")
     else:
@@ -1354,7 +1356,7 @@ def generate_chat_text(
     model.train()
 
     # 在一个 step 内统一 log 生成的单个 HTML 对象（这样就不会多次 log 同一个 step）
-    wandb.log({"chat_text_generation": wandb.Html(html_content)}, step=global_step)
+    wandb.log({"chat_text_generation": wandb.Html(html_content)})
 
 
     # # 打印所有问答对

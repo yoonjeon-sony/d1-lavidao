@@ -167,7 +167,7 @@ def init_lavida_model_and_tokenizer(args: DiffuGRPOConfig, model_config: ModelCo
 
 def init_mmada_model_and_tokenizer(args: DiffuGRPOConfig, model_config: ModelConfig):
     """Initialize MMaDA model and tokenizer."""
-    MMADA_ROOT = REPO_ROOT / "MMaDA"
+    MMADA_ROOT = REPO_ROOT / "MMaDA-Parallel-M"
     if str(MMADA_ROOT) not in sys.path:
         sys.path.insert(0, str(MMADA_ROOT))
 
@@ -178,27 +178,31 @@ def init_mmada_model_and_tokenizer(args: DiffuGRPOConfig, model_config: ModelCon
     if not model_name_or_path:
         raise ValueError("model_name_or_path or model_path is required for MMaDA loading.")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, padding_side="left")
     uni_prompting = UniversalPrompting(
         tokenizer,
-        max_prompt_len=args.max_prompt_length,
-        max_gen_length=args.max_completion_length,
+        max_text_len=int(getattr(args, "max_prompt_length", 256)),
+        special_tokens=(
+            "<|soi|>", "<|eoi|>", "<|sov|>", "<|eov|>",
+            "<|t2i|>", "<|mmu|>", "<|t2v|>", "<|v2v|>", "<|lvg|>",
+        ),
         ignore_id=-100,
+        cond_dropout_prob=0.1,
+        use_reserved_token=True,
     )
 
     model = MMadaModelLM.from_pretrained(
         model_name_or_path,
+        trust_remote_code=True,
         torch_dtype=torch.bfloat16 if args.bf16 else None,
     )
     model.config.use_cache = False
 
-    mask_id = tokenizer.encode("<|mdm_mask|>")[0]
-    pad_id = tokenizer.encode("<|endoftext|>")[0]
-
-    # Store MMaDA-specific ids on the config for downstream use.
+    # MMaDA's mask token id is fixed (see infer_all.py: MASK_TOKEN_ID=126336).
+    # We stash it on args / model.config for downstream use.
+    mask_id = 126336
     args.mask_id = mask_id
     model.config.mask_id = mask_id
-    model.config.pad_id = pad_id
 
     tokenizer.padding_side = "left"
     return model, tokenizer, uni_prompting

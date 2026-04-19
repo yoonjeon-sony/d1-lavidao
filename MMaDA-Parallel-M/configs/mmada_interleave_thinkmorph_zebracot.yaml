@@ -5,11 +5,12 @@ wandb:
 experiment:
   project: "mmada-parallel-sft"
   name: "thinkmorph_zebracot_interleave"
-  output_dir: "/music-home-shared-disk/user/yoonjeon.kim/d1/MMaDA-Parallel-M/ckpts/thinkmorph_zebracot"
+  output_dir: "/group2/dgm/yoonjeon/ckpts/sft_MMaDA-Parallel-M-thinkmorph_zebracot"
   resume_from_checkpoint: null
   log_every: 50
   save_every: 2000
   log_grad_norm_every: 200
+  generate_every: 1000000
 
 model:
   vq_model:

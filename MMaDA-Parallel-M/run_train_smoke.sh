@@ -7,8 +7,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --time=00:30:00
 #SBATCH --requeue
-#SBATCH --output=/home/yoonjeon.kim/d1/MMaDA/slurm-logs/output.%j.log
-#SBATCH --error=/home/yoonjeon.kim/d1/MMaDA/slurm-logs/error.%j.log
+#SBATCH --output=./slurm-logs/output.%j.log
+#SBATCH --error=./slurm-logs/error.%j.log
 
 set -euo pipefail
 
