@@ -250,6 +250,13 @@ class MathVistaEvaluator:
         if not response:
             return ""
 
+        # If the model wraps its final answer in <answer>...</answer>, peel
+        # the inner text first so the short-circuits and GPT fallback below
+        # operate on the declared answer, not the surrounding reasoning.
+        m = re.search(r"<answer>\s*(.*?)\s*</answer>", response, flags=re.DOTALL | re.IGNORECASE)
+        if m:
+            response = m.group(1).strip()
+
         if question_type == "multi_choice" and response in choices:
             return response
 
