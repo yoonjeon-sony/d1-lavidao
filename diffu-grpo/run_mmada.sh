@@ -12,7 +12,7 @@
 
 # Activate the project venv so the SLURM job uses the same Python as the
 # submitting shell. sbatch does not auto-source user rc files.
-source /home/yoonjeon.kim/dLLM-RL/train_sft/.venv/bin/activate
+# source /home/yoonjeon.kim/dLLM-RL/train_sft/.venv/bin/activate
 
 export TRITON_CACHE_DIR="${SLURM_TMPDIR:-/tmp}/triton-${USER}/${SLURM_JOB_ID:-$$}-${LOCAL_RANK:-0}"
 DEBUG="${DEBUG:-0}"
@@ -26,7 +26,7 @@ REGION_EDIT=false
 
 RUN_NAME="${DATASET}-MMaDA-MixCoT"
 # MODEL_PATH="/group2/dgm/yoonjeon/MMaDA-8B-MixCoT"
-MODEL_PATH="/group2/dgm/yoonjeon/ckpts/sft_MMaDA-PM-thinkmorph_zebracot/checkpoint-4000/unwrapped_model"
+MODEL_PATH="/group2/dgm/yoonjeon/ckpts/sft_MMaDA-PM-thinkmorph_zebracot/checkpoint-8000/unwrapped_model"
 OUTPUT_DIR="/scratch2/yoonjeon.kim/rl-mmadaMixCoT-thinkmorph/$RUN_NAME"
 
 # ----------------------------
@@ -125,6 +125,7 @@ python -m accelerate.commands.launch \
     --warmup_ratio $WARMUP_RATIO \
     \
     --temperature $TEMPERATURE \
+    --mmada_image_temperature 1.0 \
     --max_prompt_length $MAX_PROMPT_LENGTH \
     --max_completion_length $MAX_COMPLETION_LENGTH \
     --block_length $BLOCK_LENGTH \

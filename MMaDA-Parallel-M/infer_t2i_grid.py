@@ -10,8 +10,11 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import random
 import re
 import sys
+
+from PIL import Image
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
 
@@ -30,7 +33,6 @@ from training.prompting_utils import UniversalPrompting
 
 from infer_all import (
     MAX_TEXT_LEN,
-    MODEL_PATH,
     NUM_SAMPLES,
     NUM_VQ_TOKENS,
     T2I_CHUNK,
@@ -39,12 +41,15 @@ from infer_all import (
     run_t2i,
 )
 
+MODEL_PATH = "/group2/dgm/yoonjeon/ckpts/sft_MMaDA-PM-thinkmorph_zebracot/checkpoint-8000/unwrapped_model"
 
+# gs0.0_ts20_temp1.0_sr0.1
 GRID_GUIDANCE = [0.0]
-GRID_TIMESTEPS = [20, 40]
-GRID_TEMPERATURE = [0.0, 0.5, 1.0]
-GRID_SEED_RATIO = [0.1, 0.2, 0.3, 0.4, 0.5]
+GRID_TIMESTEPS = [10, 20]
+GRID_TEMPERATURE = [1.0]
+GRID_SEED_RATIO = [0.01, 0.05, 0.1, 0.2]
 OUT_DIR = os.path.join(REPO_ROOT, "logs", "t2i_grid_seed_sweep")
+SHUFFLE_SEED = 42
 
 
 def safe_id(sid: str) -> str:
@@ -84,7 +89,10 @@ def main():
     print("[data] get_thinkmorph_interleave_questions(region_edit=False)", flush=True)
     tm_gen, _, _ = get_thinkmorph_interleave_questions(region_edit=False)
     assert len(tm_gen) >= NUM_SAMPLES, f"tm_gen has only {len(tm_gen)} samples"
-    gen_samples = [tm_gen[i] for i in range(NUM_SAMPLES)]
+    rng = random.Random(SHUFFLE_SEED)
+    shuffled_idx = list(range(len(tm_gen)))
+    rng.shuffle(shuffled_idx)
+    gen_samples = [tm_gen[i] for i in shuffled_idx[:NUM_SAMPLES]]
 
     os.makedirs(OUT_DIR, exist_ok=True)
     manifest_path = os.path.join(OUT_DIR, "manifest.jsonl")
@@ -119,7 +127,11 @@ def main():
 
         for s, prompt, img in zip(gen_samples, prompts_all, images_all):
             out_img = os.path.join(sub_dir, f"{safe_id(s['sample_id'])}.png")
-            img.save(out_img)
+            input_pil = Image.open(s["image"]).convert("RGB").resize(img.size, Image.BICUBIC)
+            composite = Image.new("RGB", (img.size[0] * 2, img.size[1]), (0, 0, 0))
+            composite.paste(input_pil, (0, 0))
+            composite.paste(img, (img.size[0], 0))
+            composite.save(out_img)
             manifest.write(json.dumps({
                 "config": tag,
                 "guidance_scale": float(gs),

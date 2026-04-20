@@ -352,7 +352,7 @@ class MMaDAGRPOTrainer(DiffuGRPOTrainer):
                 "<|t2i|>", "<|mmu|>", "<|t2v|>", "<|v2v|>", "<|lvg|>",
             ),
             ignore_id=-100,
-            cond_dropout_prob=0.1,
+            cond_dropout_prob=0.0,
             use_reserved_token=True,
         )
         vq_name = getattr(self.args, "mmada_vq_model_name", _MMADA_VQ_MODEL_NAME)
@@ -472,20 +472,44 @@ class MMaDAGRPOTrainer(DiffuGRPOTrainer):
         max_seq_length = int(getattr(self.args, "mmada_max_seq_length", _MMADA_MAX_SEQ_LENGTH))
         mask_id = int(getattr(self.args, "mask_id", _MMADA_MASK_TOKEN_ID))
 
-        # Input image: gen_image (unified mode) takes precedence over the
-        # problem image, so the text rollout sees the rollout-generated
-        # reasoning image when available.
-        pixels = []
+        # Input image(s): in unified mode (text_rollout_use_gen_image=True)
+        # every example carries BOTH the original problem image AND the
+        # rollout-generated gen_image. Both are fed into the MMU prefix as
+        # two consecutive <|soi|>...<|eoi|> blocks — input image first, then
+        # gen image — so the text rollout is conditioned on the source AND
+        # the model's own reasoning image. When gen_image is absent (non-
+        # unified mode) the single original image is used as before.
+        use_two_images_list = [ex.get("gen_image") is not None for ex in examples]
+        if any(use_two_images_list) and not all(use_two_images_list):
+            raise ValueError(
+                "Text rollout batch mixes gen_image / no-gen_image samples; "
+                "expected all-or-none within a chunk."
+            )
+        use_two_images = bool(use_two_images_list and use_two_images_list[0])
+
+        input_pixels = []
+        gen_pixels = []
         for ex in examples:
-            src = ex.get("gen_image") if ex.get("gen_image") is not None else ex.get("image")
+            src = ex.get("image")
             if src is None:
                 raise ValueError(
-                    f"Text rollout example missing an input image "
+                    f"Text rollout example missing the original input image "
                     f"(sample_id={ex.get('sample_id', 'unknown')})"
                 )
-            pixels.append(self._mmada_load_image_tensor(src, device, resolution))
-        pixel_batch = torch.stack(pixels, dim=0)
-        image_tokens_shifted = vq_model.get_code(pixel_batch) + len(tokenizer)
+            input_pixels.append(self._mmada_load_image_tensor(src, device, resolution))
+            if use_two_images:
+                gen_pixels.append(self._mmada_load_image_tensor(ex["gen_image"], device, resolution))
+        input_pixel_batch = torch.stack(input_pixels, dim=0)
+        input_image_tokens_shifted = vq_model.get_code(input_pixel_batch) + len(tokenizer)
+        if use_two_images:
+            gen_pixel_batch = torch.stack(gen_pixels, dim=0)
+            gen_image_tokens_shifted = vq_model.get_code(gen_pixel_batch) + len(tokenizer)
+        else:
+            gen_image_tokens_shifted = None
+        # The scoring-side "input_image_tokens" remains the original input —
+        # gen image tokens go in only via the MMU prefix, not into the
+        # scoring payload (which expects a single image slot).
+        image_tokens_shifted = input_image_tokens_shifted
 
         # Build the MMU text prefix via chat template (matches infer_all.run_mmu).
         text_token_lists: list[list[int]] = []
@@ -515,26 +539,34 @@ class MMaDAGRPOTrainer(DiffuGRPOTrainer):
         mmu_tok = int(uni_prompting.sptids_dict["<|mmu|>"])
         soi = int(uni_prompting.sptids_dict["<|soi|>"])
         eoi = int(uni_prompting.sptids_dict["<|eoi|>"])
-        input_ids = torch.cat(
-            [
-                torch.full((B, 1), mmu_tok, dtype=torch.long, device=device),
-                torch.full((B, 1), soi, dtype=torch.long, device=device),
-                image_tokens_shifted,
-                torch.full((B, 1), eoi, dtype=torch.long, device=device),
-                text_batch,
-            ],
-            dim=1,
-        )
+        mmu_col = torch.full((B, 1), mmu_tok, dtype=torch.long, device=device)
+        soi_col = torch.full((B, 1), soi, dtype=torch.long, device=device)
+        eoi_col = torch.full((B, 1), eoi, dtype=torch.long, device=device)
+        prefix_parts: list[torch.Tensor] = [mmu_col, soi_col, input_image_tokens_shifted, eoi_col]
+        if use_two_images:
+            prefix_parts.extend([soi_col, gen_image_tokens_shifted, eoi_col])
+        prefix_parts.append(text_batch)
+        input_ids = torch.cat(prefix_parts, dim=1)
 
-        prefix_len = 3 + image_tokens_shifted.shape[1]
+        # 1 (mmu) + 2 (soi/eoi) + N input-image tokens [+ 2 (soi/eoi) + N gen-image tokens]
+        prefix_len = 3 + input_image_tokens_shifted.shape[1]
+        if use_two_images:
+            prefix_len += 2 + gen_image_tokens_shifted.shape[1]
         max_new_tokens = max_seq_length
         prefix_mask = torch.ones((B, prefix_len), dtype=torch.long, device=device)
         text_mask = (text_batch != pad_id).long()
         gen_mask = torch.ones((B, max_new_tokens), dtype=torch.long, device=device)
         attention_mask = torch.cat([prefix_mask, text_mask, gen_mask], dim=1)
 
-        steps = max(1, max_new_tokens // 2)
-        block_length = max(1, max_new_tokens // 4)
+        steps = int(getattr(self.args, "diffusion_steps", None) or max(1, max_new_tokens // 2))
+        block_length = int(getattr(self.args, "block_length", None) or max(1, max_new_tokens // 4))
+        _mmada_text_temp = getattr(self.args, "mmada_text_temperature", None)
+        temperature = float(
+            _mmada_text_temp if _mmada_text_temp is not None
+            else getattr(self.args, "temperature", 0.0)
+        )
+        cfg_scale = float(getattr(self.args, "cfg_scale", 0.0))
+        remasking = str(getattr(self.args, "remasking", "low_confidence"))
 
         ctx_mgr = (
             torch.autocast("cuda", dtype=torch.bfloat16)
@@ -547,6 +579,9 @@ class MMaDAGRPOTrainer(DiffuGRPOTrainer):
                 max_new_tokens=max_new_tokens,
                 steps=steps,
                 block_length=block_length,
+                temperature=temperature,
+                cfg_scale=cfg_scale,
+                remasking=remasking,
                 attention_mask=attention_mask,
                 mask_id=mask_id,
             )
@@ -583,13 +618,15 @@ class MMaDAGRPOTrainer(DiffuGRPOTrainer):
         init_image=None,
         predicted_bbox: Optional[list[tuple[float, float, float, float]]] = None,
     ) -> tuple[torch.Tensor, list[dict[str, Any]]]:
-        """Image-edit rollout (input image + instruction -> output image) via
-        ``model.interleave_generate``. Mirrors ``run_interleave`` in infer_all.py.
+        """Image rollout (instruction + seeded input image -> output image) via
+        ``model.t2i_generate``. Mirrors ``run_t2i`` in infer_all.py.
 
-        MMaDA-Parallel has no separate ``image_edit`` path — the interleave
-        generator jointly samples image + text tokens, and we return both. The
-        decoded text is carried in the context so the unified scoring payload
-        can reuse it alongside the text rollout's output if needed.
+        Switched from ``interleave_generate`` (which jointly samples image +
+        text and has no native seed-from-input-image path) to ``t2i_generate``
+        because the image rollout only needs the image slot. Seeding is driven
+        by ``UniversalPrompting``'s ``t2i_gen`` task, which randomly replaces a
+        ``seed_ratio`` fraction of the all-masked output image tokens with the
+        input image's VQ codebook indices.
 
         ``predicted_bbox`` / ``init_image`` are accepted for signature
         compatibility with the parent but ignored — region-edit is explicitly
@@ -604,71 +641,78 @@ class MMaDAGRPOTrainer(DiffuGRPOTrainer):
         resolution = int(getattr(self.args, "mmada_resolution", _MMADA_RESOLUTION))
         num_vq = _MMADA_NUM_VQ_TOKENS
         codebook_size = _MMADA_CODEBOOK_SIZE
+        mask_id = int(getattr(self.args, "mask_id", _MMADA_MASK_TOKEN_ID))
 
-        # Encode input images.
+        # Resolve generation params from args.
+        guidance_scale = float(getattr(self.args, "mmada_image_guidance_scale", 0.0))
+        timesteps = int(getattr(self.args, "mmada_image_timesteps", 10))
+        image_temperature = float(getattr(self.args, "mmada_image_temperature", 1.0))
+        seed_ratio = float(getattr(self.args, "mmada_seed_ratio", 0.0))
+
+        # Keep cfg in sync so helpers reading from config see the same values.
+        cfg.training.guidance_scale = guidance_scale
+        cfg.training.generation_timesteps = timesteps
+        cfg.training.generation_temperature = image_temperature
+
+        # Encode input images → shifted VQ tokens (used both as the seed source
+        # and as the scoring-side ``input_image_tokens``).
         pixel_batch = torch.stack(
             [self._mmada_load_image_tensor(ex["image"], device, resolution) for ex in examples],
             dim=0,
         )
-        image_tokens_shifted = vq_model.get_code(pixel_batch) + len(tokenizer)  # (B, N_vq)
-        uncond_image_tokens = torch.zeros_like(image_tokens_shifted)
+        input_image_tokens_shifted = vq_model.get_code(pixel_batch) + len(tokenizer)
 
-        # Build instruction / uncond text token sequences with BOS/EOS padding.
-        bos = tokenizer.bos_token_id
-        eos = tokenizer.eos_token_id
-        cond_lists: list[list[int]] = []
-        uncond_lists: list[list[int]] = []
-        for ex in examples:
-            instruction = ex.get("instruction", "")
-            ids = list(tokenizer(instruction)["input_ids"])
-            if not ids or ids[0] != bos:
-                ids = [bos] + ids
-            ids = ids + [eos]
-            cond_lists.append(ids)
-
-            u_ids = list(tokenizer("")["input_ids"])
-            if not u_ids or u_ids[0] != bos:
-                u_ids = [bos] + u_ids
-            u_ids = u_ids + [eos]
-            uncond_lists.append(u_ids)
-        max_len = max(len(ids) for ids in cond_lists)
-        for i in range(len(examples)):
-            cond_lists[i] = cond_lists[i] + [eos] * (max_len - len(cond_lists[i]))
-            uncond_lists[i] = uncond_lists[i] + [eos] * (max_len - len(uncond_lists[i]))
-        text_ids = torch.tensor(cond_lists, dtype=torch.long, device=device)
-        uncond_text_ids = torch.tensor(uncond_lists, dtype=torch.long, device=device)
-
-        B = text_ids.shape[0]
-        interleave_col = torch.full(
-            (B, 1), _MMADA_RESERVED_TOKENS["<|interleave|>"], dtype=torch.long, device=device
+        B = len(examples)
+        prompts = [ex.get("instruction", "") for ex in examples]
+        masked_image_tokens = torch.full(
+            (B, num_vq), mask_id, dtype=torch.long, device=device
         )
-        soi_col = torch.full((B, 1), _MMADA_RESERVED_TOKENS["<|soi|>"], dtype=torch.long, device=device)
-        eoi_col = torch.full((B, 1), _MMADA_RESERVED_TOKENS["<|eoi|>"], dtype=torch.long, device=device)
-        input_ids = torch.cat([interleave_col, soi_col, image_tokens_shifted, eoi_col, text_ids], dim=1)
-        uncond_input_ids = torch.cat(
-            [interleave_col, soi_col, uncond_image_tokens, eoi_col, uncond_text_ids], dim=1
+
+        # UniversalPrompting's t2i_gen task seeds the masked image tokens from
+        # ``ref_image_ids`` at a ``seed_ratio`` fraction of positions.
+        ref_image_ids = input_image_tokens_shifted if seed_ratio > 0 else None
+        input_ids, attention_mask = uni_prompting(
+            (prompts, masked_image_tokens, ref_image_ids, seed_ratio),
+            "t2i_gen",
         )
+        if guidance_scale > 0:
+            uncond_input_ids, uncond_attention_mask = uni_prompting(
+                ([""] * B, masked_image_tokens, ref_image_ids, seed_ratio),
+                "t2i_gen",
+            )
+        else:
+            uncond_input_ids = None
+            uncond_attention_mask = None
 
         from models import get_mask_schedule  # lazy
+        schedule = get_mask_schedule(
+            getattr(self.args, "mmada_mask_schedule", cfg.mask_schedule.schedule)
+        )
 
         with torch.no_grad():
-            output_image_ids, output_text_ids = model.interleave_generate(
-                input_ids,
-                uncond_input_ids,
-                text_cfg=float(getattr(self.args, "mmada_text_cfg", 2.5)),
-                image_cfg=float(getattr(self.args, "mmada_image_cfg", 4.0)),
-                noise_schedule=get_mask_schedule(getattr(self.args, "mmada_mask_schedule", "cosine")),
-                text_steps=int(getattr(self.args, "mmada_text_steps", 128)),
-                image_steps=int(getattr(self.args, "mmada_image_steps", 30)),
-                reserved_token_mapping=_MMADA_RESERVED_TOKENS,
+            output_image_ids = model.t2i_generate(
+                input_ids=input_ids,
+                uncond_input_ids=uncond_input_ids,
+                attention_mask=attention_mask,
+                uncond_attention_mask=uncond_attention_mask,
+                guidance_scale=guidance_scale,
+                temperature=image_temperature,
+                timesteps=timesteps,
+                noise_schedule=schedule,
+                seq_len=num_vq,
+                mask_token_id=mask_id,
+                resolution=resolution,
+                codebook_size=codebook_size,
                 uni_prompting=uni_prompting,
                 config=cfg,
             )
 
         output_image_ids = torch.clamp(output_image_ids, 0, codebook_size - 1).to(torch.long)
         output_image_tokens_shifted = output_image_ids + len(tokenizer)
-        decoded_texts = tokenizer.batch_decode(output_text_ids, skip_special_tokens=True)
         decoded_images = self._mmada_decode_vq(vq_model, output_image_ids)
+        # t2i_generate does not emit a text slot; the text rollout runs through
+        # ``_rollout_multimodal_text_gen`` separately.
+        decoded_texts = [""] * B
 
         rollout_dir = Path("/tmp/mmada_grpo_rollouts")
         rollout_dir.mkdir(parents=True, exist_ok=True)
@@ -682,20 +726,22 @@ class MMaDAGRPOTrainer(DiffuGRPOTrainer):
                 pil_img.save(img_path)
             except Exception:
                 pass
+            prompt_text = ex.get("instruction", "")
+            prompt_ids = tokenizer(prompt_text)["input_ids"]
             image_contexts.append({
                 "valid": True,
                 "decoded_image": pil_img,
                 "decoded_image_path": str(img_path),
                 "decoded_text": decoded_text,
                 "sample_id": sample_id,
-                "prompt": ex.get("instruction", ""),
-                "prompt_len_tokens": int((text_ids[i] != eos).sum().item()),
+                "prompt": prompt_text,
+                "prompt_len_tokens": int(len(prompt_ids)),
                 "completion_len_tokens": int(num_vq),
-                "input_image_tokens": image_tokens_shifted[i].detach(),
+                "input_image_tokens": input_image_tokens_shifted[i].detach(),
                 "output_image_tokens": output_image_tokens_shifted[i].detach(),
                 "payload": {
                     "sample_id": sample_id,
-                    "instruction": ex.get("instruction", ""),
+                    "instruction": prompt_text,
                     "image": ex.get("image"),
                     "image_gen": str(img_path),
                 },

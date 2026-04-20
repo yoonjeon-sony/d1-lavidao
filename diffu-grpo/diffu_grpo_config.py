@@ -597,6 +597,40 @@ class DiffuGRPOConfig(TrainingArguments):
     image_edit_edit_mode: int = field(default=0)
     image_edit_order_cutoff: float = field(default=1.0)
 
+    # MMaDA-Parallel image/text rollout knobs. Used by the MMaDAGRPOTrainer
+    # rollout paths (``t2i_generate`` for the image slot, ``mmu_generate`` for
+    # the text slot). Defaults mirror the infer_all.py t2i-grid settings.
+    mmada_image_guidance_scale: float = field(
+        default=0.0,
+        metadata={"help": "CFG guidance_scale passed to t2i_generate for the MMaDA image rollout."},
+    )
+    mmada_image_timesteps: int = field(
+        default=10,
+        metadata={"help": "Number of diffusion steps for the MMaDA image rollout (t2i_generate)."},
+    )
+    mmada_image_temperature: float = field(
+        default=1.0,
+        metadata={"help": "Sampling temperature for the MMaDA image rollout (t2i_generate)."},
+    )
+    mmada_text_temperature: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Sampling temperature for the MMaDA text rollout (mmu_generate). "
+                "If None, falls back to the shared --temperature."
+            ),
+        },
+    )
+    mmada_seed_ratio: float = field(
+        default=0.1,
+        metadata={
+            "help": (
+                "Fraction of the masked output image tokens to seed from the "
+                "input image's VQ codebook indices in the t2i rollout."
+            ),
+        },
+    )
+
     # Text rollout normalization.
     text_rollout_force_prefix_lm: Optional[bool] = field(
         default=None,

@@ -44,6 +44,7 @@ INTERLEAVE_CHUNK = 2
 LOGPROB_CHUNK = 2
 LOGPROB_MASK_PROB = 0.15
 # MODEL_PATH = "tyfeld/MMaDA-Parallel-M"
+
 MODEL_PATH = "/group2/dgm/yoonjeon/ckpts/sft_MMaDA-PM-thinkmorph_zebracot/checkpoint-4000/unwrapped_model"
 VQ_MODEL_NAME = "showlab/magvitv2"
 RESOLUTION = 512
