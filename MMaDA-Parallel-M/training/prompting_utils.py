@@ -439,6 +439,15 @@ class UniversalPrompting():
         elif task == "t2i_gen":
             text_ids = self.text_tokenizer(input[0])['input_ids']  # (B, max_len)
             image_ids = input[1]  # (B, #tokens)
+            if len(input) >= 3 and input[2] is not None:
+                ref_image_ids = input[2]  # (B, #tokens) in unified vocab (shifted)
+                seed_ratio = input[3] if len(input) >= 4 and input[3] is not None else 0.01
+                image_ids = image_ids.clone()
+                B, L = image_ids.shape
+                num_sub = max(1, int(round(L * float(seed_ratio))))
+                for b in range(B):
+                    idx = torch.randperm(L, device=image_ids.device)[:num_sub]
+                    image_ids[b, idx] = ref_image_ids[b, idx]
             sequence_ids_with_masks = self.t2i_gen_prompt(text_ids, image_ids)
 
         elif task == "t2v_gen":

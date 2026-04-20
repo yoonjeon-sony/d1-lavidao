@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --partition=dgm
+#SBATCH --partition=sharedp
 #SBATCH --account=dgm
 #SBATCH --job-name=RL-mmada-diffuGRPO
 #SBATCH --nodes=1
 #SBATCH --ntasks=1                    # 1 task per GPU
 #SBATCH --gres=gpu:8
-#SBATCH --time=100:00:00               # Max time
+#SBATCH --time=24:00:00               # Max time
 #SBATCH --requeue                     # allow requeue if preempted
 #SBATCH --output=/home/yoonjeon.kim/dLLM-RL/train_sft/slurm-logs/output.%j.log
 #SBATCH --error=/home/yoonjeon.kim/dLLM-RL/train_sft/slurm-logs/error.%j.log
@@ -14,28 +14,19 @@
 # submitting shell. sbatch does not auto-source user rc files.
 source /home/yoonjeon.kim/dLLM-RL/train_sft/.venv/bin/activate
 
-# Run from the worktree root — the launch command uses relative paths
-# (./diffu-grpo/accelerate.yaml, diffu-grpo/diffu_grpo_train.py).
-cd /music-home-shared-disk/user/yoonjeon.kim/d1/.claude/worktrees/mmada-parallel
-
-# LaVida sampling env vars are harmless on the MMaDA path (llada modules
-# aren't imported), but keep them in case the training entry pulls llava
-# symbols during shared config handling.
-export DEBUG_FIX_PADDING=1
-export NOT_ALWASY_DO_2DPOOL=1
-export SKIP_COMPLEMENTARY_MASKING=1
 export TRITON_CACHE_DIR="${SLURM_TMPDIR:-/tmp}/triton-${USER}/${SLURM_JOB_ID:-$$}-${LOCAL_RANK:-0}"
 DEBUG="${DEBUG:-0}"
 
 mkdir -p "$TRITON_CACHE_DIR"
 chmod 700 "$TRITON_CACHE_DIR"
-DATASET="thinkmorph_interleave" # Options: thinkmorph_interleave, thinkmorph_answer, thinkmorph_edit
+DATASET="thinkmorph_answer" # Options: thinkmorph_interleave, thinkmorph_answer, thinkmorph_edit
 
 # MMaDA-Parallel has no grounding head — region-edit is always false here.
 REGION_EDIT=false
 
 RUN_NAME="${DATASET}-MMaDA-MixCoT"
-MODEL_PATH="/group2/dgm/yoonjeon/MMaDA-8B-MixCoT"
+# MODEL_PATH="/group2/dgm/yoonjeon/MMaDA-8B-MixCoT"
+MODEL_PATH="/group2/dgm/yoonjeon/ckpts/sft_MMaDA-PM-thinkmorph_zebracot/checkpoint-4000/unwrapped_model"
 OUTPUT_DIR="/scratch2/yoonjeon.kim/rl-mmadaMixCoT-thinkmorph/$RUN_NAME"
 
 # ----------------------------
@@ -63,13 +54,6 @@ RANDOM_MASKING="true"
 P_MASK_PROMPT=0.15
 GENERATION_BATCH_SIZE=16
 
-# NOTE: MMaDA rollout / scoring parameters (resolution, text/image CFG,
-# text_steps, image_steps, mask_schedule, ...) are read by MMaDAGRPOTrainer
-# via ``getattr(self.args, "mmada_*", <default>)`` with defaults matching
-# infer_all.py. They are NOT declared on DiffuGRPOConfig, so don't pass
-# them as CLI flags; edit mmada_grpo_trainer.py defaults if you need to
-# deviate from the reference values.
-
 # ----------------------------
 # GRPO model update configs
 # ----------------------------
@@ -85,7 +69,7 @@ if [[ "${DEBUG}" == "1" || "${DEBUG,,}" == "true" ]]; then
     export DIFFU_GRPO_STEP0_ASSERT=1
     export DIFFU_GRPO_STEP0_STRICT=1
     BATCH_SIZE=16
-    NUM_PROCESSES=8
+    NUM_PROCESSES=4
     NUM_GENERATIONS=2
     PER_DEVICE_BATCH_SIZE=1
     MAX_STEPS=20

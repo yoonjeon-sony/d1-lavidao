@@ -218,12 +218,15 @@ class MMaDAGRPOTrainer(DiffuGRPOTrainer):
             reward_funcs=reward_funcs,
             args=args,
             train_dataset=train_dataset,
+            train_dataset_und=train_dataset_und,
+            train_dataset_ground=train_dataset_ground,
             eval_dataset=eval_dataset,
             processing_class=processing_class,
             reward_processing_classes=reward_processing_classes,
             callbacks=callbacks,
             optimizers=optimizers,
             peft_config=peft_config,
+            modality=modality,
         )
         args.use_fast_dlm = False
         
@@ -829,19 +832,24 @@ class MMaDAGRPOTrainer(DiffuGRPOTrainer):
 
                 output = model.forward(input_ids=input_ids, attention_mask=attn_mask)
                 logits = output.logits
-                log_probs = F.log_softmax(logits.float(), dim=-1)
+
+                # Avoid materializing full (1, L, V) log_probs: slice to the
+                # scored slot, then compute logp[label] = logits[label] -
+                # logsumexp(logits) so only (1, L_slot) tensors are allocated.
+                def _slot_logp(sl_start: int, sl_end: int) -> torch.Tensor:
+                    sl_logits = logits[:, sl_start:sl_end]
+                    sl_labels = labels[:, sl_start:sl_end]
+                    safe = sl_labels.clamp(min=0)
+                    gathered = sl_logits.gather(-1, safe.unsqueeze(-1)).squeeze(-1)
+                    lse = torch.logsumexp(sl_logits.float(), dim=-1)
+                    mask = (sl_labels != -100).float()
+                    return (gathered.float() - lse) * mask
 
                 parts: list[torch.Tensor] = []
                 if mode in ("gen", "unified"):
-                    img_lp = self._mmada_gather_logp(
-                        log_probs[:, img_start:img_end], labels[:, img_start:img_end]
-                    )  # (1, N_vq)
-                    parts.append(img_lp)
+                    parts.append(_slot_logp(img_start, img_end))  # (1, N_vq)
                 if mode in ("und", "unified"):
-                    text_lp = self._mmada_gather_logp(
-                        log_probs[:, text_start:text_end], labels[:, text_start:text_end]
-                    )  # (1, max_text_len)
-                    parts.append(text_lp)
+                    parts.append(_slot_logp(text_start, text_end))  # (1, max_text_len)
                 sample_logp = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
                 per_sample_logps.append(sample_logp)
 
@@ -850,7 +858,7 @@ class MMaDAGRPOTrainer(DiffuGRPOTrainer):
                     "text_mask": text_mask.detach().to("cpu") if mode in ("und", "unified") else None,
                 })
 
-                del logits, log_probs, output
+                del logits, output
             per_seed_outputs.append(torch.cat(per_sample_logps, dim=0))  # (N_sel, D)
             captured_masks_per_seed.append(captured_masks)
         return per_seed_outputs, captured_masks_per_seed

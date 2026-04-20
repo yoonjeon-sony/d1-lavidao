@@ -43,7 +43,8 @@ MMU_CHUNK = 4
 INTERLEAVE_CHUNK = 2
 LOGPROB_CHUNK = 2
 LOGPROB_MASK_PROB = 0.15
-MODEL_PATH = "tyfeld/MMaDA-Parallel-M"
+# MODEL_PATH = "tyfeld/MMaDA-Parallel-M"
+MODEL_PATH = "/group2/dgm/yoonjeon/ckpts/sft_MMaDA-PM-thinkmorph_zebracot/checkpoint-4000/unwrapped_model"
 VQ_MODEL_NAME = "showlab/magvitv2"
 RESOLUTION = 512
 NUM_VQ_TOKENS = 1024
@@ -74,10 +75,10 @@ def build_config() -> OmegaConf:
             "model": {"mmada": {"num_vq_tokens": NUM_VQ_TOKENS, "codebook_size": CODEBOOK_SIZE}},
             "dataset": {"preprocessing": {"max_seq_length": MAX_SEQ_LENGTH, "resolution": RESOLUTION}},
             "training": {
-                "guidance_scale": 3.5,
-                "generation_timesteps": 50,
+                "guidance_scale": 0,
+                "generation_timesteps": 20,
                 "cond_dropout_prob": 0.1,
-                "generation_temperature": 1.0,
+                "generation_temperature": 0.2,
                 "noise_type": "mask",
             },
             "mask_schedule": {"schedule": "cosine"},
@@ -100,18 +101,24 @@ def decode_vq(vq_model: MAGVITv2, token_ids: torch.Tensor) -> list[Image.Image]:
     return [Image.fromarray(img) for img in images]
 
 
-def run_t2i(model, vq_model, uni_prompting, cfg, samples, device):
+def run_t2i(model, vq_model, uni_prompting, cfg, samples, device, seed_ratio: float = 0.0):
     prompts = [s["instruction"] for s in samples]
     batch_size = len(prompts)
     image_tokens = torch.full(
         (batch_size, NUM_VQ_TOKENS), MASK_TOKEN_ID, dtype=torch.long, device=device
     )
-    input_ids, attention_mask = uni_prompting((prompts, image_tokens), "t2i_gen")
+    ref_image_ids = None
+    if seed_ratio > 0:
+        pixel_batch = torch.stack([load_image_tensor(s["image"], device) for s in samples], 0)
+        ref_image_ids = vq_model.get_code(pixel_batch) + len(uni_prompting.text_tokenizer)
+    input_ids, attention_mask = uni_prompting(
+        (prompts, image_tokens, ref_image_ids, seed_ratio), "t2i_gen"
+    )
 
     guidance_scale = cfg.training.guidance_scale
     if guidance_scale > 0:
         uncond_input_ids, uncond_attention_mask = uni_prompting(
-            ([""] * batch_size, image_tokens), "t2i_gen"
+            ([""] * batch_size, image_tokens, ref_image_ids, seed_ratio), "t2i_gen"
         )
     else:
         uncond_input_ids = None

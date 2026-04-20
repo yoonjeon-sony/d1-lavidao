@@ -504,7 +504,7 @@ def main():
     #################################
     global_step = 0
     first_epoch = 0
-    num_train_epochs = 1
+    num_train_epochs = int(config.training.get("num_train_epochs", 1))
 
     logger.info(f"num_update_steps_per_epoch: {num_update_steps_per_epoch}")
     logger.info(f"num_train_epochs: {num_train_epochs}")

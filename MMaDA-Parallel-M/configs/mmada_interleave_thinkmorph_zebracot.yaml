@@ -5,8 +5,8 @@ wandb:
 experiment:
   project: "mmada-parallel-sft"
   name: "thinkmorph_zebracot_interleave"
-  output_dir: "/group2/dgm/yoonjeon/ckpts/sft_MMaDA-Parallel-M-thinkmorph_zebracot"
-  resume_from_checkpoint: null
+  output_dir: "/group2/dgm/yoonjeon/ckpts/sft_MMaDA-PM-thinkmorph_zebracot"
+  resume_from_checkpoint: true
   log_every: 50
   save_every: 2000
   log_grad_norm_every: 200
@@ -75,7 +75,8 @@ training:
   mixed_precision: "bf16"
   enable_tf32: true
   seed: 42
-  max_train_steps: 20000
+  num_train_epochs: 15
+  max_train_steps: 50000
   overfit_one_batch: false
   cond_dropout_prob: 0.1
   min_masking_rate: 0.0
