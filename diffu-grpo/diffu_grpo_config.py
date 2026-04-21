@@ -630,6 +630,19 @@ class DiffuGRPOConfig(TrainingArguments):
             ),
         },
     )
+    mmada_activation_checkpointing: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Enable MMaDA's fine_grained activation checkpointing "
+                "(model.model.set_activation_checkpointing) during training. "
+                "This is the MMaDA-specific path; the generic "
+                "--gradient_checkpointing flag does NOT work for MMadaModelLM "
+                "because the HF Trainer's gradient_checkpointing_enable is "
+                "not implemented by the model."
+            ),
+        },
+    )
 
     # Text rollout normalization.
     text_rollout_force_prefix_lm: Optional[bool] = field(

@@ -198,6 +198,16 @@ def init_mmada_model_and_tokenizer(args: DiffuGRPOConfig, model_config: ModelCon
     )
     model.config.use_cache = False
 
+    # Activation checkpointing — MMaDA's backward pass keeps full activations
+    # for a 32-layer 8B model, which OOMs on 80 GB GPUs under the GRPO double
+    # rollout (gen + und forward per grad-accum step). fine_grained matches
+    # what train_interleave.py uses for SFT. Gated on the MMaDA-specific flag
+    # because the generic HF --gradient_checkpointing path raises for
+    # MMadaModelLM (no supports_gradient_checkpointing).
+    if getattr(args, "mmada_activation_checkpointing", True):
+        from models.configuration_llada import ActivationCheckpointingStrategy
+        model.model.set_activation_checkpointing(ActivationCheckpointingStrategy.fine_grained)
+
     # MMaDA's mask token id is fixed (see infer_all.py: MASK_TOKEN_ID=126336).
     # We stash it on args / model.config for downstream use.
     mask_id = 126336

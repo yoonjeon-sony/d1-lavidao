@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --partition=sharedp
+#SBATCH --partition=dgm
 #SBATCH --account=dgm
 #SBATCH --job-name=RL-mmada-diffuGRPO
 #SBATCH --nodes=1
 #SBATCH --ntasks=1                    # 1 task per GPU
 #SBATCH --gres=gpu:8
-#SBATCH --time=24:00:00               # Max time
+#SBATCH --time=100:00:00              # Max time
 #SBATCH --requeue                     # allow requeue if preempted
 #SBATCH --output=/home/yoonjeon.kim/dLLM-RL/train_sft/slurm-logs/output.%j.log
 #SBATCH --error=/home/yoonjeon.kim/dLLM-RL/train_sft/slurm-logs/error.%j.log
@@ -19,14 +19,19 @@ DEBUG="${DEBUG:-0}"
 
 mkdir -p "$TRITON_CACHE_DIR"
 chmod 700 "$TRITON_CACHE_DIR"
-DATASET="thinkmorph_answer" # Options: thinkmorph_interleave, thinkmorph_answer, thinkmorph_edit
+DATASET="thinkmorph_interleave" # Options: thinkmorph_interleave, thinkmorph_answer, thinkmorph_edit
 
 # MMaDA-Parallel has no grounding head — region-edit is always false here.
 REGION_EDIT=false
-
-RUN_NAME="${DATASET}-MMaDA-MixCoT"
 # MODEL_PATH="/group2/dgm/yoonjeon/MMaDA-8B-MixCoT"
-MODEL_PATH="/group2/dgm/yoonjeon/ckpts/sft_MMaDA-PM-thinkmorph_zebracot/checkpoint-8000/unwrapped_model"
+# MODEL_PATH="/group2/dgm/yoonjeon/ckpts/sft_MMaDA-PM-thinkmorph_zebracot/checkpoint-8000/unwrapped_model"
+MODEL_PATH="yjyjyj98/sft_MMaDA-PM-thinkmorph_zebracot-ckpt8000"
+TEXT_ROLLOUT_USE_GEN_IMAGE=true
+RUN_NAME="${DATASET}-MMaDA-MixCoT"
+if [[ "${TEXT_ROLLOUT_USE_GEN_IMAGE}" == "true" ]]; then
+    RUN_NAME="${DATASET}-Unified-MMaDA-MixCoT"
+fi
+
 OUTPUT_DIR="/scratch2/yoonjeon.kim/rl-mmadaMixCoT-thinkmorph/$RUN_NAME"
 
 # ----------------------------
@@ -43,7 +48,7 @@ WARMUP_RATIO=0.0001
 # ----------------------------
 # Sampling configs (MMaDA-Parallel layout: max_seq_length=256, num_vq_tokens=1024)
 # ----------------------------
-TEMPERATURE=0.6
+TEMPERATURE=1.0
 MAX_PROMPT_LENGTH=256
 MAX_COMPLETION_LENGTH=256
 BLOCK_LENGTH=32
@@ -125,7 +130,6 @@ python -m accelerate.commands.launch \
     --warmup_ratio $WARMUP_RATIO \
     \
     --temperature $TEMPERATURE \
-    --mmada_image_temperature 1.0 \
     --max_prompt_length $MAX_PROMPT_LENGTH \
     --max_completion_length $MAX_COMPLETION_LENGTH \
     --block_length $BLOCK_LENGTH \
@@ -148,4 +152,5 @@ python -m accelerate.commands.launch \
     --save_steps $SAVE_STEPS \
     --logging_steps $LOGGING_STEPS \
     --region_edit $REGION_EDIT \
-    --text_rollout_use_gen_image true
+    --text_rollout_use_gen_image $TEXT_ROLLOUT_USE_GEN_IMAGE \
+    --mmada_activation_checkpointing true
