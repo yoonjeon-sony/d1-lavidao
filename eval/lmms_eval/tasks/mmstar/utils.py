@@ -49,22 +49,20 @@ def mmstar_doc_to_text(doc, lmms_eval_specific_kwargs=None):
     return question
 
 
+from lmms_eval.tasks._robust_extract import extract_mc_letter
+
+
 def exact_match(pred, gt):
-    """Brought from MMStar"""
-    answer = gt.lower().replace("\n", " ").strip()
-    predict = pred.lower().replace("\n", " ").strip()
-    try:
-        if answer == predict[0]:
-            return 1.0
-        elif predict[0] == "(" and answer == predict[1]:
-            return 1.0
-        elif predict[0:7] == "option " and answer == predict[7]:
-            return 1.0
-        elif predict[0:14] == "the answer is " and answer == predict[14]:
-            return 1.0
-    except Exception as e:
+    """Robust MMStar scorer — uses the shared MC extractor so that prose answers,
+    <answer> tags, boxed answers, and trailing letters are all handled.
+    Preserves the original signature (pred, gt) -> 1.0 / 0.0."""
+    if pred is None:
         return 0.0
-    return 0.0
+    answer = (gt or "").lower().replace("\n", " ").strip()
+    if not answer:
+        return 0.0
+    pred_letter = extract_mc_letter(pred or "", valid_letters="ABCDE").lower()
+    return 1.0 if pred_letter and pred_letter == answer else 0.0
 
 
 def mmstar_process_results(doc, results):

@@ -43,14 +43,25 @@ def sqa_doc_to_target(doc):
     return options[doc["answer"]]
 
 
+from lmms_eval.tasks._robust_extract import extract_mc_letter
+
+
 def sqa_process_results(doc, results):
-    # I know this is weird, but it's how llava parse it.
+    """Robust ScienceQA-image scorer.
+
+    Original scorer only accepted `<letter>.` prefix or exact-lowercase match. This
+    extended version tolerates chain-of-thought prose, <answer> tags, \\boxed answers,
+    \"The answer is X\" phrasing, and trailing/last letters.
+    """
     target = sqa_doc_to_target(doc).strip().lower()
-    pred = results[0].strip().lower()
-    if pred == target:
+    pred_raw = results[0] if results else ""
+    # Fast path: exact match (unchanged behaviour)
+    if pred_raw.strip().lower() == target:
         return {"exact_match": 1.0}
-    # pattern: ^[A-Z]\. .*
-    if len(pred) >= 2 and pred[0].isupper() and pred[1] == ".":
-        result = 1.0 if pred[0] == target else 0.0
-        return {"exact_match": result}
+    # Robust extractor
+    n = len(doc["choices"])
+    valid = "".join(chr(ord("A") + i) for i in range(max(2, min(n, 26))))
+    letter = extract_mc_letter(pred_raw or "", valid_letters=valid).lower()
+    if letter and letter == target:
+        return {"exact_match": 1.0}
     return {"exact_match": 0.0}

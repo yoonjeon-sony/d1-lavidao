@@ -90,7 +90,7 @@ def get_chat_response(prompt, model=GPT_EVAL_MODEL_NAME, temperature=0.0, max_to
     client = _get_openai_client()
     kwargs = {"model": model, "input": prompt}
     if _is_reasoning_model(model):
-        # Simple scoring task — minimal reasoning to save tokens and latency.
+        # Simple scoring task — skip reasoning to save tokens and latency.
         kwargs["reasoning"] = {"effort": "minimal"}
     else:
         kwargs["temperature"] = temperature

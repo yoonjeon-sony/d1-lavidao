@@ -77,6 +77,7 @@ try:
         logit_normal_schedule,
     )
     from llava.model.utils import pad_along_last_dim
+    from llava.eval.pmj import stratified_random
     from llava.mm_utils import pad_to_square_and_resize
 except ImportError as e:
     eval_logger.debug(f"LLaVA is not installed. Please install LLaVA to use this model.\nError: {e}")
@@ -737,6 +738,16 @@ class Llava_Llada(lmms):
             num_transfer_tokens[b, :ntt_len] = ntt[0, :ntt_len]
 
         confidence_policy = gen_cfg["confidence_policy"]
+        # Mirror the trainer: stratified confidence uses a deterministic PMJ
+        # permutation (seed=42, shuffle_blocks=True) over the √N×√N latent grid
+        # instead of falling through to the stochastic gumbel-topk branch.
+        unmask_order = None
+        if confidence_policy == "stratified":
+            unmask_order = stratified_random(
+                n=int(np.sqrt(gen_cfg["n_tokens"])),
+                seed=42,
+                shuffle_blocks=True,
+            )
 
         # Temperature schedules
         sch_temperatures = torch.zeros(batch_size, max_step, device=device, dtype=torch.float32)
@@ -867,6 +878,15 @@ class Llava_Llada(lmms):
                     confidence = torch.where(b_mask, confidence, -np.inf)
                     confidence = torch.softmax(confidence, dim=-1)
                     select_index = torch.multinomial(confidence, num_samples=k)
+                elif step_confidence_policy == "stratified" and unmask_order is not None:
+                    # Deterministic PMJ unmask order (matches trainer's
+                    # _rollout_image_edit_latents). ``start`` advances as more
+                    # tokens are unmasked, so successive steps pick the next
+                    # slice of the pre-computed permutation.
+                    start = gen_cfg["n_tokens"] - b_n_mask
+                    select_index = torch.tensor(
+                        unmask_order[start : start + k], device=device, dtype=torch.long
+                    )
                 else:
                     alg_t = gen_cfg["alg_temp"] * local_temp_b if gen_cfg["dynamic_temperature"] else gen_cfg["alg_temp"]
                     confidence = torch.log(x0_p[b_idx].clamp(1e-20)) + alg_t * self._image_edit_gumbel_noise(x0_p[b_idx])
@@ -922,23 +942,28 @@ class Llava_Llada(lmms):
         # so that we don't try to execute e.g. greedy sampling and temp=0.8 sampling
         # in the same batch.
         metadata = requests[0].metadata
+
+        # Also group by (task, split) so batches never cross tasks. Without this,
+        # sort-by-length can mix tasks in a chunk, then `task = batched_task[0]`
+        # indexes all doc_ids through one task's dataset -> IndexError when another
+        # task's doc_id exceeds that dataset's size.
+        def _group(args):
+            gk = dict(args[1]) if isinstance(args[1], dict) else {"__gk__": args[1]}
+            gk["__task__"] = args[4]
+            gk["__split__"] = args[5]
+            return gk
+
         if DEBUG_PRINT_OUTPUT:
             # do not sort by length, instead using lambda x:x[-3]
-            re_ords = utils.Collator([reg.args for reg in requests], lambda x:x[-3], grouping=True)
+            re_ords = utils.Collator([reg.args for reg in requests], lambda x:x[-3], group_fn=_group, grouping=True)
         else:
-            re_ords = utils.Collator([reg.args for reg in requests], _collate, grouping=True)
+            re_ords = utils.Collator([reg.args for reg in requests], _collate, group_fn=_group, grouping=True)
         chunks = re_ords.get_batched(n=self.batch_size, batch_fn=None)
         num_iters = len(requests) // self.batch_size if len(requests) % self.batch_size == 0 else len(requests) // self.batch_size + 1
         pbar = tqdm(total=num_iters, disable=(self.rank != 0), desc="Model Responding")
 
         origin_image_aspect_ratio = getattr(self._config, "image_aspect_ratio", None)
-        if DEBUG_LOAD_TRAINER:
-            ckpt1 = torch.load(DEBUG_LOAD_TRAINER, map_location='cpu')
-            ckpt1 = {k.replace('module.model','model'):v for k,v in ckpt1.items()}
-            _res = self.model.load_state_dict(ckpt1,strict=False)
-            print(f"DEBUG_LOAD_TRAINER:{DEBUG_LOAD_TRAINER} {_res}")
-            print("Something is broken if above line does not show all keys matched!!!")
-            del ckpt1
+
         delta_t = 0
         num_generated = 0
         for chunk in chunks:
@@ -1262,15 +1287,25 @@ class Llava_Llada(lmms):
             text_outputs = [response.strip() for response in text_outputs]
 
             # Save generated images to disk and record paths for logging.
+            # Directory layout: <IMAGE_ROLLOUT_SAVE_DIR>/<ckpt_name>/<task>/<doc_id>.png
+            # where ckpt_name mirrors the MODEL_NAME scheme used by eval/run.sh
+            # (basename(dirname(pretrained)) + "-" + basename(pretrained)).
             if do_image_rollout:
-                rollout_save_dir = Path(os.environ.get(
+                rollout_root = Path(os.environ.get(
                     "IMAGE_ROLLOUT_SAVE_DIR", "/tmp/image_rollout_outputs"
                 ))
-                rollout_save_dir.mkdir(parents=True, exist_ok=True)
+                ckpt_path = Path(str(self.pretrained))
+                ckpt_name = (
+                    f"{ckpt_path.parent.name}-{ckpt_path.name}"
+                    if ckpt_path.parent.name
+                    else ckpt_path.name
+                )
+                img_dir = rollout_root / ckpt_name / task
+                img_dir.mkdir(parents=True, exist_ok=True)
                 for s_idx, (doc_id, gen_img) in enumerate(zip(batched_doc_id, generated_images)):
                     if gen_img is not None and hasattr(gen_img, "save"):
                         safe_id = str(doc_id).replace("/", "_").replace(os.sep, "_").replace(" ", "_")
-                        img_path = rollout_save_dir / f"{task}_{safe_id}_{os.getpid()}.png"
+                        img_path = img_dir / f"{safe_id}.png"
                         gen_img.save(img_path)
                         self._image_resps[(task, doc_id)] = str(img_path)
 
